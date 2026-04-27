@@ -150,34 +150,40 @@ struct SettingsView: View {
                         Label("历史会话管理", systemImage: "list.bullet.rectangle")
                     }
 
-                    NavigationLink(destination: ProviderListView().environmentObject(viewModel)) {
-                        Label("提供商与模型管理", systemImage: "list.bullet.rectangle.portrait")
-                    }
+                    WatchSubscriptionGated(
+                        title: "提供商与模型管理",
+                        icon: "list.bullet.rectangle.portrait",
+                        destination: { ProviderListView().environmentObject(viewModel) }
+                    )
                     
-                    NavigationLink(destination: ModelAdvancedSettingsView(
-                        aiTemperature: $viewModel.aiTemperature,
-                        aiTopP: $viewModel.aiTopP,
-                        globalSystemPromptEntries: $viewModel.globalSystemPromptEntries,
-                        selectedGlobalSystemPromptEntryID: $viewModel.selectedGlobalSystemPromptEntryID,
-                        maxChatHistory: $viewModel.maxChatHistory,
-                        lazyLoadMessageCount: $viewModel.lazyLoadMessageCount,
-                        enableStreaming: $viewModel.enableStreaming,
-                        enableResponseSpeedMetrics: $viewModel.enableResponseSpeedMetrics,
-                        enableOpenAIStreamIncludeUsage: $viewModel.enableOpenAIStreamIncludeUsage,
-                        enableAutoSessionNaming: $viewModel.enableAutoSessionNaming, // 传递新增的绑定
-                        enableReasoningSummary: $viewModel.enableReasoningSummary,
-                        currentSession: $viewModel.currentSession,
-                        includeSystemTimeInPrompt: $viewModel.includeSystemTimeInPrompt,
-                        enablePeriodicTimeLandmark: $viewModel.enablePeriodicTimeLandmark,
-                        periodicTimeLandmarkIntervalMinutes: $viewModel.periodicTimeLandmarkIntervalMinutes,
-                        addGlobalSystemPromptEntry: viewModel.addGlobalSystemPromptEntry,
-                        selectGlobalSystemPromptEntry: viewModel.selectGlobalSystemPromptEntry,
-                        updateSelectedGlobalSystemPromptContent: viewModel.updateSelectedGlobalSystemPromptContent,
-                        updateGlobalSystemPromptEntry: viewModel.updateGlobalSystemPromptEntry,
-                        deleteGlobalSystemPromptEntry: { viewModel.deleteGlobalSystemPromptEntry(id: $0) }
-                    )) {
-                        Label("模型高级设置", systemImage: "brain.head.profile")
-                    }
+                    WatchSubscriptionGated(
+                        title: "模型高级设置",
+                        icon: "brain.head.profile",
+                        destination: {
+                            ModelAdvancedSettingsView(
+                                aiTemperature: $viewModel.aiTemperature,
+                                aiTopP: $viewModel.aiTopP,
+                                globalSystemPromptEntries: $viewModel.globalSystemPromptEntries,
+                                selectedGlobalSystemPromptEntryID: $viewModel.selectedGlobalSystemPromptEntryID,
+                                maxChatHistory: $viewModel.maxChatHistory,
+                                lazyLoadMessageCount: $viewModel.lazyLoadMessageCount,
+                                enableStreaming: $viewModel.enableStreaming,
+                                enableResponseSpeedMetrics: $viewModel.enableResponseSpeedMetrics,
+                                enableOpenAIStreamIncludeUsage: $viewModel.enableOpenAIStreamIncludeUsage,
+                                enableAutoSessionNaming: $viewModel.enableAutoSessionNaming,
+                                enableReasoningSummary: $viewModel.enableReasoningSummary,
+                                currentSession: $viewModel.currentSession,
+                                includeSystemTimeInPrompt: $viewModel.includeSystemTimeInPrompt,
+                                enablePeriodicTimeLandmark: $viewModel.enablePeriodicTimeLandmark,
+                                periodicTimeLandmarkIntervalMinutes: $viewModel.periodicTimeLandmarkIntervalMinutes,
+                                addGlobalSystemPromptEntry: viewModel.addGlobalSystemPromptEntry,
+                                selectGlobalSystemPromptEntry: viewModel.selectGlobalSystemPromptEntry,
+                                updateSelectedGlobalSystemPromptContent: viewModel.updateSelectedGlobalSystemPromptContent,
+                                updateGlobalSystemPromptEntry: viewModel.updateGlobalSystemPromptEntry,
+                                deleteGlobalSystemPromptEntry: { viewModel.deleteGlobalSystemPromptEntry(id: $0) }
+                            )
+                        }
+                    )
 
                     NavigationLink(destination: DailyPulseView(viewModel: viewModel)) {
                         HStack(spacing: 8) {
@@ -195,9 +201,11 @@ struct SettingsView: View {
                         Label("用量统计", systemImage: "calendar.badge.clock")
                     }
 
-                    NavigationLink(destination: ExtendedFeaturesView().environmentObject(viewModel)) {
-                        Label("拓展功能", systemImage: "puzzlepiece.extension")
-                    }
+                    WatchSubscriptionGated(
+                        title: "拓展功能",
+                        icon: "puzzlepiece.extension",
+                        destination: { ExtendedFeaturesView().environmentObject(viewModel) }
+                    )
 
                     NavigationLink(destination: DisplaySettingsView(
                         enableMarkdown: $viewModel.enableMarkdown,
