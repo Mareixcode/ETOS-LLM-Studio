@@ -1,0 +1,116 @@
+name: Build & Package
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Build iOS + watchOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Resolve SPM dependencies
+        run: |
+          env -u SDKROOT -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH \
+            xcodebuild -resolvePackageDependencies \
+            -workspace 'ETOS LLM Studio.xcworkspace'
+
+      # ── iOS ──────────────────────────────────────────────────────────────────
+      - name: Build iOS (generic, no signing)
+        run: |
+          set -euo pipefail
+          mkdir -p ci-build/ios
+          env -u SDKROOT -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH \
+            xcodebuild \
+            -workspace 'ETOS LLM Studio.xcworkspace' \
+            -scheme 'ETOS LLM Studio App' \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER="" \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
+            -derivedDataPath ci-build/ios \
+            build
+
+      - name: Package iOS .app as zip
+        run: |
+          cd ci-build/ios/Build/Products/Debug
+          APP_PATH=$(find . -name "*.app" -type d | grep -v "Watch" | head -1)
+          echo "Found app: $APP_PATH"
+          ditto -c -k --keepParent "$APP_PATH" "../../../ios-app.zip"
+          echo "::set-output name=ios_app::../../../ios-app.zip"
+        shell: bash
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ETOS-iOS-App
+          path: ci-build/ios-app.zip
+          retention-days: 7
+
+      # ── watchOS ──────────────────────────────────────────────────────────────
+      - name: Build watchOS App
+        run: |
+          set -euo pipefail
+          mkdir -p ci-build/watch
+          env -u SDKROOT -u LIBRARY_PATH -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH \
+            xcodebuild \
+            -workspace 'ETOS LLM Studio.xcworkspace' \
+            -scheme 'ETOS LLM Studio Watch App' \
+            -configuration Debug \
+            -destination 'generic/platform=watchOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER="" \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
+            -derivedDataPath ci-build/watch \
+            build
+
+      - name: Package watchOS .app as zip
+        run: |
+          cd ci-build/watch/Build/Products/Debug
+          WATCH_APP=$(find . -name "*.app" | grep -i watch | head -1)
+          echo "Found watch app: $WATCH_APP"
+          ditto -c -k --keepParent "$WATCH_APP" "../../../watch-app.zip"
+        shell: bash
+
+      - name: Upload watchOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ETOS-watchOS-App
+          path: ci-build/watch-app.zip
+          retention-days: 7
+
+      # ── Upload all logs ─────────────────────────────────────────────────────
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ci-build/ios/*.log 2>/dev/null || true
+            ci-build/watch/*.log 2>/dev/null || true
+          if-no-files-found: ignore
+          retention-days: 7
