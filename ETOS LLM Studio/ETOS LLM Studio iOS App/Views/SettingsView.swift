@@ -86,13 +86,19 @@ struct SettingsView: View {
                     Label("历史会话管理", systemImage: "list.bullet.rectangle")
                 }
 
-                NavigationLink {
+                SubscriptionGatedLink(
+                    title: "提供商与模型管理",
+                    icon: "list.bullet.rectangle.portrait",
+                    requiresSubscription: true
+                ) {
                     ProviderListView().environmentObject(viewModel)
-                } label: {
-                    Label("提供商与模型管理", systemImage: "list.bullet.rectangle.portrait")
                 }
-                
-                NavigationLink {
+
+                SubscriptionGatedLink(
+                    title: "高级模型设置",
+                    icon: "slider.vertical.3",
+                    requiresSubscription: true
+                ) {
                     ModelAdvancedSettingsView(
                         aiTemperature: $viewModel.aiTemperature,
                         aiTopP: $viewModel.aiTopP,
@@ -115,8 +121,6 @@ struct SettingsView: View {
                         updateGlobalSystemPromptEntry: viewModel.updateGlobalSystemPromptEntry,
                         deleteGlobalSystemPromptEntry: { viewModel.deleteGlobalSystemPromptEntry(id: $0) }
                     )
-                } label: {
-                    Label("高级模型设置", systemImage: "slider.vertical.3")
                 }
 
                 NavigationLink {
@@ -173,10 +177,12 @@ struct SettingsView: View {
                     Label("MCP 工具集成", systemImage: "network")
                 }
 
-                NavigationLink {
+                SubscriptionGatedLink(
+                    title: "Agent Skills",
+                    icon: "sparkles.square.filled.on.square",
+                    requiresSubscription: true
+                ) {
                     AgentSkillsView()
-                } label: {
-                    Label("Agent Skills", systemImage: "sparkles.square.filled.on.square")
                 }
 
                 NavigationLink {
@@ -213,10 +219,12 @@ struct SettingsView: View {
                     Label("语音输入", systemImage: "mic")
                 }
 
-                NavigationLink {
+                SubscriptionGatedLink(
+                    title: "拓展功能",
+                    icon: "puzzlepiece.extension",
+                    requiresSubscription: true
+                ) {
                     ExtendedFeaturesView()
-                } label: {
-                    Label("拓展功能", systemImage: "puzzlepiece.extension")
                 }
             }
             
