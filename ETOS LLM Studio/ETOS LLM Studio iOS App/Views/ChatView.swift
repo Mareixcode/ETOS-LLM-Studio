@@ -71,6 +71,7 @@ struct ChatView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var toolPermissionCenter = ToolPermissionCenter.shared
     @ObservedObject private var ttsManager = TTSManager.shared
+    @ObservedObject private var quotaManager = QuotaManager.shared
     @State private var showScrollToBottom = false
     @State private var suppressAutoScrollOnce = false
     @State private var navigationDestination: ChatNavigationDestination?
@@ -1039,6 +1040,12 @@ struct ChatView: View {
                 VStack(spacing: 12) {
                     modelPickerHeader
 
+                    // 配额进度条（仅订阅用户显示）
+                    if quotaManager.isSubscribed {
+                        QuotaProgressBar(record: quotaManager.record)
+                            .padding(.horizontal, 16)
+                    }
+
                     if viewModel.activatedModels.isEmpty {
                         modelPickerEmptyState
                     } else {
@@ -1125,14 +1132,27 @@ struct ChatView: View {
             dismissModelPickerPanel()
         } label: {
             HStack(alignment: .top, spacing: 12) {
-                MarqueeTitleSubtitleLabel(
-                    title: runnable.model.displayName,
-                    subtitle: "\(runnable.provider.name) · \(runnable.model.modelName)",
-                    titleUIFont: .systemFont(ofSize: 15, weight: .semibold),
-                    subtitleUIFont: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                    subtitleColor: TelegramColors.navBarSubtitle
-                )
-                .foregroundColor(TelegramColors.navBarText)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(runnable.model.displayName)
+                            .etFont(.system(size: 15, weight: .semibold))
+                            .foregroundColor(TelegramColors.navBarText)
+
+                        // 倍率徽章
+                        Text(ModelPriceMultiplier.displayString(for: runnable.model.modelName))
+                            .etFont(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule()
+                                    .fill(quotaColor(for: ModelPriceMultiplier.multiplier(for: runnable.model.modelName)))
+                            )
+                    }
+                    Text("\(runnable.provider.name) · \(runnable.model.modelName)")
+                        .etFont(.monospacedSystemFont(ofSize: 12, weight: .regular))
+                        .foregroundColor(TelegramColors.navBarSubtitle)
+                }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -5139,4 +5159,73 @@ private struct MessageInfoStreamingSpeedChart: View {
         path.closeSubpath()
         return path
     }
+}
+
+// MARK: - 配额进度条
+
+private struct QuotaProgressBar: View {
+    let record: QuotaRecord
+
+    private var fillColor: Color {
+        if record.usagePercent < 0.5 { return Color.green }
+        if record.usagePercent < 0.8 { return Color.orange }
+        return Color.red
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("本月配额")
+                    .etFont(.system(size: 12, weight: .medium))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(formatTokens(record.remainingTokens)) 剩余 / \(formatTokens(record.monthlyTokenQuota))")
+                    .etFont(.system(size: 12, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.2))
+
+                    Capsule()
+                        .fill(fillColor)
+                        .frame(width: geo.size.width * record.usagePercent)
+                        .animation(.easeInOut(duration: 0.3), value: record.usagePercent)
+                }
+            }
+            .frame(height: 8)
+
+            HStack {
+                Text(record.usagePercentString)
+                    .etFont(.system(size: 11, weight: .semibold))
+                    .foregroundColor(fillColor)
+                Text("已使用")
+                    .etFont(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("10元/月 · \(formatTokens(record.monthlyTokenQuota)) token")
+                    .etFont(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func formatTokens(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
+    }
+}
+
+// MARK: - 配额颜色
+
+private func quotaColor(for multiplier: Double) -> Color {
+    if multiplier <= 1.0  { return .green }
+    if multiplier <= 1.5  { return .blue }
+    if multiplier <= 2.0  { return .orange }
+    if multiplier <= 2.5  { return .pink }
+    return .purple
 }
