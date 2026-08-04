@@ -32,9 +32,12 @@ extension ChatView {
             .environmentObject(viewModel)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(NSLocalizedString("完成", comment: "")) {
-                        dismissSessionPicker()
+                    Button {
+                        openSettingsFromSessionPicker()
+                    } label: {
+                        Image(systemName: "gearshape")
                     }
+                    .accessibilityLabel(NSLocalizedString("设置", comment: "会话选择器设置入口"))
                 }
             }
     }
@@ -103,9 +106,12 @@ extension ChatView {
         .toolbar {
             if showsCloseButton {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(NSLocalizedString("完成", comment: "")) {
-                        dismissSessionPicker()
+                    Button {
+                        openSettingsFromSessionPicker()
+                    } label: {
+                        Image(systemName: "gearshape")
                     }
+                    .accessibilityLabel(NSLocalizedString("设置", comment: "会话选择器设置入口"))
                 }
             }
             if !showsInlineCreateButton {
@@ -119,6 +125,11 @@ extension ChatView {
                 }
             }
         }
+    }
+
+    func openSettingsFromSessionPicker() {
+        chatPickerDismissDestination = .settings
+        dismissSessionPicker()
     }
 
     func applySessionPickerLifecycle<Content: View>(to content: Content) -> some View {
@@ -182,6 +193,18 @@ extension ChatView {
                 Spacer()
 
                 if showsCreateButton {
+                    Button {
+                        performQuickAction(.settings)
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .etFont(.system(size: 14, weight: .semibold))
+                            .foregroundColor(TelegramColors.navBarText)
+                            .frame(width: 32, height: 32)
+                            .background(sessionPickerFooterButtonBackground)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(NSLocalizedString("设置", comment: "横屏会话侧栏设置入口"))
+
                     Button {
                         createSessionFromPicker()
                     } label: {

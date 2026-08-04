@@ -6,6 +6,7 @@
 
 import SwiftUI
 import Foundation
+import Combine
 import ETOSCore
 
 extension ModelSettingsView {
@@ -92,6 +93,7 @@ extension ModelSettingsView {
     }
 
     func saveEditorState() {
+        model.pickerGroupName = Model.normalizedPickerGroupName(model.pickerGroupName)
         model.requestBodyOverrideMode = requestBodyMode
         model.rawRequestBodyJSON = rawJSONInput
 
@@ -302,12 +304,15 @@ extension ModelSettingsView {
                 Text(NSLocalizedString("暂无", comment: ""))
                     .foregroundStyle(.secondary)
             } else {
-                ForEach($model.requestBodyControls) { $control in
+                ForEach(requestBodyControlsBinding, id: \.id, editActions: .move) { $control in
                     let controlID = control.id
                     NavigationLink {
                         RequestBodyControlDetailView(
                             control: $control,
-                            payloadDisplayMode: requestBodyMode
+                            payloadDisplayMode: requestBodyMode,
+                            onSplit: { splitControls in
+                                replaceRequestBodyControl(withID: controlID, with: splitControls)
+                            }
                         )
                     } label: {
                         RequestBodyControlRow(control: control)
@@ -320,7 +325,6 @@ extension ModelSettingsView {
                         }
                     }
                 }
-                .onDelete(perform: deleteRequestBodyControls)
             }
 
             Button {
@@ -334,12 +338,40 @@ extension ModelSettingsView {
             } label: {
                 Label(NSLocalizedString("添加组选项", comment: ""), systemImage: "list.bullet")
             }
+
+            Button {
+                presentRequestBodyControlImport()
+            } label: {
+                Label(NSLocalizedString("从其他模型导入", comment: ""), systemImage: "square.and.arrow.down")
+            }
         }
+    }
+
+    private func presentRequestBodyControlImport() {
+        var sourceProviders = ChatService.shared.providersSubject.value.filter { $0.id != provider.id }
+        sourceProviders.insert(provider, at: 0)
+        requestBodyControlImportSources = sourceProviders.flatMap { sourceProvider in
+            sourceProvider.models.compactMap { sourceModel in
+                guard !(sourceProvider.id == provider.id && sourceModel.id == model.id),
+                      !sourceModel.requestBodyControls.isEmpty else {
+                    return nil
+                }
+                return RunnableModel(provider: sourceProvider, model: sourceModel)
+            }
+        }
+        isRequestBodyControlImportPresented = true
     }
 
     private func addToggleControl() {
         model.requestBodyControls.append(
             ModelRequestBodyControlDefaults.initialToggleControl(existingControls: model.requestBodyControls)
+        )
+    }
+
+    private var requestBodyControlsBinding: Binding<[ModelRequestBodyControl]> {
+        Binding(
+            get: { model.requestBodyControls },
+            set: { model.requestBodyControls = $0 }
         )
     }
 
@@ -352,13 +384,17 @@ extension ModelSettingsView {
         )
     }
 
-    private func deleteRequestBodyControls(at offsets: IndexSet) {
-        model.requestBodyControls.remove(atOffsets: offsets)
-    }
-
     private func deleteRequestBodyControl(withID controlID: String) {
         guard let index = model.requestBodyControls.firstIndex(where: { $0.id == controlID }) else { return }
         model.requestBodyControls.remove(at: index)
+    }
+
+    private func replaceRequestBodyControl(
+        withID controlID: String,
+        with splitControls: [ModelRequestBodyControl]
+    ) {
+        guard let index = model.requestBodyControls.firstIndex(where: { $0.id == controlID }) else { return }
+        model.requestBodyControls.replaceSubrange(index...index, with: splitControls)
     }
 
     private func buildRequestPreviewPayload(
@@ -379,26 +415,7 @@ extension ModelSettingsView {
                     ]
                 ]
             ]
-
-            var generationConfig: [String: Any] = [:]
-            if let temperature = overridesAny["temperature"] { generationConfig["temperature"] = temperature }
-            if let topP = overridesAny["top_p"] { generationConfig["topP"] = topP }
-            if let topK = overridesAny["top_k"] { generationConfig["topK"] = topK }
-            if let maxTokens = overridesAny["max_tokens"] { generationConfig["maxOutputTokens"] = maxTokens }
-            var thinkingConfig: [String: Any] = [:]
-            if let thinkingLevel = overridesAny["thinking_level"] {
-                thinkingConfig["thinkingLevel"] = thinkingLevel
-            }
-            if let thinkingBudget = overridesAny["thinkingBudget"] ?? overridesAny["thinking_budget"] {
-                thinkingConfig["thinkingBudget"] = thinkingBudget
-            }
-            if !thinkingConfig.isEmpty {
-                generationConfig["thinkingConfig"] = thinkingConfig
-            }
-            if !generationConfig.isEmpty {
-                payload["generationConfig"] = generationConfig
-            }
-            return payload
+            return mergedPreviewRequestPayload(payload, with: overridesAny)
 
         case .anthropic:
             var payload: [String: Any] = [:]
@@ -426,7 +443,7 @@ extension ModelSettingsView {
             if let effort = overridesAny["effort"] {
                 payload["effort"] = effort
             }
-            return payload
+            return mergedPreviewRequestPayload(payload, with: passthroughAnthropicPreviewOverrides(overridesAny))
 
         case .openAIResponses:
             var payload = sanitizedResponsesPreviewOverrides(overridesAny)
@@ -482,6 +499,26 @@ extension ModelSettingsView {
                 return payload
             }
         }
+    }
+
+    private func mergedPreviewRequestPayload(_ base: [String: Any], with overlay: [String: Any]) -> [String: Any] {
+        var result = base
+        for (key, overlayValue) in overlay {
+            if let baseDictionary = result[key] as? [String: Any],
+               let overlayDictionary = overlayValue as? [String: Any] {
+                result[key] = mergedPreviewRequestPayload(baseDictionary, with: overlayDictionary)
+            } else if let baseArray = result[key] as? [Any],
+                      let overlayArray = overlayValue as? [Any] {
+                result[key] = baseArray + overlayArray
+            } else {
+                result[key] = overlayValue
+            }
+        }
+        return result
+    }
+
+    private func passthroughAnthropicPreviewOverrides(_ overrides: [String: Any]) -> [String: Any] {
+        overrides.filter { $0.key != "thinking_budget" }
     }
 
     private enum OpenAIPreviewMode {

@@ -21,6 +21,7 @@ struct ChatBubble: View {
     // MARK: - 属性与绑定
 
     @ObservedObject var messageState: ChatMessageRenderState
+    let roleplaySessionID: UUID?
     let preparedMarkdownPayload: ETPreparedMarkdownRenderPayload?
     let preparedReasoningMarkdownPayload: ETPreparedMarkdownRenderPayload?
     let reasoningThinkingTitle: String?
@@ -51,6 +52,9 @@ struct ChatBubble: View {
     let onCopy: () -> Void
     let onSwitchToPreviousVersion: () -> Void
     let onSwitchToNextVersion: () -> Void
+    let isSelectionMode: Bool
+    let isSelected: Bool
+    let onToggleSelection: () -> Void
     let onOpenMore: (() -> Void)?
     let providers: [Provider]
 
@@ -59,6 +63,7 @@ struct ChatBubble: View {
     @State var filePreview: FileAttachmentPreviewPayload?
     @State var toolCallResultExpandedState: [String: Bool] = [:]
     @State var selectedToolCallDetailSheetItem: ToolCallDetailSheetItem?
+    @State var webHTMLPageItem: WatchWebHTMLPageItem?
     @State var showRawToolResultInDetailSheet: Bool = false
     @ObservedObject var toolPermissionCenter = ToolPermissionCenter.shared
     @ObservedObject private var appearanceProfileManager = ChatAppearanceProfileManager.shared
@@ -68,6 +73,7 @@ struct ChatBubble: View {
 
     init(
         messageState: ChatMessageRenderState,
+        roleplaySessionID: UUID? = nil,
         preparedMarkdownPayload: ETPreparedMarkdownRenderPayload? = nil,
         preparedReasoningMarkdownPayload: ETPreparedMarkdownRenderPayload? = nil,
         reasoningThinkingTitle: String? = nil,
@@ -97,10 +103,14 @@ struct ChatBubble: View {
         onCopy: @escaping () -> Void = {},
         onSwitchToPreviousVersion: @escaping () -> Void = {},
         onSwitchToNextVersion: @escaping () -> Void = {},
+        isSelectionMode: Bool = false,
+        isSelected: Bool = false,
+        onToggleSelection: @escaping () -> Void = {},
         onOpenMore: (() -> Void)? = nil,
         providers: [Provider] = []
     ) {
         self.messageState = messageState
+        self.roleplaySessionID = roleplaySessionID
         self.preparedMarkdownPayload = preparedMarkdownPayload
         self.preparedReasoningMarkdownPayload = preparedReasoningMarkdownPayload
         self.reasoningThinkingTitle = reasoningThinkingTitle
@@ -130,6 +140,9 @@ struct ChatBubble: View {
         self.onCopy = onCopy
         self.onSwitchToPreviousVersion = onSwitchToPreviousVersion
         self.onSwitchToNextVersion = onSwitchToNextVersion
+        self.isSelectionMode = isSelectionMode
+        self.isSelected = isSelected
+        self.onToggleSelection = onToggleSelection
         self.onOpenMore = onOpenMore
         self.providers = providers
     }
@@ -156,21 +169,38 @@ struct ChatBubble: View {
     }
 
     var customTextColorOverride: Color? {
-        if colorScheme == .dark {
-            let slot = activeAppearanceProfile.darkText
-            guard slot.isEnabled else { return nil }
-            return ChatAppearanceColorCodec.color(from: slot.hex, fallback: .white)
+        guard !isSelected else { return nil }
+        let slot: ChatAppearanceColorSlot
+        let fallback: Color
+        // watchOS 不区分白天与夜览文字配色，统一使用可跨端同步的白天槽位。
+        if message.role == .user {
+            slot = activeAppearanceProfile.userLightText
+            fallback = .white
+        } else {
+            slot = activeAppearanceProfile.assistantLightText
+            fallback = .primary
         }
-        let slot = activeAppearanceProfile.lightText
         guard slot.isEnabled else { return nil }
-        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: .primary)
+        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: fallback)
+    }
+
+    var customTextStyleColors: ChatAppearanceTextStyleColors {
+        message.role == .user
+            ? activeAppearanceProfile.userLightTextStyles
+            : activeAppearanceProfile.assistantLightTextStyles
     }
 
     func resolvedTextColor(default defaultColor: Color) -> Color {
-        customTextColorOverride ?? defaultColor
+        if isSelected {
+            return .white
+        }
+        return customTextColorOverride ?? defaultColor
     }
 
     func resolvedSecondaryTextColor(default defaultColor: Color, customOpacity: Double) -> Color {
+        if isSelected {
+            return Color.white.opacity(customOpacity)
+        }
         if let customTextColorOverride {
             return customTextColorOverride.opacity(customOpacity)
         }
@@ -212,26 +242,66 @@ struct ChatBubble: View {
         .padding(.horizontal, usesNoBubbleStyle ? noBubbleRowHorizontalPadding : nil)
         .padding(.top, mergeWithPrevious ? 0 : rowVerticalPadding)
         .padding(.bottom, mergeWithNext ? 0 : rowVerticalPadding)
-        .modifier(ChatBubbleOpenMoreGestureModifier(onOpenMore: onOpenMore))
-        .sheet(item: $imagePreview) { payload in
-            ZStack {
-                Color.black.ignoresSafeArea()
-                Image(uiImage: payload.image)
-                    .resizable()
-                    .scaledToFit()
-                    .padding(12)
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.red, lineWidth: 2)
+                    .allowsHitTesting(false)
             }
         }
-        .sheet(item: $filePreview) { payload in
+        .modifier(
+            ChatBubbleOpenMoreGestureModifier(
+                isSelectionMode: isSelectionMode,
+                onToggleSelection: onToggleSelection,
+                onOpenMore: onOpenMore
+            )
+        )
+        .sheet(item: $imagePreview, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { payload in
+            WatchAttachmentImagePreviewSheet(payload: payload)
+        }
+        .sheet(item: $filePreview, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { payload in
             WatchFileAttachmentPreviewSheet(payload: payload)
         }
-        .sheet(item: $selectedToolCallDetailSheetItem) { item in
+        .sheet(item: $selectedToolCallDetailSheetItem, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { item in
             toolCallDetailSheet(for: item)
         }
+        .sheet(item: $webHTMLPageItem, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { item in
+            NavigationStack {
+                WatchWebHTMLPage(item: item)
+            }
+        }
         .onAppear {
+            refreshChatBubbleLocalPresentationBlocker()
             autoPresentPendingToolCallIfNeeded()
         }
+        .onDisappear {
+            setChatBubbleLocalPresentationBlocked(false)
+        }
+        .onChange(of: imagePreview != nil) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
+        }
+        .onChange(of: filePreview != nil) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
+        }
+        .onChange(of: selectedToolCallDetailSheetItem?.id) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
+        }
+        .onChange(of: webHTMLPageItem?.id) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
+        }
         .onChange(of: toolPermissionCenter.activeRequest?.id) { _, _ in
+            autoPresentPendingToolCallIfNeeded()
+        }
+        .onChange(of: toolPermissionCenter.canAutoPresentRequestDetails) { _, canAutoPresent in
+            guard canAutoPresent else { return }
             autoPresentPendingToolCallIfNeeded()
         }
         .onChange(of: toolCallAutoPresentationSignature) { _, _ in

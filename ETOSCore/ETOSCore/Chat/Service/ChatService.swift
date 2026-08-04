@@ -43,8 +43,7 @@ public class ChatService {
             id: systemSpeechRecognizerModelID,
             modelName: "sf-speech-recognizer",
             displayName: "SFSpeechRecognizer",
-            isActivated: true,
-            kind: .speechToText
+            isActivated: true
         )
         return RunnableModel(provider: provider, model: model)
     }()
@@ -132,6 +131,7 @@ public class ChatService {
         case noAvailableModel
         case unsupportedAdapter
         case buildRequestFailed
+        case unsupportedAttachments
 
         public var errorDescription: String? {
             switch self {
@@ -141,6 +141,8 @@ public class ChatService {
                 return NSLocalizedString("当前模型对应的适配器不可用，无法执行 Detached Completion。", comment: "Detached completion adapter unavailable error")
             case .buildRequestFailed:
                 return NSLocalizedString("Detached Completion 请求构建失败。", comment: "Detached completion build request error")
+            case .unsupportedAttachments:
+                return NSLocalizedString("当前 Detached Completion 模型不支持这组附件。", comment: "Detached completion attachments unsupported error")
             }
         }
     }
@@ -162,6 +164,12 @@ public class ChatService {
     /// 每个会话独立维护请求上下文，支持跨会话并发。
     private var requestContextBySessionID: [UUID: RequestExecutionContext] = [:]
     private let requestStateLock = NSRecursiveLock()
+    /// 运行期消息快照用于覆盖 GRDB 异步写入窗口，避免后台会话连续工具调用读到旧落库状态。
+    private var runtimeMessagesBySessionID: [UUID: [ChatMessage]] = [:]
+    private let runtimeMessagesLock = NSRecursiveLock()
+    /// 显式临时对话只保留运行期消息，和“尚未发送首条消息”的占位会话语义分开。
+    var ephemeralSessionStates: [UUID: TemporaryChatRuntimeState] = [:]
+    let ephemeralSessionLock = NSLock()
     /// 记录每个会话上一次注入周期性时间路标的时间，保证路标按周期出现且不会过于频繁。
     var periodicTimeLandmarkLastInjectedAtBySessionID: [UUID: Date] = [:]
     /// 重试时要添加新版本的assistant消息ID（如果有）
@@ -177,6 +185,7 @@ public class ChatService {
     let worldbookImportService: WorldbookImportService
     let worldbookExportService: WorldbookExportService
     let worldbookEngine: WorldbookEngine
+    let roleplayStore: RoleplayStore
     let urlSession: URLSession
     let fileAttachmentTextExtractor: FileAttachmentTextExtractor
     let startupStateLoadLock = NSLock()
@@ -201,6 +210,7 @@ public class ChatService {
         cache.totalCostLimit = 64 * 1024 * 1024
         return cache
     }()
+    let geminiVideoUploadCache = GeminiVideoUploadCache()
 
     struct ImageGenerationContext {
         let sessionID: UUID
@@ -224,6 +234,14 @@ public class ChatService {
     struct FileAttachmentTextPreprocessingResult {
         let messages: [ChatMessage]
         let fileAttachments: [UUID: [FileAttachment]]
+        let errorMessage: String?
+    }
+
+    struct VideoAttachmentPreprocessingResult {
+        let messages: [ChatMessage]
+        let imageAttachments: [UUID: [ImageAttachment]]
+        let nativeVideoAttachments: [UUID: [FileAttachment]]
+        let documentAttachments: [UUID: [FileAttachment]]
         let errorMessage: String?
     }
 
@@ -268,12 +286,51 @@ public class ChatService {
         if currentSessionSubject.value?.id == sessionID {
             return messagesForSessionSubject.value
         }
+        if let cachedMessages = runtimeMessagesSnapshot(for: sessionID) {
+            return cachedMessages
+        }
         return Persistence.loadMessages(for: sessionID)
+    }
+
+    func messagesForSessionActivation(_ sessionID: UUID) -> [ChatMessage] {
+        if isTemporaryChatEnabled(for: sessionID) {
+            return runtimeMessagesSnapshot(for: sessionID) ?? []
+        }
+        if hasActiveRequestContext(for: sessionID),
+           let cachedMessages = runtimeMessagesSnapshot(for: sessionID) {
+            return cachedMessages
+        }
+        Persistence.flushPendingMessageWritesForSyncSnapshot()
+        return Persistence.loadMessages(for: sessionID)
+    }
+
+    func runtimeMessagesSnapshot(for sessionID: UUID) -> [ChatMessage]? {
+        runtimeMessagesLock.lock()
+        defer { runtimeMessagesLock.unlock() }
+        return runtimeMessagesBySessionID[sessionID]
+    }
+
+    func storeRuntimeMessagesSnapshot(_ messages: [ChatMessage], for sessionID: UUID) {
+        runtimeMessagesLock.lock()
+        runtimeMessagesBySessionID[sessionID] = messages
+        runtimeMessagesLock.unlock()
+    }
+
+    func clearRuntimeMessagesSnapshot(for sessionID: UUID) {
+        runtimeMessagesLock.lock()
+        runtimeMessagesBySessionID.removeValue(forKey: sessionID)
+        runtimeMessagesLock.unlock()
     }
 
     func loadingMessageID(for sessionID: UUID) -> UUID? {
         withRequestStateLock {
             requestContextBySessionID[sessionID]?.loadingMessageID
+        }
+    }
+
+    func hasActiveRequestContext(for sessionID: UUID) -> Bool {
+        withRequestStateLock {
+            requestContextBySessionID[sessionID] != nil
         }
     }
 
@@ -291,6 +348,7 @@ public class ChatService {
         for sessionID: UUID,
         keepingSpeedSamplesFor preferredMessageID: UUID? = nil
     ) {
+        storeRuntimeMessagesSnapshot(messages, for: sessionID)
         publishMessagesIfCurrentSession(messages, for: sessionID, keepingSpeedSamplesFor: preferredMessageID)
         persistMessages(messages, for: sessionID)
     }
@@ -332,6 +390,8 @@ public class ChatService {
         }
         guard didClear else { return }
         setSessionRunning(sessionID, isRunning: false)
+        Persistence.flushPendingMessageWritesForSyncSnapshot()
+        clearRuntimeMessagesSnapshot(for: sessionID)
     }
 
     private func setSessionRunning(_ sessionID: UUID, isRunning: Bool) {
@@ -349,6 +409,15 @@ public class ChatService {
     }
 
     func emitSessionRequestStatus(_ status: SessionRequestStatus, sessionID: UUID) {
+        switch status {
+        case .started:
+            break
+        case .finished, .error, .cancelled:
+            if !Task.isCancelled {
+                setSessionRunning(sessionID, isRunning: false)
+            }
+        }
+
         sessionRequestStatusSubject.send(SessionRequestStatusEvent(sessionID: sessionID, status: status))
         switch status {
         case .started:
@@ -406,7 +475,17 @@ public class ChatService {
         }
 
         let fileExtension = (fileName as NSString).pathExtension.lowercased()
-        let mimeType = fileExtension == "png" ? "image/png" : "image/jpeg"
+        let mimeType: String
+        switch fileExtension {
+        case "png":
+            mimeType = "image/png"
+        case "webp":
+            mimeType = "image/webp"
+        case "gif":
+            mimeType = "image/gif"
+        default:
+            mimeType = "image/jpeg"
+        }
         return ImageAttachment(data: imageData, mimeType: mimeType, fileName: fileName)
     }
 
@@ -448,6 +527,7 @@ public class ChatService {
         worldbookImportService: WorldbookImportService = WorldbookImportService(),
         worldbookExportService: WorldbookExportService = WorldbookExportService(),
         worldbookEngine: WorldbookEngine = WorldbookEngine(),
+        roleplayStore: RoleplayStore = .shared,
         fileAttachmentTextExtractor: FileAttachmentTextExtractor = FileAttachmentTextExtractor(),
         localModelStore: LocalModelStore = .shared,
         urlSession: URLSession = NetworkSessionConfiguration.shared
@@ -459,6 +539,7 @@ public class ChatService {
         self.worldbookImportService = worldbookImportService
         self.worldbookExportService = worldbookExportService
         self.worldbookEngine = worldbookEngine
+        self.roleplayStore = roleplayStore
         self.fileAttachmentTextExtractor = fileAttachmentTextExtractor
         self.localModelStore = localModelStore
         self.urlSession = urlSession
@@ -516,6 +597,12 @@ public class ChatService {
                 self?.reloadProviders()
             }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .officialDataDidUpdate)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.reloadProviders()
+            }
+            .store(in: &cancellables)
 
         let savedModelID = AppConfigStore.textValue(
             for: .selectedRunnableModelID,
@@ -528,29 +615,13 @@ public class ChatService {
         }
         self.selectedModelSubject.send(initialModel)
 
-        ConfigLoader.fetchDownloadOnceConfigsIfNeeded { [weak self] in
-            self?.reloadProviders()
-        }
+        ConfigLoader.fetchDownloadOnceConfigsIfNeeded()
 
         logger.info("  - 初始选中模型为: \(initialModel?.model.displayName ?? "无")")
         if !Self.isRunningUnitTests {
             logger.info("  - 已切换为启动后异步加载持久化会话状态。")
         }
         logger.info("  - 初始化完成。")
-        AppLog.developer(
-            category: "chat_service",
-            action: "initialize",
-            message: NSLocalizedString("ChatService 初始化完成", comment: "App log message"),
-            payload: [
-                "providerCount": "\(self.providers.count)",
-                "selectedModel": initialModel?.model.displayName ?? NSLocalizedString("无", comment: "App log empty value")
-            ]
-        )
-        AppLog.userOperation(
-            category: NSLocalizedString("应用", comment: "App log category"),
-            action: NSLocalizedString("初始化聊天服务", comment: "App log action"),
-            payload: ["providerCount": "\(self.providers.count)"]
-        )
     }
 
     public func fetchModels(for provider: Provider) async throws -> [Model] {
@@ -610,10 +681,59 @@ public class ChatService {
             return transcript
         }
 
+        if LocalModelProviderBridge.isLocalRunnableModel(model) {
+            guard let record = localModelRecord(for: model, requiresExistingFile: false) else {
+                throw LocalSpeechEngineError.modelFileMissing(model.model.modelName)
+            }
+            let decoderRecord = record.speechDecoderModelID.flatMap { decoderID in
+                localModelStore.models.first {
+                    $0.id == decoderID && localModelStore.fileExists(for: $0)
+                }
+            }
+            if record.speechArchitecture?.requiresDecoderModel == true,
+               decoderRecord == nil {
+                throw LocalSpeechEngineError.transcriptionFailed(
+                    NSLocalizedString("Fun-ASR-Nano 尚未关联可用的本地 Qwen 解码模型。", comment: "Fun-ASR-Nano decoder not configured")
+                )
+            }
+            let vadRecord = record.speechVADModelID.flatMap { vadID in
+                localModelStore.models.first {
+                    $0.id == vadID
+                        && $0.speechArchitecture == .fsmnVAD
+                        && localModelStore.fileExists(for: $0)
+                }
+            }
+            let extensionFromName = URL(fileURLWithPath: fileName).pathExtension
+            let fallbackExtension = mimeType.lowercased().contains("wav") ? "wav" : "m4a"
+            let localModelCacheEnabled = await MainActor.run {
+                AppConfigStore.shared.localModelCacheEnabled
+            }
+            #if os(watchOS)
+            let gpuLayers = 0
+            #else
+            let gpuLayers = record.effectiveGPULayers
+            #endif
+            let transcript = try await LocalSpeechEngine.transcribe(
+                audioData: audioData,
+                fileExtension: extensionFromName.isEmpty ? fallbackExtension : extensionFromName,
+                modelURL: localModelStore.fileURL(for: record),
+                decoderModelURL: decoderRecord.map(localModelStore.fileURL(for:)),
+                vadModelURL: vadRecord.map(localModelStore.fileURL(for:)),
+                options: LocalSpeechTranscriptionOptions(
+                    contextSize: record.effectiveContextSize,
+                    maxOutputTokens: record.effectiveMaxOutputTokens,
+                    gpuLayers: gpuLayers,
+                    useModelCache: localModelCacheEnabled
+                )
+            )
+            logger.info("本地语音识别完成，长度 \(transcript.count) 字符。")
+            return transcript
+        }
+
         logger.info("正在向 \(model.provider.name) 的语音模型 \(model.model.displayName) 发起转写请求...")
         
-        guard let adapter = adapters[model.provider.apiFormat] else {
-            throw NetworkError.adapterNotFound(format: model.provider.apiFormat)
+        guard let adapter = adapters["openai-compatible"] else {
+            throw NetworkError.adapterNotFound(format: "openai-compatible")
         }
         
         guard let request = adapter.buildTranscriptionRequest(
@@ -639,10 +759,21 @@ public class ChatService {
 
     /// 取消指定会话正在进行的请求，并进行必要的状态恢复。
     public func cancelRequest(for sessionID: UUID) async {
-        guard let context = withRequestStateLock({ requestContextBySessionID[sessionID] }),
-              let task = context.task else { return }
-        let token = context.token
+        guard let activeContext = withRequestStateLock({ requestContextBySessionID[sessionID] }),
+              let task = activeContext.task else { return }
         task.cancel()
+        emitSessionRequestStatus(.cancelled, sessionID: sessionID)
+
+        if let imageContext = activeContext.imageGenerationContext {
+            imageGenerationStatusSubject.send(
+                .cancelled(
+                    sessionID: imageContext.sessionID,
+                    loadingMessageID: imageContext.loadingMessageID,
+                    prompt: imageContext.prompt,
+                    finishedAt: Date()
+                )
+            )
+        }
 
         do {
             try await task.value
@@ -655,11 +786,6 @@ public class ChatService {
             } else {
                 logger.error("取消会话请求时出现意外错误: \(error.localizedDescription)")
             }
-        }
-
-        guard let activeContext = withRequestStateLock({ requestContextBySessionID[sessionID] }),
-              activeContext.token == token else {
-            return
         }
 
         if let loadingID = activeContext.loadingMessageID {
@@ -675,22 +801,12 @@ public class ChatService {
             }
         }
 
-        let cancelledImageContext = activeContext.imageGenerationContext
-        _ = withRequestStateLock {
+        withRequestStateLock {
+            guard let context = requestContextBySessionID[sessionID],
+                  context.token == activeContext.token else {
+                return
+            }
             requestContextBySessionID.removeValue(forKey: sessionID)
-        }
-        setSessionRunning(sessionID, isRunning: false)
-        emitSessionRequestStatus(.cancelled, sessionID: sessionID)
-
-        if let imageContext = cancelledImageContext {
-            imageGenerationStatusSubject.send(
-                .cancelled(
-                    sessionID: imageContext.sessionID,
-                    loadingMessageID: imageContext.loadingMessageID,
-                    prompt: imageContext.prompt,
-                    finishedAt: Date()
-                )
-            )
         }
     }
 

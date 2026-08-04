@@ -5,6 +5,11 @@ import Foundation
 @Suite("公告语言匹配测试")
 @MainActor
 struct AnnouncementLanguageMatchingTests {
+    @Test("公告统一从反馈服务域名获取")
+    func announcementUsesUnifiedServiceEndpoint() {
+        #expect(AnnouncementManager.announcementURL.host == "feedback.els.ericterminal.com")
+        #expect(AnnouncementManager.announcementURL.path == "/v1/announcements")
+    }
 
     @Test("简体环境只命中 zh-Hans，不命中 zh-Hant")
     func simplifiedLocaleMatchesOnlyHans() {
@@ -56,27 +61,4 @@ struct AnnouncementLanguageMatchingTests {
         #expect(specific > generic)
     }
 
-    @Test("手动 App 语言会影响内置模型提示语言")
-    func manualAppLanguageControlsModelPromptLanguage() {
-        let previous = Persistence.readAppConfigText(key: AppConfigKey.appLanguage.rawValue)
-        defer {
-            if let previous {
-                Persistence.writeAppConfig(
-                    key: AppConfigKey.appLanguage.rawValue,
-                    text: previous,
-                    typeHint: AppConfigKey.appLanguage.typeHint
-                )
-            } else {
-                Persistence.deleteAppConfig(key: AppConfigKey.appLanguage.rawValue)
-            }
-        }
-
-        Persistence.writeAppConfig(
-            key: AppConfigKey.appLanguage.rawValue,
-            text: AppLanguagePreference.japanese.rawValue,
-            typeHint: AppConfigKey.appLanguage.typeHint
-        )
-
-        #expect(ModelPromptLanguage.current == .japanese)
-    }
 }

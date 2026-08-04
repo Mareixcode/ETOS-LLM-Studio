@@ -23,6 +23,9 @@ struct WatchMessageRowView: View {
     let connectsTimelineToNext: Bool
     let isLiquidGlassEnabled: Bool
     let canRetry: Bool
+    let isSelectionMode: Bool
+    let isSelected: Bool
+    let onToggleSelection: () -> Void
     let onOpenMore: () -> Void
 
     private var message: ChatMessage {
@@ -74,6 +77,7 @@ struct WatchMessageRowView: View {
     var body: some View {
         let bubble = ChatBubble(
             messageState: state,
+            roleplaySessionID: viewModel.currentSession?.id,
             preparedMarkdownPayload: viewModel.preparedMarkdownByMessageID[message.id],
             preparedReasoningMarkdownPayload: viewModel.preparedReasoningMarkdownByMessageID[message.id],
             reasoningThinkingTitle: viewModel.reasoningThinkingTitleByMessageID[message.id],
@@ -119,6 +123,9 @@ struct WatchMessageRowView: View {
             onSwitchToNextVersion: {
                 viewModel.switchToNextVersion(of: message)
             },
+            isSelectionMode: isSelectionMode,
+            isSelected: isSelected,
+            onToggleSelection: onToggleSelection,
             onOpenMore: hasActivePermission ? nil : onOpenMore,
             providers: viewModel.providers
         )
@@ -126,7 +133,7 @@ struct WatchMessageRowView: View {
         .listRowInsets(EdgeInsets())
         .listRowBackground(Color.clear)
 
-        if hasActivePermission {
+        if hasActivePermission || isSelectionMode {
             bubble
         } else {
             bubble.swipeActions(edge: .leading) {

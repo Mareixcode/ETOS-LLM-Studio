@@ -19,6 +19,7 @@ import Testing
 import ETOSCore
 @testable import ETOS_LLM_Studio_Watch_App
 
+@MainActor
 struct ETOS_LLM_Studio_Watch_AppTests {
 
     @Test("自动朗读触发条件判断")
@@ -461,6 +462,19 @@ struct ETOS_LLM_Studio_Watch_AppTests {
         )
     }
 
+    @Test("TextFieldLink 提交会保留换行转义输入习惯")
+    func testWatchChatInputSubmissionNormalizesEscapedNewlines() {
+        let submittedText = "第一行\\n第二行"
+
+        #expect(WatchChatInputSubmission.normalizedText(from: submittedText) == "第一行\n第二行")
+    }
+
+    @Test("手表聊天输入已有草稿时使用可回填编辑页")
+    func testWatchChatInputUsesBoundEditorForExistingDraft() {
+        #expect(!WatchChatInputSubmission.shouldUseBoundEditor(for: ""))
+        #expect(WatchChatInputSubmission.shouldUseBoundEditor(for: "继续写"))
+    }
+
     @Test("Markdown 围栏闭合容错：重复语言标签闭合会被规范为标准围栏")
     func testMarkdownFenceNormalizationForRepeatedLanguageClosing() async {
         let source = """
@@ -497,6 +511,51 @@ let value = 42
 """
 
         #expect(ETPreparedMarkdownRenderPayload.extractThinkingTitle(from: source) == "定位展开状态")
+    }
+
+    @Test("watchOS 会为裸 TeX 提供二级公式预览内容")
+    func testBareTeXPreparesWatchMathPreview() async {
+        let source = #"答案是 \frac{1}{2}。"#
+
+        let prepared = await ETPreparedMarkdownRenderPayload.build(from: source)
+
+        #expect(prepared.containsMathContent)
+        #expect(prepared.mathRenderText == #"答案是 \(\frac{1}{2}\)。"#)
+    }
+
+    @Test("watchOS 官方社群二维码使用指定链接")
+    func testOfficialCommunityQRCodePayloads() {
+        #expect(WatchOfficialCommunity.qq.account == "974605250")
+        #expect(
+            WatchOfficialCommunity.qq.qrPayload
+                == "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=974605250&card_type=group&source=qrcode"
+        )
+        #expect(WatchOfficialCommunity.qq.qrAssetName == "OfficialCommunityQQQRCode")
+
+        #expect(WatchOfficialCommunity.telegram.account == "@ETOSLLMStudio")
+        #expect(
+            WatchOfficialCommunity.telegram.qrPayload
+                == "https://t.me/ETOSLLMStudio"
+        )
+        #expect(WatchOfficialCommunity.telegram.qrAssetName == "OfficialCommunityTelegramQRCode")
+
+        #expect(WatchOfficialCommunity.testFlight.account == nil)
+        #expect(
+            WatchOfficialCommunity.testFlight.qrPayload
+                == "https://testflight.apple.com/join/d4PgF4CK"
+        )
+        #expect(
+            WatchOfficialCommunity.testFlight.qrAssetName
+                == "OfficialCommunityTestFlightQRCode"
+        )
+        #expect(
+            WatchOfficialCommunity.visibleCommunities(for: .appStore)
+                == [.qq, .telegram, .testFlight]
+        )
+        #expect(
+            WatchOfficialCommunity.visibleCommunities(for: .testFlight)
+                == [.qq, .telegram]
+        )
     }
 
 }

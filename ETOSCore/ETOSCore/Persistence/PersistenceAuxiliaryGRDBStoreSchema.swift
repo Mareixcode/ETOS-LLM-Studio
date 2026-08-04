@@ -82,6 +82,7 @@ extension PersistenceAuxiliaryGRDBStore {
                         id TEXT PRIMARY KEY NOT NULL,
                         name TEXT NOT NULL,
                         base_url TEXT NOT NULL,
+                        chat_endpoint_path TEXT NOT NULL DEFAULT '/chat/completions',
                         api_format TEXT NOT NULL,
                         proxy_is_enabled INTEGER,
                         proxy_type TEXT,
@@ -120,6 +121,7 @@ extension PersistenceAuxiliaryGRDBStore {
                         provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
                         model_name TEXT NOT NULL,
                         display_name TEXT NOT NULL,
+                        picker_group_name TEXT,
                         is_activated INTEGER NOT NULL,
                         kind TEXT,
                         input_modalities_json TEXT,
@@ -838,6 +840,68 @@ extension PersistenceAuxiliaryGRDBStore {
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_mcp_tools_server_sort ON mcp_tools(server_id, sort_index ASC)")
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_mcp_tools_updated_at ON mcp_tools(updated_at DESC)")
             }
+
+            migrator.registerMigration("v13_add_provider_chat_endpoint_path") { db in
+                func tableExists(_ name: String) throws -> Bool {
+                    (try Int.fetchOne(
+                        db,
+                        sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        arguments: [name]
+                    ) ?? 0) > 0
+                }
+
+                func tableHasColumn(_ tableName: String, columnName: String) throws -> Bool {
+                    let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(\(tableName))")
+                    return columns.contains { row in
+                        let name: String = row["name"]
+                        return name == columnName
+                    }
+                }
+
+                guard try tableExists("providers") else { return }
+                if !(try tableHasColumn("providers", columnName: "chat_endpoint_path")) {
+                    try db.execute(sql: "ALTER TABLE providers ADD COLUMN chat_endpoint_path TEXT NOT NULL DEFAULT '/chat/completions'")
+                }
+            }
+
+            migrator.registerMigration("v14_add_provider_model_picker_group") { db in
+                let tableExists = (try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'provider_models'"
+                ) ?? 0) > 0
+                guard tableExists else { return }
+
+                let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(provider_models)")
+                let hasPickerGroupName = columns.contains { row in
+                    let name: String = row["name"]
+                    return name == "picker_group_name"
+                }
+                if !hasPickerGroupName {
+                    try db.execute(sql: "ALTER TABLE provider_models ADD COLUMN picker_group_name TEXT")
+                }
+            }
+
+            migrator.registerMigration("v15_remove_speech_to_text_model_marker") { db in
+                let providerModelsExist = (try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'provider_models'"
+                ) ?? 0) > 0
+                if providerModelsExist {
+                    try db.execute(
+                        sql: "UPDATE provider_models SET kind = 'chat' WHERE kind = 'speechToText'"
+                    )
+                }
+
+                let capabilitiesExist = (try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'provider_model_capabilities'"
+                ) ?? 0) > 0
+                if capabilitiesExist {
+                    try db.execute(
+                        sql: "DELETE FROM provider_model_capabilities WHERE capability = 'speechToText'"
+                    )
+                }
+            }
         }
 
         if supportsMemoryRelationalSchema {
@@ -874,6 +938,39 @@ extension PersistenceAuxiliaryGRDBStore {
                 }
                 if !hasFlag {
                     try db.execute(sql: "ALTER TABLE conversation_user_profile ADD COLUMN needs_llm_dedup INTEGER NOT NULL DEFAULT 0")
+                }
+            }
+
+            migrator.registerMigration("v4_add_structured_memory_metadata") { db in
+                let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(memory_items)")
+                let names = Set(columns.map { row -> String in row["name"] })
+                let additions: [(name: String, definition: String)] = [
+                    ("kind", "TEXT NOT NULL DEFAULT 'semantic'"),
+                    ("source", "TEXT NOT NULL DEFAULT 'manual'"),
+                    ("importance", "REAL NOT NULL DEFAULT 0.5"),
+                    ("confidence", "REAL NOT NULL DEFAULT 1.0"),
+                    ("entities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("valid_from", "REAL"),
+                    ("valid_until", "REAL"),
+                    ("source_session_id", "TEXT"),
+                    ("access_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_accessed_at", "REAL")
+                ]
+                for addition in additions where !names.contains(addition.name) {
+                    try db.execute(sql: "ALTER TABLE memory_items ADD COLUMN \(addition.name) \(addition.definition)")
+                }
+                try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_memory_items_kind ON memory_items(kind, is_archived)")
+                try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_memory_items_validity ON memory_items(valid_from, valid_until)")
+            }
+
+            migrator.registerMigration("v5_add_structured_conversation_profile") { db in
+                let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(conversation_user_profile)")
+                let names = Set(columns.map { row -> String in row["name"] })
+                if !names.contains("facts_json") {
+                    try db.execute(sql: "ALTER TABLE conversation_user_profile ADD COLUMN facts_json TEXT NOT NULL DEFAULT '[]'")
+                }
+                if !names.contains("schema_version") {
+                    try db.execute(sql: "ALTER TABLE conversation_user_profile ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
                 }
             }
         }

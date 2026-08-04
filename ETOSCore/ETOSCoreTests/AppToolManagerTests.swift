@@ -69,6 +69,40 @@ struct AppToolManagerTests {
         #expect(kinds.contains(.deleteSandboxItem))
     }
 
+    @Test("显示网页卡片工具只暴露当前平台的 HTML 宿主契约")
+    func testShowWidgetToolUsesCurrentPlatformContract() {
+        guard case let .dictionary(schema) = AppToolKind.showWidget.parameters,
+              case let .dictionary(properties)? = schema["properties"],
+              case let .dictionary(widgetCode)? = properties["widget_code"],
+              case let .string(widgetCodeDescription)? = widgetCode["description"],
+              case let .dictionary(inlineAspectRatio)? = properties["inline_aspect_ratio"],
+              case let .string(inlineAspectRatioDescription)? = inlineAspectRatio["description"],
+              case let .array(required)? = schema["required"] else {
+            Issue.record("显示网页卡片工具缺少 Widget HTML 或画幅参数说明。")
+            return
+        }
+
+        #expect(required.contains(.string("widget_code")))
+        #expect(required.contains(.string("inline_aspect_ratio")))
+        let toolDescription = AppToolKind.showWidget.toolDescription
+        #if os(watchOS)
+        #expect(toolDescription.contains("watchOS"))
+        #expect(widgetCodeDescription.contains("watchOS"))
+        #expect(inlineAspectRatioDescription.contains("watchOS"))
+        #expect(!toolDescription.contains("iOS"))
+        #expect(!widgetCodeDescription.contains("iOS"))
+        #elseif os(iOS)
+        #expect(toolDescription.contains("iOS"))
+        #expect(widgetCodeDescription.contains("iOS"))
+        #expect(inlineAspectRatioDescription.contains("iOS"))
+        #expect(!toolDescription.contains("watchOS"))
+        #expect(!widgetCodeDescription.contains("watchOS"))
+        #else
+        #expect(!toolDescription.isEmpty)
+        #expect(!widgetCodeDescription.isEmpty)
+        #endif
+    }
+
     @Test("创建自定义 JS 工具参数包含验证输入")
     func testCreateCustomJSToolParametersIncludeValidationInput() {
         guard case let .dictionary(schema) = AppToolKind.createCustomJSCJSTool.parameters,
@@ -283,7 +317,7 @@ struct AppToolManagerTests {
 
         let result = try await manager.executeToolFromChat(
             toolName: AppToolKind.showWidget.toolName,
-            argumentsJSON: #"{"title":"测试卡片","widget_code":"<div>hello</div>","loading_messages":["渲染中..."]}"#
+            argumentsJSON: #"{"title":"测试卡片","widget_code":"<div>hello</div>","inline_aspect_ratio":"3:4","loading_messages":["渲染中..."]}"#
         )
 
         guard let data = result.data(using: .utf8),
@@ -294,6 +328,7 @@ struct AppToolManagerTests {
 
         #expect(json["title"] as? String == "测试卡片")
         #expect(json["widget_code"] as? String == "<div>hello</div>")
+        #expect(json["inline_aspect_ratio"] as? String == "3:4")
         #expect((json["loading_messages"] as? [String]) == ["渲染中..."])
     }
 
@@ -364,8 +399,8 @@ struct AppToolManagerTests {
             toolName: AppToolKind.getSystemTime.toolName,
             argumentsJSON: "{}"
         )
-        #expect(result.contains("当前系统本地时间"))
-        #expect(result.contains("ISO8601"))
+        #expect(result.contains("当前系统时间"))
+        #expect(result.contains("时区"))
     }
 
     @MainActor

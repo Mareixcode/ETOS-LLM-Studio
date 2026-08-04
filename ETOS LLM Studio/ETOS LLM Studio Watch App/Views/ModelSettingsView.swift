@@ -20,6 +20,8 @@ struct ModelSettingsView: View {
     @State var requestBodyMode: Model.RequestBodyOverrideMode = .keyValue
     @State var rawJSONInput: String = "{}"
     @State var rawJSONError: String?
+    @State var requestBodyControlImportSources: [RunnableModel] = []
+    @State var isRequestBodyControlImportPresented = false
 
     init(model: Binding<Model>, provider: Provider, onSave: @escaping () -> Void = {}) {
         _model = model
@@ -31,6 +33,10 @@ struct ModelSettingsView: View {
         let preview = requestBodyPreview
 
         Form {
+            Section {
+                ModelConfigurationIntroCard()
+            }
+
             Section(
                 header: Text(NSLocalizedString("基础信息", comment: "")),
                 footer: Text(NSLocalizedString("模型ID是 API 调用时使用的真实标识，模型名称是 App 内展示给用户的别名。", comment: ""))
@@ -40,21 +46,47 @@ struct ModelSettingsView: View {
             }
 
             Section(
-                header: Text(NSLocalizedString("用途", comment: "模型用途区块标题")),
-                footer: Text(kindFooterText)
+                header: Text(NSLocalizedString("模型分组", comment: "模型选择器分组设置区块")),
+                footer: Text(NSLocalizedString("同一提供商内使用相同分组名称的模型会折叠在一起；留空则归入未分类模型。", comment: "模型选择器分组设置说明"))
             ) {
-                Picker(NSLocalizedString("用途", comment: "模型用途选择器标题"), selection: kindBinding) {
-                    ForEach(ModelKind.allCases, id: \.self) { kind in
-                        Text(kind.localizedName).tag(kind)
+                TextField(
+                    NSLocalizedString("分组名称（可选）", comment: "模型选择器分组名称输入框"),
+                    text: pickerGroupNameBinding.watchKeyboardNewlineBinding()
+                )
+            }
+
+            if model.isChatModel && !LocalModelProviderBridge.isLocalProvider(provider) {
+                Section {
+                    NavigationLink {
+                        SingleModelConnectivityTestView(provider: provider, model: model)
+                    } label: {
+                        Label(NSLocalizedString("模型测试", comment: "Model connectivity test title"), systemImage: "checkmark.seal")
                     }
+                } footer: {
+                    Text(NSLocalizedString("测试该模型的非流式、流式和工具调用能力。", comment: "Single model connectivity test entry footer"))
                 }
             }
 
             Section(
-                header: Text(NSLocalizedString("模型能力", comment: "模型能力区块标题")),
-                footer: Text(capabilityFooterText)
+                header: Text(NSLocalizedString("模型类型", comment: "模型类型区块标题")),
+                footer: Text(kindFooterText)
             ) {
-                modelCapabilityRows
+                Picker(NSLocalizedString("模型类型", comment: "模型类型选择器标题"), selection: kindBinding) {
+                    ForEach(ModelKind.allCases, id: \.self) { kind in
+                        Text(modelKindSelectionTitle(kind)).tag(kind)
+                    }
+                }
+            }
+
+            if model.kind == .chat {
+                chatModelCapabilitySections
+            } else {
+                Section(
+                    header: Text(NSLocalizedString("能力", comment: "模型能力区块标题")),
+                    footer: Text(capabilityFooterText)
+                ) {
+                    specializedModelCapabilityRows
+                }
             }
 
             Section(
@@ -158,9 +190,21 @@ struct ModelSettingsView: View {
                 RequestBodyPreviewInlineView(preview: preview)
             }
         }
+        .navigationDestination(isPresented: $isRequestBodyControlImportPresented) {
+            RequestBodyControlImportView(sources: requestBodyControlImportSources) { source in
+                model.appendCopiesOfRequestBodyControls(source.model.requestBodyControls)
+            }
+        }
         .navigationTitle(NSLocalizedString("编辑模型信息", comment: ""))
         .onAppear(perform: loadEditorState)
         .onDisappear(perform: saveEditorState)
+    }
+
+    private var pickerGroupNameBinding: Binding<String> {
+        Binding(
+            get: { model.pickerGroupName ?? "" },
+            set: { model.pickerGroupName = $0 }
+        )
     }
 }
 
@@ -213,24 +257,23 @@ extension ModelSettingsView {
             return NSLocalizedString("用于长期记忆和检索向量化，不会出现在聊天模型列表中。", comment: "嵌入模型用途说明")
         case .rerank:
             return NSLocalizedString("用于检索结果重排，通常配合知识库或搜索结果精排使用。", comment: "重排模型用途说明")
-        case .speechToText:
-            return NSLocalizedString("用于把录音转换为文字。", comment: "语音转文字模型用途说明")
         case .textToSpeech:
             return NSLocalizedString("用于把文字转换为语音。", comment: "文字转语音模型用途说明")
         }
     }
 
+    private func modelKindSelectionTitle(_ kind: ModelKind) -> String {
+        kind == .image ? ModelModality.image.localizedName : kind.localizedName
+    }
+
     private var capabilityFooterText: String {
         switch model.kind {
-        case .chat:
-            if model.outputModalities.contains(.image) {
-                return NSLocalizedString("开启“可生成图片”后，选中该模型的主聊天会直接按生图请求处理。", comment: "聊天模型生图能力说明")
-            }
-            return NSLocalizedString("这些开关描述模型能做什么；服务商原生工具等请求参数由适配器处理。", comment: "聊天模型能力说明")
         case .image:
             return NSLocalizedString("图片生成由用途决定；如果模型支持图生图，可以开启参考图片。", comment: "图片模型能力说明")
-        case .embedding, .rerank, .speechToText, .textToSpeech:
+        case .embedding, .rerank, .textToSpeech:
             return NSLocalizedString("专用模型的输入和输出由用途决定，通常不需要额外配置。", comment: "专用模型能力说明")
+        case .chat:
+            return ""
         }
     }
 
@@ -238,32 +281,75 @@ extension ModelSettingsView {
         guard let pricing = model.pricing?.normalized, !pricing.isEffectivelyEmpty else {
             return NSLocalizedString("未配置", comment: "Model pricing not configured summary")
         }
+        if pricing.billingMode == .perRequest {
+            var parts = [NSLocalizedString("按次计费", comment: "Per-request pricing summary")]
+            if let perRequestPrice = pricing.perRequestPrice {
+                parts.append(String(
+                    format: NSLocalizedString("每次 %@", comment: "Per-request pricing value summary"),
+                    MessageCostFormatter.formatPriceValue(perRequestPrice)
+                ))
+            } else {
+                parts.append(NSLocalizedString("未填写价格", comment: "Pricing value missing summary"))
+            }
+            return parts.joined(separator: NSLocalizedString("，", comment: "List separator"))
+        }
         let baseCount = [
             pricing.inputPerMillionTokens,
             pricing.outputPerMillionTokens,
             pricing.cacheWritePerMillionTokens,
             pricing.cacheReadPerMillionTokens
         ].compactMap { $0 }.count
-        if pricing.tiers.isEmpty {
-            return String(format: NSLocalizedString("已填写 %d 项", comment: "Model pricing configured fields summary"), baseCount)
+        var parts: [String] = []
+        if baseCount > 0 {
+            parts.append(String(format: NSLocalizedString("已填写 %d 项", comment: "Model pricing configured fields summary"), baseCount))
         }
-        return String(
-            format: NSLocalizedString("已填写 %d 项，%d 个阶梯", comment: "Model pricing configured fields and tiers summary"),
-            baseCount,
-            pricing.tiers.count
-        )
+        if !pricing.tiers.isEmpty {
+            parts.append(String(format: NSLocalizedString("%d 个阶梯", comment: "Model pricing tiers summary"), pricing.tiers.count))
+        }
+        if pricing.timeOverridesEnabled, !pricing.timeOverrides.isEmpty {
+            parts.append(String(format: NSLocalizedString("%d 个峰谷时段", comment: "Peak valley pricing ranges summary"), pricing.timeOverrides.count))
+        } else if !pricing.timeOverrides.isEmpty {
+            parts.append(NSLocalizedString("峰谷已关闭", comment: "Peak valley pricing disabled summary"))
+        }
+        return parts.isEmpty
+            ? NSLocalizedString("未配置", comment: "Model pricing not configured summary")
+            : parts.joined(separator: NSLocalizedString("，", comment: "List separator"))
     }
 
     @ViewBuilder
-    private var modelCapabilityRows: some View {
+    private var chatModelCapabilitySections: some View {
+        Section(NSLocalizedString("输入模态", comment: "聊天模型输入模态区块标题")) {
+            ForEach(availableInputModalities, id: \.self) { modality in
+                Toggle(modality.localizedName, isOn: modalityBinding(modality, keyPath: \.inputModalities))
+            }
+        }
+
+        Section(NSLocalizedString("输出模态", comment: "聊天模型输出模态区块标题")) {
+            Toggle(ModelModality.text.localizedName, isOn: modalityBinding(.text, keyPath: \.outputModalities))
+            Toggle(ModelModality.image.localizedName, isOn: modalityBinding(.image, keyPath: \.outputModalities))
+        }
+
+        Section {
+            Toggle(ModelCapability.toolCalling.localizedName, isOn: capabilityBinding(.toolCalling))
+            Toggle(ModelCapability.reasoning.localizedName, isOn: capabilityBinding(.reasoning))
+        } header: {
+            Text(NSLocalizedString("能力", comment: "聊天模型能力区块标题"))
+        } footer: {
+            Text(NSLocalizedString("推理能力开启后会自动添加思考预算控制；关闭能力不会删除已经配置的控制。", comment: "推理能力与结构化控制联动说明"))
+        }
+    }
+
+    private var availableInputModalities: [ModelModality] {
+        ModelModality.allCases.filter { modality in
+            modality != .video
+                || provider.apiFormat.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == "gemini"
+        }
+    }
+
+    @ViewBuilder
+    private var specializedModelCapabilityRows: some View {
         switch model.kind {
-        case .chat:
-            Toggle(NSLocalizedString("可处理图片", comment: "聊天模型能力：图片输入"), isOn: modalityBinding(.image, keyPath: \.inputModalities))
-            Toggle(NSLocalizedString("可处理音频", comment: "聊天模型能力：音频输入"), isOn: modalityBinding(.audio, keyPath: \.inputModalities))
-            Toggle(NSLocalizedString("可处理文件", comment: "聊天模型能力：文件输入"), isOn: modalityBinding(.file, keyPath: \.inputModalities))
-            Toggle(NSLocalizedString("可生成图片", comment: "聊天模型能力：图片输出"), isOn: modalityBinding(.image, keyPath: \.outputModalities))
-            Toggle(NSLocalizedString("可调用工具", comment: "聊天模型能力：工具调用"), isOn: capabilityBinding(.toolCalling))
-            Toggle(NSLocalizedString("可用于嵌入", comment: "聊天模型能力：嵌入"), isOn: capabilityBinding(.embedding))
         case .image:
             Toggle(NSLocalizedString("支持参考图片", comment: "图片生成模型能力：参考图片输入"), isOn: modalityBinding(.image, keyPath: \.inputModalities))
         case .embedding:
@@ -272,12 +358,11 @@ extension ModelSettingsView {
         case .rerank:
             Text(NSLocalizedString("此模型用于重新排序候选内容。", comment: "重排模型能力说明"))
                 .foregroundStyle(.secondary)
-        case .speechToText:
-            Text(NSLocalizedString("此模型接收音频并输出文字。", comment: "语音转文字模型能力说明"))
-                .foregroundStyle(.secondary)
         case .textToSpeech:
             Text(NSLocalizedString("此模型接收文字并输出语音。", comment: "文字转语音模型能力说明"))
                 .foregroundStyle(.secondary)
+        case .chat:
+            EmptyView()
         }
     }
 
@@ -314,6 +399,9 @@ extension ModelSettingsView {
                 var capabilitySet = Set(model.capabilities)
                 if isEnabled {
                     capabilitySet.insert(capability)
+                    if capability == .reasoning {
+                        model.ensureThinkingRequestBodyControl(apiFormat: provider.apiFormat)
+                    }
                 } else {
                     capabilitySet.remove(capability)
                 }

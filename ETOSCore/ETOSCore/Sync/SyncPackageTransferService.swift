@@ -111,9 +111,13 @@ public enum SyncPackageTransferService {
         exportedAt: Date = Date(),
         fileManager: FileManager = .default
     ) throws -> SyncPackageExportFileOutput {
-        try exportPackageToFile(
+        let temporaryDirectory = try SyncTemporaryFileCleaner.ensureCurrentSessionDirectory(
+            temporaryDirectory: fileManager.temporaryDirectory,
+            fileManager: fileManager
+        )
+        return try exportPackageToFile(
             package,
-            destinationDirectory: fileManager.temporaryDirectory,
+            destinationDirectory: temporaryDirectory,
             exportedAt: exportedAt,
             fileManager: fileManager
         )
@@ -424,15 +428,21 @@ public enum SyncPackageTransferService {
             }
         }
 
-        if package.options.contains(.appStorage), let snapshot = package.appStorageSnapshot {
-            descriptors.append(
-                SyncRecordDescriptor(
+        if package.options.contains(.appStorage),
+           let snapshot = package.appStorageSnapshot,
+           let values = SyncEngine.decodeAppStorageSnapshot(snapshot) {
+            descriptors.append(contentsOf: values.keys.sorted().compactMap { key in
+                guard let value = values[key],
+                      let encoded = SyncEngine.encodeAppStorageSnapshot([key: value]) else {
+                    return nil
+                }
+                return SyncRecordDescriptor(
                     type: .appStorage,
-                    recordID: "global.app.storage",
-                    checksum: snapshot.sha256Hex,
+                    recordID: key,
+                    checksum: encoded.sha256Hex,
                     updatedAt: generatedAt
                 )
-            )
+            })
         }
 
         return SyncManifest(
@@ -620,7 +630,8 @@ private final class SyncPackageJSONFileWriter {
         stream.open()
         guard stream.streamStatus == .open || stream.streamStatus == .writing else {
             throw SyncPackageTransferError.fileWriteFailed(
-                stream.streamError?.localizedDescription ?? "输出流打开失败"
+                stream.streamError?.localizedDescription
+                    ?? NSLocalizedString("输出流打开失败", comment: "Sync package output stream open failure")
             )
         }
     }
@@ -631,7 +642,9 @@ private final class SyncPackageJSONFileWriter {
 
     func write(_ text: String) throws {
         guard let data = text.data(using: .utf8) else {
-            throw SyncPackageTransferError.fileWriteFailed("无法编码文本片段")
+            throw SyncPackageTransferError.fileWriteFailed(
+                NSLocalizedString("无法编码文本片段", comment: "Sync package text encoding failure")
+            )
         }
         try write(data)
     }
@@ -655,11 +668,14 @@ private final class SyncPackageJSONFileWriter {
                 let count = stream.write(baseAddress.advanced(by: written), maxLength: data.count - written)
                 if count < 0 {
                     throw SyncPackageTransferError.fileWriteFailed(
-                        stream.streamError?.localizedDescription ?? "输出流写入失败"
+                        stream.streamError?.localizedDescription
+                            ?? NSLocalizedString("输出流写入失败", comment: "Sync package output stream write failure")
                     )
                 }
                 if count == 0 {
-                    throw SyncPackageTransferError.fileWriteFailed("输出流未写入任何数据")
+                    throw SyncPackageTransferError.fileWriteFailed(
+                        NSLocalizedString("输出流未写入任何数据", comment: "Sync package output stream wrote no data")
+                    )
                 }
                 written += count
             }

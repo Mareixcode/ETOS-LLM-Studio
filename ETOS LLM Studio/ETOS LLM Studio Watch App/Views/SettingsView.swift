@@ -11,9 +11,12 @@
 import SwiftUI
 import Foundation
 import ETOSCore
+import WatchKit
 
 enum WatchSettingsNavigationDestination: Hashable, Identifiable {
+    case model
     case dailyPulse
+    case dailyPulseCard(runID: UUID, cardID: UUID)
     case feedbackCenter
     case feedbackIssue(issueNumber: Int)
     case achievementJournal
@@ -21,8 +24,12 @@ enum WatchSettingsNavigationDestination: Hashable, Identifiable {
 
     var id: String {
         switch self {
+        case .model:
+            return "model"
         case .dailyPulse:
             return "dailyPulse"
+        case .dailyPulseCard(let runID, let cardID):
+            return "dailyPulseCard-\(runID.uuidString)-\(cardID.uuidString)"
         case .feedbackCenter:
             return "feedbackCenter"
         case .feedbackIssue(let issueNumber):
@@ -89,7 +96,11 @@ struct SettingsView: View {
                     } else {
                         NavigationLink {
                             ModelSelectionView(
+                                viewModel: viewModel,
                                 models: options,
+                                providerGroups: viewModel.activatedConversationModelGroups,
+                                modelsByProviderID: viewModel.activatedConversationModelsByProviderID,
+                                layoutsByProviderID: viewModel.activatedConversationModelLayoutsByProviderID,
                                 selectedModel: selectedModelBinding
                             )
                         } label: {
@@ -120,101 +131,20 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    NavigationLink(destination: SessionListView(
-                        sessions: $viewModel.chatSessions,
-                        folders: $viewModel.sessionFolders,
-                        tags: viewModel.sessionTags,
-                        currentSession: $viewModel.currentSession,
-                        runningSessionIDs: viewModel.runningSessionIDs,
-                        deleteSessionAction: { session in
-                            viewModel.deleteSessions([session])
-                        },
-                        branchAction: { session, copyMessages in
-                            let newSession = viewModel.branchSession(from: session, copyMessages: copyMessages)
-                            return newSession
-                        },
-                        deleteLastMessageAction: { session in
-                            viewModel.deleteLastMessage(for: session)
-                        },
-                        sendSessionToCompanionAction: { session in
-                            WatchSyncManager.shared.sendSessionToCompanion(sessionID: session.id)
-                        },
-                        onSessionSelected: { selectedSession, messageOrdinal in
-                            if let messageOrdinal {
-                                viewModel.requestMessageJump(
-                                    sessionID: selectedSession.id,
-                                    messageOrdinal: messageOrdinal
-                                )
-                            } else {
-                                viewModel.clearPendingMessageJumpTarget()
-                            }
-                            ChatService.shared.setCurrentSession(selectedSession)
-                            dismiss()
-                        },
-                        updateSessionAction: { session in
-                            viewModel.updateSession(session)
-                        },
-                        createFolderAction: { name, parentID in
-                            viewModel.createSessionFolder(name: name, parentID: parentID)
-                        },
-                        renameFolderAction: { folder, newName in
-                            viewModel.renameSessionFolder(folder, newName: newName)
-                        },
-                        deleteFolderAction: { folder in
-                            viewModel.deleteSessionFolder(folder)
-                        },
-                        moveSessionToFolderAction: { session, folderID in
-                            viewModel.moveSession(session, toFolderID: folderID)
-                        },
-                        moveFolderToFolderAction: { folder, parentID in
-                            viewModel.moveSessionFolder(folder, toParentID: parentID)
-                        },
-                        createTagAction: { name, color in
-                            viewModel.createSessionTag(name: name, color: color)
-                        },
-                        updateTagAction: { tag, name, color in
-                            viewModel.updateSessionTag(tag, name: name, color: color)
-                        },
-                        deleteTagAction: { tag in
-                            viewModel.deleteSessionTag(tag)
-                        },
-                        setSessionTagsAction: { session, tagIDs in
-                            viewModel.setSessionTags(for: session, tagIDs: tagIDs)
-                        }
-                    )) {
-                        settingsNavigationLabel("历史会话管理", icon: .sessionHistory)
-                    }
-
                     NavigationLink(destination: ProviderListView().environmentObject(viewModel)) {
-                        settingsNavigationLabel("提供商与模型管理", icon: .providerManagement)
+                        settingsNavigationLabel("模型管理", icon: .providerManagement)
                     }
 
-                    NavigationLink(destination: ModelAdvancedSettingsView(
-                        aiTemperature: $viewModel.aiTemperature,
-                        aiTopP: $viewModel.aiTopP,
-                        aiTemperatureEnabled: $viewModel.aiTemperatureEnabled,
-                        aiTopPEnabled: $viewModel.aiTopPEnabled,
-                        globalSystemPromptEntries: $viewModel.globalSystemPromptEntries,
-                        selectedGlobalSystemPromptEntryID: $viewModel.selectedGlobalSystemPromptEntryID,
-                        maxChatHistory: $viewModel.maxChatHistory,
-                        lazyLoadMessageCount: $viewModel.lazyLoadMessageCount,
-                        enableStreaming: $viewModel.enableStreaming,
-                        enableResponseSpeedMetrics: $viewModel.enableResponseSpeedMetrics,
-                        enableOpenAIStreamIncludeUsage: $viewModel.enableOpenAIStreamIncludeUsage,
-                        enableAutoSessionNaming: $viewModel.enableAutoSessionNaming, // 传递新增的绑定
-                        enableReasoningSummary: $viewModel.enableReasoningSummary,
-                        currentSession: $viewModel.currentSession,
-                        includeSystemTimeInPrompt: $viewModel.includeSystemTimeInPrompt,
-                        systemTimeInjectionPosition: $viewModel.systemTimeInjectionPosition,
-                        enablePeriodicTimeLandmark: $viewModel.enablePeriodicTimeLandmark,
-                        periodicTimeLandmarkIntervalMinutes: $viewModel.periodicTimeLandmarkIntervalMinutes,
-                        addGlobalSystemPromptEntry: viewModel.addGlobalSystemPromptEntry,
-                        selectGlobalSystemPromptEntry: viewModel.selectGlobalSystemPromptEntry,
-                        updateSelectedGlobalSystemPromptContent: viewModel.updateSelectedGlobalSystemPromptContent,
-                        updateGlobalSystemPromptEntry: viewModel.updateGlobalSystemPromptEntry,
-                        deleteGlobalSystemPromptEntry: { viewModel.deleteGlobalSystemPromptEntry(id: $0) }
-                    )) {
-                        settingsNavigationLabel("偏好设置", icon: .modelAdvanced)
+                    NavigationLink(destination: advancedSettingsView(destination: .conversation)) {
+                        settingsNavigationLabel("会话", icon: .conversationSettings)
+                    }
+
+                    NavigationLink(destination: advancedSettingsView(destination: .prompts)) {
+                        settingsNavigationLabel("提示词", icon: .promptSettings)
+                    }
+
+                    NavigationLink(destination: advancedSettingsView(destination: .output)) {
+                        settingsNavigationLabel("输出", icon: .outputSettings)
                     }
 
                     NavigationLink(destination: DailyPulseView(viewModel: viewModel)) {
@@ -300,8 +230,23 @@ struct SettingsView: View {
             }
             .navigationDestination(item: $requestedDestination) { destination in
                 switch destination {
+                case .model:
+                    ModelSelectionView(
+                        viewModel: viewModel,
+                        models: viewModel.activatedConversationModels,
+                        providerGroups: viewModel.activatedConversationModelGroups,
+                        modelsByProviderID: viewModel.activatedConversationModelsByProviderID,
+                        layoutsByProviderID: viewModel.activatedConversationModelLayoutsByProviderID,
+                        selectedModel: selectedModelBinding
+                    )
                 case .dailyPulse:
                     DailyPulseView(viewModel: viewModel)
+                case .dailyPulseCard(let runID, let cardID):
+                    DailyPulseView(
+                        viewModel: viewModel,
+                        initialRunID: runID,
+                        initialCardID: cardID
+                    )
                 case .feedbackCenter:
                     FeedbackCenterView()
                 case .feedbackIssue(let issueNumber):
@@ -442,10 +387,51 @@ struct SettingsView: View {
         if pulseManager.todayRun != nil {
             return NSLocalizedString("已生成", comment: "每日脉冲已生成状态")
         }
+        if pulseManager.tomorrowRun != nil {
+            return NSLocalizedString("明日已准备", comment: "每日脉冲明日已准备状态")
+        }
         if deliveryCoordinator.reminderEnabled {
-            return deliveryCoordinator.reminderTimeText
+            return deliveryCoordinator.deliveryTimes.count == 1
+                ? deliveryCoordinator.reminderTimeText
+                : String(
+                    format: NSLocalizedString("%d 个时间点", comment: "Daily Pulse delivery time count"),
+                    deliveryCoordinator.deliveryTimes.count
+                )
         }
         return nil
+    }
+
+    private func advancedSettingsView(
+        destination: ModelAdvancedSettingsDestination
+    ) -> ModelAdvancedSettingsView {
+        ModelAdvancedSettingsView(
+            viewModel: viewModel,
+            aiTemperature: $viewModel.aiTemperature,
+            aiTopP: $viewModel.aiTopP,
+            aiTemperatureEnabled: $viewModel.aiTemperatureEnabled,
+            aiTopPEnabled: $viewModel.aiTopPEnabled,
+            globalSystemPromptEntries: $viewModel.globalSystemPromptEntries,
+            selectedGlobalSystemPromptEntryID: $viewModel.selectedGlobalSystemPromptEntryID,
+            maxChatHistory: $viewModel.maxChatHistory,
+            lazyLoadMessageCount: $viewModel.lazyLoadMessageCount,
+            enableStreaming: $viewModel.enableStreaming,
+            enableResponseSpeedMetrics: $viewModel.enableResponseSpeedMetrics,
+            enableOpenAIStreamIncludeUsage: $viewModel.enableOpenAIStreamIncludeUsage,
+            enableAutoSessionNaming: $viewModel.enableAutoSessionNaming,
+            enableReasoningSummary: $viewModel.enableReasoningSummary,
+            currentSession: $viewModel.currentSession,
+            includeSystemTimeInPrompt: $viewModel.includeSystemTimeInPrompt,
+            systemTimeInjectionPosition: $viewModel.systemTimeInjectionPosition,
+            enablePeriodicTimeLandmark: $viewModel.enablePeriodicTimeLandmark,
+            periodicTimeLandmarkIntervalMinutes: $viewModel.periodicTimeLandmarkIntervalMinutes,
+            addGlobalSystemPromptEntry: viewModel.addGlobalSystemPromptEntry,
+            selectGlobalSystemPromptEntry: viewModel.selectGlobalSystemPromptEntry,
+            updateSelectedGlobalSystemPromptContent: viewModel.updateSelectedGlobalSystemPromptContent,
+            updateGlobalSystemPromptEntry: viewModel.updateGlobalSystemPromptEntry,
+            deleteGlobalSystemPromptEntry: { viewModel.deleteGlobalSystemPromptEntry(id: $0) },
+            onSessionSelected: { dismiss() },
+            destination: destination
+        )
     }
 }
 
@@ -464,18 +450,16 @@ struct SettingsListIcon {
 extension SettingsListIcon {
     static let currentModel = SettingsListIcon(systemName: "cpu", backgroundColor: .blue)
     static let newConversation = SettingsListIcon(systemName: "plus", backgroundColor: .green, legacySystemName: "plus.message")
-    static let sessionHistory = SettingsListIcon(
-        systemName: "clock",
-        backgroundColor: .indigo,
-        legacySystemName: "list.bullet.rectangle"
-    )
+    static let slashCommands = SettingsListIcon(systemName: "terminal", backgroundColor: .indigo)
     static let providerManagement = SettingsListIcon(
         systemName: "cube",
         backgroundColor: .orange,
         legacySystemName: "list.bullet.rectangle.portrait"
     )
-    static let modelAdvanced = SettingsListIcon(systemName: "gearshape", backgroundColor: .purple, legacySystemName: "brain.head.profile")
     static let tts = SettingsListIcon(systemName: "speaker", backgroundColor: .pink, legacySystemName: "speaker.wave.2")
+    static let conversationSettings = SettingsListIcon(systemName: "bubble.left.and.bubble.right", backgroundColor: .indigo)
+    static let promptSettings = SettingsListIcon(systemName: "text.quote", backgroundColor: .purple)
+    static let outputSettings = SettingsListIcon(systemName: "waveform", backgroundColor: .blue)
     static let toolCenter = SettingsListIcon(systemName: "wrench", backgroundColor: .teal, legacySystemName: "slider.horizontal.3")
     static let dailyPulse = SettingsListIcon(systemName: "sparkles", backgroundColor: .yellow, legacySystemName: "sparkles.rectangle.stack")
     static let usageAnalytics = SettingsListIcon(systemName: "chart.bar", backgroundColor: .cyan, legacySystemName: "calendar.badge.clock")
@@ -485,6 +469,7 @@ extension SettingsListIcon {
     static let shortcuts = SettingsListIcon(systemName: "bolt", backgroundColor: .orange, legacySystemName: "bolt.horizontal.circle")
     static let imageGeneration = SettingsListIcon(systemName: "photo", backgroundColor: .pink, legacySystemName: "photo.on.rectangle.angled")
     static let worldbook = SettingsListIcon(systemName: "book", backgroundColor: .brown, legacySystemName: "book.pages")
+    static let roleplay = SettingsListIcon(systemName: "theatermasks", backgroundColor: .purple, legacySystemName: "person.2")
     static let speechInput = SettingsListIcon(systemName: "mic", backgroundColor: .red)
     static let extendedFeatures = SettingsListIcon(systemName: "ellipsis", backgroundColor: .indigo, legacySystemName: "puzzlepiece.extension")
     static let localModels = SettingsListIcon(systemName: "cpu", backgroundColor: .blue)
@@ -542,30 +527,307 @@ struct SettingsListIconView: View {
 
 private struct ModelSelectionView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
+    @ObservedObject private var appConfig = AppConfigStore.shared
+    @ObservedObject private var viewModel: ChatViewModel
 
     let models: [RunnableModel]
+    let providerGroups: [RunnableModelProviderGroup]
+    let modelsByProviderID: [UUID: [RunnableModel]]
+    let layoutsByProviderID: [UUID: RunnableModelPickerLayout]
     @Binding var selectedModel: RunnableModel?
+    @State private var quickSettingsTarget: RunnableModel?
+    @State private var selectedProviderID: UUID?
+    @State private var showsAllModels = false
+
+    init(
+        viewModel: ChatViewModel,
+        models: [RunnableModel],
+        providerGroups: [RunnableModelProviderGroup],
+        modelsByProviderID: [UUID: [RunnableModel]],
+        layoutsByProviderID: [UUID: RunnableModelPickerLayout],
+        selectedModel: Binding<RunnableModel?>
+    ) {
+        self.viewModel = viewModel
+        self.models = models
+        self.providerGroups = providerGroups
+        self.modelsByProviderID = modelsByProviderID
+        self.layoutsByProviderID = layoutsByProviderID
+        _selectedModel = selectedModel
+        let currentProviderID = selectedModel.wrappedValue?.provider.id
+        _selectedProviderID = State(
+            initialValue: currentProviderID.flatMap {
+                modelsByProviderID[$0] == nil ? nil : $0
+            } ?? providerGroups.first?.id
+        )
+    }
 
     var body: some View {
+        modelSelectionContent
+            .navigationTitle(NSLocalizedString("当前模型", comment: "当前模型选择页标题"))
+            .navigationDestination(item: $quickSettingsTarget) { model in
+                WatchQuickModelSettingsView(runnableModel: model)
+            }
+    }
+
+    @ViewBuilder
+    private var modelSelectionContent: some View {
+        if appConfig.watchModelPickerGroupsByProvider {
+            providerGroupedModelList
+        } else {
+            classicModelList
+        }
+    }
+
+    private var classicModelList: some View {
         List {
-            ForEach(models) { model in
-                Button {
-                    select(model)
-                } label: {
-                    selectionRow(
-                        title: model.model.displayName,
-                        subtitle: "\(model.provider.name) · \(model.model.modelName)",
-                        isSelected: selectedModel?.id == model.id
-                    )
+            Section {
+                ForEach(models) { model in
+                    modelButton(model, showsProviderName: true)
                 }
+            } footer: {
+                Text(NSLocalizedString("轻点切换模型，长按打开设置", comment: "模型选择列表操作提示"))
+            }
+            if appConfig.modelPickerPromptShortcutEnabled {
+                quickPromptSection
+            }
+            if appConfig.modelPickerWorldbookShortcutEnabled {
+                quickWorldbookSection
             }
         }
-        .navigationTitle(NSLocalizedString("当前模型", comment: "当前模型选择页标题"))
+    }
+
+    private var providerGroupedModelList: some View {
+        List {
+            if !showsAllModels {
+                Section(NSLocalizedString("提供商", comment: "")) {
+                    Picker(
+                        NSLocalizedString("提供商", comment: ""),
+                        selection: $selectedProviderID
+                    ) {
+                        ForEach(providerGroups) { group in
+                            Text(group.provider.name)
+                                .tag(Optional(group.id))
+                        }
+                    }
+                }
+            }
+
+            if showsAllModels {
+                modelSection(models: models, showsProviderName: true)
+            } else {
+                selectedProviderModelSections
+                showAllModelsSection
+            }
+            if appConfig.modelPickerPromptShortcutEnabled {
+                quickPromptSection
+            }
+            if appConfig.modelPickerWorldbookShortcutEnabled {
+                quickWorldbookSection
+            }
+        }
+        .id(showsAllModels)
+    }
+
+    private var selectedProviderModels: [RunnableModel] {
+        guard let selectedProviderID else { return [] }
+        return modelsByProviderID[selectedProviderID] ?? []
+    }
+
+    private var selectedProviderLayout: RunnableModelPickerLayout? {
+        guard let selectedProviderID else { return nil }
+        return layoutsByProviderID[selectedProviderID]
+    }
+
+    @ViewBuilder
+    private var selectedProviderModelSections: some View {
+        if let layout = selectedProviderLayout,
+           !layout.groups.isEmpty {
+            Section {
+                modelPickerTreeRows(layout.rootItems)
+            }
+        } else {
+            modelSection(
+                models: selectedProviderModels,
+                showsProviderName: false,
+                showsInteractionHint: false
+            )
+        }
+    }
+
+    private func modelPickerTreeRows(_ items: [RunnableModelPickerRootItem]) -> AnyView {
+        AnyView(
+            ForEach(items) { item in
+                switch item {
+                case .model(let model):
+                    modelButton(model, showsProviderName: false)
+                case .group(let group):
+                    modelGroupFolderButton(group)
+
+                    if appConfig.watchModelPickerExpandedGroupIDs.contains(group.id) {
+                        modelPickerTreeRows(group.items)
+                    }
+                }
+            }
+        )
+    }
+
+    private func modelSection(
+        models: [RunnableModel],
+        showsProviderName: Bool,
+        showsInteractionHint: Bool = true
+    ) -> some View {
+        Section {
+            ForEach(models) { model in
+                modelButton(model, showsProviderName: showsProviderName)
+            }
+        } header: {
+            Text(NSLocalizedString("模型", comment: ""))
+        } footer: {
+            if showsInteractionHint {
+                Text(NSLocalizedString("轻点切换模型，长按打开设置", comment: "模型选择列表操作提示"))
+            }
+        }
+    }
+
+    private var showAllModelsSection: some View {
+        Section {
+            Button(action: showAllModelsTemporarily) {
+                Label(
+                    NSLocalizedString("全部模型", comment: "模型选择器临时显示全部模型按钮"),
+                    systemImage: "square.grid.2x2"
+                )
+            }
+        } footer: {
+            Text(NSLocalizedString("轻点切换模型，长按打开设置", comment: "模型选择列表操作提示"))
+        }
+    }
+
+    private var quickPromptSection: some View {
+        Section {
+            NavigationLink {
+                WatchQuickPromptEditorView(viewModel: viewModel)
+            } label: {
+                Label(
+                    NSLocalizedString("提示词", comment: "模型选择器快速提示词入口"),
+                    systemImage: "text.quote"
+                )
+            }
+        }
+    }
+
+    private var quickWorldbookSection: some View {
+        Section {
+            NavigationLink {
+                WatchWorldbookSessionBindingView(
+                    session: Binding(
+                        get: { viewModel.currentSession },
+                        set: { viewModel.currentSession = $0 }
+                    )
+                )
+            } label: {
+                Label(
+                    NSLocalizedString("世界书", comment: "模型选择器快速世界书入口"),
+                    systemImage: "books.vertical"
+                )
+            }
+            .disabled(viewModel.currentSession == nil)
+        }
+    }
+
+    private func groupExpansionBinding(for groupID: String) -> Binding<Bool> {
+        Binding(
+            get: { appConfig.watchModelPickerExpandedGroupIDs.contains(groupID) },
+            set: { isExpanded in
+                var expandedGroupIDs = appConfig.watchModelPickerExpandedGroupIDs
+                if isExpanded {
+                    expandedGroupIDs.insert(groupID)
+                } else {
+                    expandedGroupIDs.remove(groupID)
+                }
+                appConfig.watchModelPickerExpandedGroupIDs = expandedGroupIDs
+            }
+        )
+    }
+
+    private func modelGroupFolderButton(_ group: RunnableModelPickerGroup) -> some View {
+        let isExpanded = appConfig.watchModelPickerExpandedGroupIDs.contains(group.id)
+        return Button {
+            let binding = groupExpansionBinding(for: group.id)
+            if accessibilityReduceMotion {
+                binding.wrappedValue.toggle()
+            } else {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    binding.wrappedValue.toggle()
+                }
+            }
+            WKInterfaceDevice.current().play(.click)
+        } label: {
+            HStack {
+                Label(
+                    group.name,
+                    systemImage: isExpanded ? "folder.fill" : "folder"
+                )
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func showAllModelsTemporarily() {
+        WKInterfaceDevice.current().play(.click)
+        showsAllModels = true
+    }
+
+    private func modelButton(
+        _ model: RunnableModel,
+        showsProviderName: Bool
+    ) -> some View {
+        selectionRow(
+            title: model.model.displayName,
+            subtitle: showsProviderName
+                ? "\(model.provider.name) · \(model.model.modelName)"
+                : model.model.modelName,
+            isSelected: selectedModel?.id == model.id
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .gesture(
+            LongPressGesture(minimumDuration: 0.45)
+                .exclusively(before: TapGesture())
+                .onEnded { gesture in
+                    switch gesture {
+                    case .first(_):
+                        presentSettings(for: model)
+                    case .second(_):
+                        select(model)
+                    }
+                }
+        )
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            select(model)
+        }
+        .accessibilityHint(NSLocalizedString("长按可打开模型设置", comment: "模型选择行的无障碍提示"))
+        .accessibilityAction(named: Text(NSLocalizedString("打开模型设置", comment: "模型选择行的无障碍操作"))) {
+            presentSettings(for: model)
+        }
     }
 
     private func select(_ model: RunnableModel) {
         selectedModel = model
         dismiss()
+    }
+
+    private func presentSettings(for model: RunnableModel) {
+        WKInterfaceDevice.current().play(.click)
+        quickSettingsTarget = model
     }
 
     @ViewBuilder
@@ -579,5 +841,29 @@ private struct ModelSelectionView: View {
                 weight: .regular
             )
         )
+    }
+}
+
+private struct WatchQuickModelSettingsView: View {
+    @State private var provider: Provider
+    private let modelID: UUID
+
+    init(runnableModel: RunnableModel) {
+        _provider = State(initialValue: runnableModel.provider)
+        modelID = runnableModel.model.id
+    }
+
+    var body: some View {
+        if let modelIndex = provider.models.firstIndex(where: { $0.id == modelID }) {
+            ModelSettingsView(
+                model: $provider.models[modelIndex],
+                provider: provider,
+                onSave: saveProvider
+            )
+        }
+    }
+
+    private func saveProvider() {
+        ChatService.shared.saveProviderFromManagement(provider)
     }
 }

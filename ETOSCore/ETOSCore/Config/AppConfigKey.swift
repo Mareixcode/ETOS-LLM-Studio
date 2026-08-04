@@ -66,6 +66,51 @@ public enum ReasoningContentEchoMode: String, CaseIterable, Identifiable, Sendab
     }
 }
 
+public enum VideoFrameExtractionMode: String, CaseIterable, Identifiable, Sendable {
+    case smart
+    case fixedFPS = "fixed_fps"
+
+    public static let defaultMode: VideoFrameExtractionMode = .smart
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .smart:
+            return NSLocalizedString("智能抽帧", comment: "Video frame extraction mode smart")
+        case .fixedFPS:
+            return NSLocalizedString("固定 FPS", comment: "Video frame extraction mode fixed FPS")
+        }
+    }
+
+    public static func normalized(_ rawValue: String) -> VideoFrameExtractionMode {
+        VideoFrameExtractionMode(rawValue: rawValue) ?? defaultMode
+    }
+}
+
+public enum LiquidGlassTintSetting {
+    public static let minimumOpacity = 0.0
+    public static let maximumOpacity = 0.6
+    public static let defaultOpacity = 0.3
+    public static let opacityStep = 0.05
+
+    public static func normalized(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultOpacity }
+        return min(max(value, minimumOpacity), maximumOpacity)
+    }
+}
+
+public enum BackgroundGenerationAudioKeepAliveSettings {
+    public static let minimumVolume = 0.05
+    public static let maximumVolume = 1.0
+    public static let defaultVolume = 0.15
+
+    public static func normalizedVolume(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultVolume }
+        return min(max(value, minimumVolume), maximumVolume)
+    }
+}
+
 public enum AppConfigKey: String, CaseIterable, Sendable {
     case syncProviders = "sync.options.providers"
     case syncSessions = "sync.options.sessions"
@@ -99,9 +144,11 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case providerOrderIDs = "providerOrder.ids"
     case selectedRunnableModelID = "selectedRunnableModelID"
     case lastActiveSessionID = "launch.lastActiveSessionID"
+    case lastAppBackgroundedAt = "launch.lastAppBackgroundedAt"
     case localModelsEnabled = "localModels.enabled"
     case localModelPerformanceMonitorEnabled = "localModels.performanceMonitor.enabled"
     case localModelCacheEnabled = "localModels.cache.enabled"
+    case localModelKVCacheEnabled = "localModels.kvCache.enabled"
     case appToolsChatToolsEnabled = "appTools.chatToolsEnabled"
     case appToolsEnabledToolIDs = "appTools.enabledToolIDs"
     case appToolsKnownDefaultToolIDs = "appTools.knownDefaultToolIDs"
@@ -126,15 +173,25 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case aiTopPEnabled = "aiTopPEnabled"
     case systemPrompt = "systemPrompt"
     case maxChatHistory = "maxChatHistory"
+    case enableContextCompressionReminder = "contextCompression.reminder.enabled"
+    case contextCompressionReminderTokenThreshold = "contextCompression.reminder.tokenThreshold"
     case enableStreaming = "enableStreaming"
     case enableResponseSpeedMetrics = "enableResponseSpeedMetrics"
+    case requestLogEnabled = "logs.request.enabled"
     case requestLogPlainMessageEnabled = "logs.request.plainMessageEnabled"
+    case performanceTelemetryEnabled = "telemetry.performance.enabled"
     case modelConnectivityTestConcurrencyLimit = "modelConnectivityTest.concurrencyLimit"
     case enableOpenAIStreamIncludeUsage = "enableOpenAIStreamIncludeUsage"
     case reasoningContentEchoMode = "chat.reasoningContentEchoMode"
     case lazyLoadMessageCount = "lazyLoadMessageCount"
     case enableAutoSessionNaming = "enableAutoSessionNaming"
+    case chatSendDelaySeconds = "chat.sendDelaySeconds"
     case messageRegexRules = "chat.messageRegexRules"
+    case videoFrameExtractionMode = "video.frameExtraction.mode"
+    case videoFrameExtractionFPS = "video.frameExtraction.fps"
+    case videoFrameMaximumCount = "video.frameExtraction.maximumCount"
+    case enableVideoAnalysisForNonNativeModels = "video.analysis.enabled"
+    case videoAnalysisModelIdentifier = "video.analysis.modelIdentifier"
 
     case enableMemory = "enableMemory"
     case enableMemoryWrite = "enableMemoryWrite"
@@ -142,6 +199,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case memoryTopK = "memoryTopK"
     case memorySendUpdateTime = "memory.sendUpdateTime"
     case memoryReembeddingConcurrencyLimit = "memoryReembedding.concurrencyLimit"
+    case enableMemoryAutoConsolidation = "memory.autoConsolidation.enabled"
+    case memoryAutoConsolidationState = "memory.autoConsolidation.state"
     case enableConversationMemoryAsync = "enableConversationMemoryAsync"
     case conversationMemoryRecentLimit = "conversationMemoryRecentLimit"
     case conversationMemoryRoundThreshold = "conversationMemoryRoundThreshold"
@@ -173,6 +232,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case enableAutoRotateBackground = "enableAutoRotateBackground"
     case enableReasoningSummary = "enableReasoningSummary"
     case enableLiquidGlass = "enableLiquidGlass"
+    case liquidGlassTintOpacity = "liquidGlass.tintOpacity"
     case enableChatTopBlurFade = "enableChatTopBlurFade"
     case enableNoBubbleUI = "enableNoBubbleUI"
     case chatScrollAnimationEnabled = "chat.scrollAnimation.enabled"
@@ -187,7 +247,10 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case fontUseCustomFonts = "font.useCustomFonts"
     case fontFallbackScope = "font.fallbackScope"
     case fontCustomScale = "font.customScale"
+    case fontLineSpacingEmIOS = "font.lineSpacingEm.iOS"
+    case fontLineSpacingEmWatchOS = "font.lineSpacingEm.watchOS"
     case appLanguage = "ui.appLanguage"
+    case watchInputQuickActionConfiguration = "watch.input.quickActions.configuration"
     case watchAttachmentLastSource = "watch.attachment.lastSource"
     case watchAttachmentSourceHistory = "watch.attachment.sourceHistory"
     case watchBackgroundLastSource = "watch.background.lastSource"
@@ -195,12 +258,25 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case watchUseThirdPartyKeyboard = "watch.keyboard.useThirdPartyKeyboard"
     case localDebugLastServerAddress = "localDebug.lastServerAddress"
     case settingsColorfulIconsEnabled = "ui.settingsColorfulIconsEnabled"
+    case iOSModelPickerGroupsByProvider = "ui.modelPicker.groupByProvider.iOS"
+    case watchModelPickerGroupsByProvider = "ui.modelPicker.groupByProvider.watchOS"
+    case modelPickerPromptShortcutEnabled = "ui.modelPicker.promptShortcut.enabled"
+    case modelPickerWorldbookShortcutEnabled = "ui.modelPicker.worldbookShortcut.enabled"
+    case iOSModelPickerExpandedGroupIDs = "ui.modelPicker.expandedGroupIDs.iOS"
+    case watchModelPickerExpandedGroupIDs = "ui.modelPicker.expandedGroupIDs.watchOS"
+    case modelPickerFolderPathsByProvider = "ui.modelPicker.folderPathsByProvider"
+    case chatQuickActionIDs = "ui.chatQuickActionIDs"
+    case temporaryChatMemoryEnabled = "chat.temporary.memoryEnabled"
+    case enableSlashCommands = "chat.slashCommands.enabled"
     case chatComposerDraft = "chat.composer.draft"
     case restoreLastSessionOnLaunch = "launch.restoreLastSessionOnLaunchEnabled"
+    case restoreLastSessionOnlyIfRecent = "launch.restoreLastSessionOnlyIfRecent"
+    case restoreLastSessionWithinMinutes = "launch.restoreLastSessionWithinMinutes"
     case providerDetailGroupByMainstream = "providerDetail.groupByMainstream"
     case backgroundCropTarget = "backgroundCropTarget"
     case shortcutBridgeShortcutName = "shortcut.bridgeShortcutName"
 
+    case openAITailContextUsesSystemRole = "openAI.tailContextUsesSystemRole"
     case includeSystemTimeInPrompt = "includeSystemTimeInPrompt"
     case systemTimeInjectionPosition = "systemTimeInjectionPosition"
     case enablePeriodicTimeLandmark = "enablePeriodicTimeLandmark"
@@ -208,6 +284,10 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case sendSpeechAsAudio = "sendSpeechAsAudio"
     case enableSpeechInput = "enableSpeechInput"
     case audioRecordingFormat = "audioRecordingFormat"
+    case backgroundGenerationKeepAliveEnabled = "backgroundGeneration.keepAlive.locationEnabled"
+    case backgroundGenerationAudioKeepAliveEnabled = "backgroundGeneration.keepAlive.audioEnabled"
+    case backgroundGenerationAudioKeepAliveVolume = "backgroundGeneration.keepAlive.audioVolume"
+    case continueTTSPlaybackInBackground = "tts.continuePlaybackInBackground"
     case enableBackgroundReplyNotification = "enableBackgroundReplyNotification"
     case hasRequestedBackgroundReplyNotificationPermission = "hasRequestedBackgroundReplyNotificationPermission"
     case hasRequestedBackgroundReplyNotificationPermissionWatch = "hasRequestedBackgroundReplyNotificationPermissionWatch"
@@ -260,8 +340,11 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
         case .selectedRunnableModelID,
              .lastActiveSessionID:
             return .text("")
+        case .lastAppBackgroundedAt:
+            return .real(0)
         case .localModelsEnabled,
-             .localModelPerformanceMonitorEnabled:
+             .localModelPerformanceMonitorEnabled,
+             .localModelKVCacheEnabled:
             return .bool(false)
         case .localModelCacheEnabled:
             return .bool(true)
@@ -300,8 +383,9 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
         case .aiTopP:
             return .real(1.0)
         case .aiTemperatureEnabled,
-             .aiTopPEnabled,
-             .enableOpenAIStreamIncludeUsage,
+             .aiTopPEnabled:
+            return .bool(false)
+        case .enableOpenAIStreamIncludeUsage,
              .enableAutoSessionNaming:
             return .bool(true)
         case .systemPrompt:
@@ -310,6 +394,10 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .text("[]")
         case .maxChatHistory:
             return .integer(0)
+        case .enableContextCompressionReminder:
+            return .bool(true)
+        case .contextCompressionReminderTokenThreshold:
+            return .integer(ContextCompressionReminderPolicy.defaultTokenThreshold)
         case .enableStreaming:
             #if os(watchOS)
             return .bool(false)
@@ -322,12 +410,26 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             #else
             return .bool(true)
             #endif
+        case .requestLogEnabled:
+            return .bool(true)
         case .requestLogPlainMessageEnabled:
             return .bool(false)
+        case .performanceTelemetryEnabled:
+            return .bool(true)
         case .reasoningContentEchoMode:
             return .text(ReasoningContentEchoMode.defaultMode.rawValue)
         case .modelConnectivityTestConcurrencyLimit:
             return .integer(1)
+        case .chatSendDelaySeconds:
+            return .real(0.0)
+        case .videoFrameExtractionMode:
+            return .text(VideoFrameExtractionMode.defaultMode.rawValue)
+        case .videoFrameExtractionFPS:
+            return .real(1.0)
+        case .videoFrameMaximumCount:
+            return .integer(60)
+        case .enableVideoAnalysisForNonNativeModels:
+            return .bool(false)
         case .lazyLoadMessageCount:
             #if os(watchOS)
             return .integer(3)
@@ -337,7 +439,9 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
 
         case .enableMemory,
              .enableMemoryWrite,
+             .temporaryChatMemoryEnabled,
              .memorySendUpdateTime,
+             .enableMemoryAutoConsolidation,
              .enableConversationMemoryAsync,
              .enableConversationProfileDailyUpdate:
             return .bool(true)
@@ -347,6 +451,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .integer(3)
         case .memoryReembeddingConcurrencyLimit:
             return .integer(1)
+        case .memoryAutoConsolidationState:
+            return .text("")
         case .conversationMemoryRecentLimit:
             return .integer(5)
         case .conversationMemoryRoundThreshold:
@@ -361,6 +467,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .dailyPulseModelIdentifier,
              .conversationSummaryModelIdentifier,
              .reasoningSummaryModelIdentifier,
+             .videoAnalysisModelIdentifier,
              .imageGenerationModelIdentifier:
             return .text("")
         case .ocrModelIdentifier:
@@ -378,12 +485,13 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .enableAutoReasoningPreview,
              .enableResponsiveReasoningPreviewHeight,
              .enableBackground,
-             .enableReasoningSummary,
              .enableChatTopBlurFade:
             return .bool(true)
         case .enableAutoRotateBackground,
+             .enableReasoningSummary,
              .enableLiquidGlass,
-             .enableNoBubbleUI:
+             .enableNoBubbleUI,
+             .enableSlashCommands:
             return .bool(false)
         case .chatScrollAnimationEnabled,
              .chatSendAnimationEnabled:
@@ -402,6 +510,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .real(10.0)
         case .backgroundOpacity:
             return .real(0.7)
+        case .liquidGlassTintOpacity:
+            return .real(LiquidGlassTintSetting.defaultOpacity)
         case .reasoningPreviewHeightPercent:
             #if os(watchOS)
             return .real(58.0)
@@ -421,8 +531,14 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .text("segment")
         case .fontCustomScale:
             return .real(1.0)
+        case .fontLineSpacingEmIOS:
+            return .real(FontLibrary.defaultIOSLineSpacingEm)
+        case .fontLineSpacingEmWatchOS:
+            return .real(FontLibrary.defaultWatchLineSpacingEm)
         case .appLanguage:
             return .text("system")
+        case .watchInputQuickActionConfiguration:
+            return .text(WatchInputQuickActionConfiguration.defaultConfigurationJSON)
         case .watchAttachmentLastSource,
              .watchBackgroundLastSource,
              .chatComposerDraft:
@@ -440,8 +556,24 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             #else
             return .bool(true)
             #endif
-        case .restoreLastSessionOnLaunch:
+        case .iOSModelPickerGroupsByProvider,
+             .watchModelPickerGroupsByProvider:
+            return .bool(true)
+        case .modelPickerPromptShortcutEnabled,
+             .modelPickerWorldbookShortcutEnabled:
             return .bool(false)
+        case .iOSModelPickerExpandedGroupIDs,
+             .watchModelPickerExpandedGroupIDs:
+            return .text("[]")
+        case .modelPickerFolderPathsByProvider:
+            return .text("{}")
+        case .chatQuickActionIDs:
+            return .text("temporaryChat")
+        case .restoreLastSessionOnLaunch,
+             .restoreLastSessionOnlyIfRecent:
+            return .bool(false)
+        case .restoreLastSessionWithinMinutes:
+            return .integer(LaunchSessionPolicy.defaultRestoreWindowMinutes)
         case .providerDetailGroupByMainstream:
             return .bool(true)
         case .backgroundCropTarget:
@@ -449,6 +581,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
         case .shortcutBridgeShortcutName:
             return .text("ETOS Shortcut Bridge")
 
+        case .openAITailContextUsesSystemRole:
+            return .bool(true)
         case .includeSystemTimeInPrompt:
             return .bool(false)
         case .systemTimeInjectionPosition:
@@ -459,12 +593,17 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .integer(30)
         case .sendSpeechAsAudio,
              .enableSpeechInput,
+             .backgroundGenerationKeepAliveEnabled,
+             .backgroundGenerationAudioKeepAliveEnabled,
+             .continueTTSPlaybackInBackground,
              .hasRequestedBackgroundReplyNotificationPermission,
              .hasRequestedBackgroundReplyNotificationPermissionWatch,
              .hideAnnouncementSection:
             return .bool(false)
         case .audioRecordingFormat:
             return .text("aac")
+        case .backgroundGenerationAudioKeepAliveVolume:
+            return .real(BackgroundGenerationAudioKeepAliveSettings.defaultVolume)
         case .enableBackgroundReplyNotification,
              .updateTimelineAutoCheckEnabled:
             return .bool(true)
@@ -485,11 +624,18 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
         switch self {
         case .chatComposerDraft,
              .lastActiveSessionID,
+             .lastAppBackgroundedAt,
              .syncAutoSyncEnabled,
+             .cloudSyncEnabled,
+             .cloudSyncAutoSyncEnabled,
              .appToolsKnownDefaultToolIDs,
              .configLoaderDownloadOnceCompleted,
              .configLoaderToolCapabilityMigrated,
              .feedbackAPIBaseURL,
+             .backgroundGenerationKeepAliveEnabled,
+             .backgroundGenerationAudioKeepAliveEnabled,
+             .backgroundGenerationAudioKeepAliveVolume,
+             .continueTTSPlaybackInBackground,
              .hasRequestedBackgroundReplyNotificationPermission,
              .hasRequestedBackgroundReplyNotificationPermissionWatch,
              .updateTimelineAutoCheckEnabled,
@@ -497,9 +643,14 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .lastAnnouncementId,
              .hideAnnouncementSection,
              .hiddenAnnouncementKeys,
+             .requestLogEnabled,
              .requestLogPlainMessageEnabled,
+             .performanceTelemetryEnabled,
              .watchUseThirdPartyKeyboard,
              .localDebugLastServerAddress,
+             .iOSModelPickerExpandedGroupIDs,
+             .watchModelPickerExpandedGroupIDs,
+             .memoryAutoConsolidationState,
              .appLockEnabled,
              .appLockTimeoutSeconds,
              .appLockBiometricEnabled,
@@ -507,7 +658,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return false
         case .localModelsEnabled,
              .localModelPerformanceMonitorEnabled,
-             .localModelCacheEnabled:
+             .localModelCacheEnabled,
+             .localModelKVCacheEnabled:
             return false
         default:
             return true

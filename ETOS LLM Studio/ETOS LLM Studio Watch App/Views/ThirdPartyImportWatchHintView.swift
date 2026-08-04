@@ -398,7 +398,7 @@ struct ThirdPartyImportWatchHintView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let downloadProgress, downloadProgress.totalBytes > 0 {
-                    Text(String(format: "%.0f%%", downloadProgress.fractionCompleted * 100))
+                    Text(String(format: "%d%%", downloadProgress.displayPercentage))
                         .etFont(.caption2)
                         .monospacedDigit()
                 }
@@ -410,8 +410,8 @@ struct ThirdPartyImportWatchHintView: View {
                 Text(
                     String(
                         format: NSLocalizedString("已下载 %@ / %@", comment: ""),
-                        StorageUtility.formatSize(downloadProgress.bytesReceived),
-                        StorageUtility.formatSize(downloadProgress.totalBytes)
+                        StorageUtility.formatTransferSize(downloadProgress.bytesReceived),
+                        StorageUtility.formatTransferSize(downloadProgress.totalBytes)
                     )
                 )
                 .etFont(.caption2)

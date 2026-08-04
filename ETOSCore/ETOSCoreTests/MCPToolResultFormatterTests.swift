@@ -6,6 +6,7 @@
 // - 覆盖摘要与原始返回回退逻辑
 // ============================================================================
 
+import Foundation
 import Testing
 @testable import ETOSCore
 
@@ -31,7 +32,12 @@ struct MCPToolResultFormatterTests {
 
         let display = MCPToolResultFormatter.displayModel(from: raw)
 
-        #expect(display.summaryText == "返回 MCP 内容（1 段）")
+        #expect(
+            display.summaryText == String(
+                format: NSLocalizedString("返回 MCP 内容（%d 段）", comment: "MCP structured content summary"),
+                1
+            )
+        )
         #expect(display.primaryContentText == nil)
         #expect(display.rawDisplayText.contains(#""mimeType""#))
         #expect(display.isStructuredMCPEnvelope)
@@ -57,7 +63,12 @@ struct MCPToolResultFormatterTests {
 
         let display = MCPToolResultFormatter.displayModel(from: raw)
 
-        #expect(display.summaryText == "返回 JSON 数据（2 个字段）")
+        #expect(
+            display.summaryText == String(
+                format: NSLocalizedString("返回 JSON 数据（%d 个字段）", comment: "JSON object summary"),
+                2
+            )
+        )
         #expect(display.primaryContentText == nil)
         #expect(display.rawDisplayText.contains("\n"))
         #expect(!display.isStructuredMCPEnvelope)
@@ -75,13 +86,14 @@ struct MCPToolResultFormatterTests {
 
     @Test("Widget 载荷可从工具参数中提取")
     func testWidgetPayloadCanBeParsedFromArguments() {
-        let raw = #"{"title":"conversation_summary_system_plan","widget_code":"<style>.card{}</style><div>demo</div>","loading_messages":["规划中..."]}"#
+        let raw = #"{"title":"conversation_summary_system_plan","widget_code":"<style>.card{}</style><div>demo</div>","inline_aspect_ratio":"16:9","loading_messages":["规划中..."]}"#
 
         let payload = ToolWidgetPayloadParser.parse(from: raw)
 
         #expect(payload?.title == "conversation_summary_system_plan")
         #expect(payload?.widgetCode.contains("<div>demo</div>") == true)
         #expect(payload?.loadingMessages == ["规划中..."])
+        #expect(payload?.inlineAspectRatio.rawValue == "16:9")
     }
 
     @Test("Widget 载荷支持 input 包裹结构")
@@ -92,6 +104,32 @@ struct MCPToolResultFormatterTests {
 
         #expect(payload?.title == "wrapped_widget")
         #expect(payload?.widgetCode == "<div>wrapped</div>")
+        #expect(payload?.inlineAspectRatio == .standard)
+    }
+
+    @Test("Widget 画幅接受任意可表示的正数比例")
+    func testWidgetAspectRatioValidation() {
+        let portrait = ToolWidgetAspectRatio(rawValue: " 9 : 16 ")
+        let wide = ToolWidgetAspectRatio(rawValue: "3:1")
+        let tall = ToolWidgetAspectRatio(rawValue: "1:4")
+
+        #expect(portrait?.rawValue == "9:16")
+        #expect(portrait?.value == 0.5625)
+        #expect(wide?.value == 3)
+        #expect(tall?.value == 0.25)
+        #expect(ToolWidgetAspectRatio(rawValue: "0:1") == nil)
+        #expect(ToolWidgetAspectRatio(rawValue: "1:0") == nil)
+        #expect(ToolWidgetAspectRatio(rawValue: "1e308:1e-308") == nil)
+        #expect(ToolWidgetAspectRatio(rawValue: "invalid") == nil)
+    }
+
+    @Test("Widget 载荷中的非法画幅会回退为标准比例")
+    func testWidgetPayloadInvalidAspectRatioUsesDefault() {
+        let raw = #"{"widget_code":"<div>fallback</div>","inline_aspect_ratio":"0:1"}"#
+
+        let payload = ToolWidgetPayloadParser.parse(from: raw)
+
+        #expect(payload?.inlineAspectRatio == .standard)
     }
 
     @Test("非法 Widget JSON 会安全降级为 nil")

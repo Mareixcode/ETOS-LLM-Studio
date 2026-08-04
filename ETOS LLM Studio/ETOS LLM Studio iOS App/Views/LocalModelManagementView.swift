@@ -46,13 +46,21 @@ struct LocalModelManagementView: View {
             }
 
             Section {
+                Toggle(NSLocalizedString("对话 KV 缓存", comment: "Conversation KV cache toggle"), isOn: localModelKVCacheEnabledBinding)
+            } footer: {
+                Text(NSLocalizedString("打开后，本地文本模型会保留当前对话的 KV 缓存，让下一轮只处理新增内容；切换对话或关闭开关时释放。此功能会额外占用内存，且不复用于多模态对话。", comment: "Conversation KV cache footer"))
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Button {
                     isImportingModel = true
                 } label: {
                     Label(NSLocalizedString("导入 GGUF 权重", comment: "Import local GGUF model"), systemImage: "square.and.arrow.down")
                 }
             } footer: {
-                Text(NSLocalizedString("导入后的权重只保存在本机，并会以“本地模型”出现在模型候选列表中。", comment: "Local model import footer"))
+                Text(NSLocalizedString("可一次选择模型权重和对应的 mmproj 投影器；导入后的文件只保存在本机。", comment: "Local model import footer"))
                     .etFont(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -79,7 +87,7 @@ struct LocalModelManagementView: View {
         .fileImporter(
             isPresented: $isImportingModel,
             allowedContentTypes: [ggufType, .data],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
             importModel(result)
         }
@@ -97,8 +105,14 @@ struct LocalModelManagementView: View {
 
     private func importModel(_ result: Result<[URL], Error>) {
         do {
-            guard let url = try result.get().first else { return }
-            _ = try store.importModel(from: url)
+            let urls = try result.get()
+            guard let selection = LocalModelImportSelection(urls: urls) else { return }
+            for (index, modelURL) in selection.modelURLs.enumerated() {
+                _ = try store.importModel(
+                    from: modelURL,
+                    mmprojURL: index == 0 ? selection.projectorURL : nil
+                )
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -127,9 +141,39 @@ struct LocalModelManagementView: View {
         } set: { isEnabled in
             appConfig.localModelCacheEnabled = isEnabled
             if !isEnabled {
-                LocalLLMEngine.shared.clearModelCache()
+                Task.detached(priority: .utility) {
+                    LocalLLMEngine.shared.clearModelCache()
+                }
             }
         }
+    }
+
+    private var localModelKVCacheEnabledBinding: Binding<Bool> {
+        Binding {
+            appConfig.localModelKVCacheEnabled
+        } set: { isEnabled in
+            appConfig.localModelKVCacheEnabled = isEnabled
+            if !isEnabled {
+                Task.detached(priority: .utility) {
+                    LocalLLMEngine.shared.clearKVCache()
+                }
+            }
+        }
+    }
+}
+
+private struct LocalModelImportSelection {
+    let modelURLs: [URL]
+    let projectorURL: URL?
+
+    init?(urls: [URL]) {
+        projectorURL = urls.first(where: Self.isProjector)
+        modelURLs = urls.filter { !Self.isProjector($0) }
+        guard !modelURLs.isEmpty else { return nil }
+    }
+
+    nonisolated private static func isProjector(_ url: URL) -> Bool {
+        url.lastPathComponent.lowercased().contains("mmproj")
     }
 }
 
@@ -155,6 +199,16 @@ private struct LocalModelRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if record.hasMultimodalProjector {
+                    Label(NSLocalizedString("已配置 mmproj", comment: "Local model has mmproj"), systemImage: "photo")
+                        .etFont(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let architecture = record.speechArchitecture {
+                    Label(architecture.localizedTitle, systemImage: "waveform")
+                        .etFont(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Spacer()
@@ -181,6 +235,8 @@ private struct LocalModelDetailView: View {
     @State private var showUnsavedChangesAlert = false
     @State private var showAdvancedIntro = false
     @State private var showCLIImport = false
+    @State private var isImportingProjector = false
+    @State private var detailErrorMessage: String?
     @State private var cliImportResult: LocalLLMCLIStyleImportResult?
     @State private var contextSizeText: String
     @State private var maxOutputTokensText: String
@@ -196,6 +252,8 @@ private struct LocalModelDetailView: View {
     @State private var repeatPenaltyText: String
     @State private var frequencyPenaltyText: String
     @State private var presencePenaltyText: String
+    @State private var imageMinTokensText: String
+    @State private var imageMaxTokensText: String
 
     private let savedSnapshot: LocalModelRecord
 
@@ -216,6 +274,8 @@ private struct LocalModelDetailView: View {
         _repeatPenaltyText = State(initialValue: LocalModelFormat.decimal(record.effectiveRepeatPenalty))
         _frequencyPenaltyText = State(initialValue: LocalModelFormat.decimal(record.effectiveFrequencyPenalty))
         _presencePenaltyText = State(initialValue: LocalModelFormat.decimal(record.effectivePresencePenalty))
+        _imageMinTokensText = State(initialValue: "\(record.effectiveImageMinTokens)")
+        _imageMaxTokensText = State(initialValue: "\(record.effectiveImageMaxTokens)")
     }
 
     var body: some View {
@@ -226,10 +286,17 @@ private struct LocalModelDetailView: View {
 
             Section {
                 TextField(NSLocalizedString("名称", comment: "Local model display name field"), text: $draft.displayName)
-                Toggle(NSLocalizedString("加入候选模型", comment: "Activate local model"), isOn: $draft.isActivated)
+                if draft.isSpeechAuxiliaryModel {
+                    Label(NSLocalizedString("语音分段辅助模型", comment: "Speech VAD auxiliary model role"), systemImage: "waveform")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Toggle(NSLocalizedString("加入候选模型", comment: "Activate local model"), isOn: $draft.isActivated)
+                }
             }
 
+            speechSection
             runtimeSection
+            multimodalSection
             metalStabilitySection
             samplingSection
             grammarSection
@@ -267,6 +334,13 @@ private struct LocalModelDetailView: View {
                 }
             }
         }
+        .fileImporter(
+            isPresented: $isImportingProjector,
+            allowedContentTypes: [UTType(filenameExtension: "gguf") ?? .data, .data],
+            allowsMultipleSelection: false
+        ) { result in
+            importProjector(result)
+        }
         .toolbar {
             if hasUnsavedChanges {
                 ToolbarItem(placement: .cancellationAction) {
@@ -293,19 +367,101 @@ private struct LocalModelDetailView: View {
                 dismiss()
             }
         } message: {
-            Text(NSLocalizedString("会同时删除本机保存的权重文件。", comment: "Delete local model alert message"))
+            Text(NSLocalizedString("会同时删除本机保存的权重文件和 mmproj 投影器。", comment: "Delete local model alert message"))
         }
         .alert(NSLocalizedString("未保存更改", comment: "Unsaved changes alert title"), isPresented: $showUnsavedChangesAlert) {
             Button(NSLocalizedString("保存并离开", comment: "Save changes and leave")) {
                 saveAndDismiss()
             }
             Button(NSLocalizedString("放弃更改", comment: "Discard changes"), role: .destructive) {
-                dismiss()
+                discardAndDismiss()
             }
             Button(NSLocalizedString("继续编辑", comment: "Continue editing"), role: .cancel) {}
         } message: {
             Text(NSLocalizedString("要保存当前本地模型设置，还是放弃更改并离开？", comment: "Unsaved local model settings alert message"))
         }
+        .alert(NSLocalizedString("本地模型", comment: "Local models alert title"), isPresented: Binding(
+            get: { detailErrorMessage != nil },
+            set: { if !$0 { detailErrorMessage = nil } }
+        )) {
+            Button(NSLocalizedString("好的", comment: "OK"), role: .cancel) {
+                detailErrorMessage = nil
+            }
+        } message: {
+            Text(detailErrorMessage ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private var speechSection: some View {
+        if let architecture = draft.speechArchitecture {
+            Section {
+                LabeledContent(
+                    NSLocalizedString("GGUF 架构", comment: "Local GGUF architecture label"),
+                    value: architecture.localizedTitle
+                )
+
+                if architecture.requiresDecoderModel {
+                    Picker(
+                        NSLocalizedString("解码模型", comment: "Local speech decoder model picker"),
+                        selection: $draft.speechDecoderModelID
+                    ) {
+                        Text(NSLocalizedString("未选择", comment: "No associated local model"))
+                            .tag(UUID?.none)
+                        ForEach(speechDecoderCandidates) { record in
+                            Text(record.sanitizedDisplayName)
+                                .tag(Optional(record.id))
+                        }
+                    }
+                }
+
+                if architecture.isTranscriptionModel {
+                    Picker(
+                        NSLocalizedString("VAD 模型", comment: "Local speech VAD model picker"),
+                        selection: $draft.speechVADModelID
+                    ) {
+                        Text(NSLocalizedString("不使用", comment: "Do not use an optional local model"))
+                            .tag(UUID?.none)
+                        ForEach(speechVADCandidates) { record in
+                            Text(record.sanitizedDisplayName)
+                                .tag(Optional(record.id))
+                        }
+                    }
+                }
+            } header: {
+                Text(NSLocalizedString("本地语音转写", comment: "Local speech transcription section"))
+            } footer: {
+                Text(speechSectionFooter(for: architecture))
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var speechDecoderCandidates: [LocalModelRecord] {
+        store.models.filter {
+            $0.id != draft.id
+                && $0.ggufArchitecture == "qwen3"
+                && store.fileExists(for: $0)
+        }
+    }
+
+    private var speechVADCandidates: [LocalModelRecord] {
+        store.models.filter {
+            $0.id != draft.id
+                && $0.speechArchitecture == .fsmnVAD
+                && store.fileExists(for: $0)
+        }
+    }
+
+    private func speechSectionFooter(for architecture: LocalSpeechModelArchitecture) -> String {
+        if architecture == .funASRNanoEncoder {
+            return NSLocalizedString("Fun-ASR-Nano 必须关联本地 Qwen3 解码模型；FSMN-VAD 可选。", comment: "Fun-ASR-Nano local model association footer")
+        }
+        if architecture == .fsmnVAD {
+            return NSLocalizedString("FSMN-VAD 只负责切分语音，请在转写模型中关联使用。", comment: "FSMN-VAD auxiliary model footer")
+        }
+        return NSLocalizedString("SenseVoiceSmall 与 Paraformer 可直接转写，也可以关联 FSMN-VAD 处理长音频。", comment: "Local speech model footer")
     }
 
     private var runtimeSection: some View {
@@ -348,6 +504,74 @@ private struct LocalModelDetailView: View {
             )
         } header: {
             Text(NSLocalizedString("运行时", comment: "Local model runtime section"))
+        }
+    }
+
+    private var multimodalSection: some View {
+        Section {
+            LabeledContent(NSLocalizedString("mmproj 投影器", comment: "Local model mmproj label")) {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(draft.mmprojFileName ?? NSLocalizedString("未导入", comment: "No local mmproj"))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let size = draft.mmprojFileSize {
+                        Text(StorageUtility.formatSize(size))
+                            .etFont(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if draft.hasMultimodalProjector {
+                LabeledContent(NSLocalizedString("投影器状态", comment: "Local model mmproj status")) {
+                    Text(store.mmprojFileExists(for: draft)
+                        ? NSLocalizedString("文件可用", comment: "Local model file exists")
+                        : NSLocalizedString("文件缺失", comment: "Local model file missing"))
+                        .foregroundStyle(store.mmprojFileExists(for: draft) ? Color.secondary : Color.orange)
+                }
+            }
+
+            Button {
+                isImportingProjector = true
+            } label: {
+                Label(draft.hasMultimodalProjector
+                    ? NSLocalizedString("替换 mmproj", comment: "Replace local mmproj")
+                    : NSLocalizedString("选择 mmproj", comment: "Select local mmproj"),
+                      systemImage: "photo.badge.plus")
+            }
+
+            if draft.hasMultimodalProjector {
+                Button(role: .destructive) {
+                    if let relativePath = draft.mmprojRelativePath,
+                       relativePath != savedSnapshot.mmprojRelativePath {
+                        store.deleteProjectorFile(relativePath: relativePath)
+                    }
+                    draft.mmprojFileName = nil
+                    draft.mmprojRelativePath = nil
+                    draft.mmprojFileSize = nil
+                } label: {
+                    Label(NSLocalizedString("移除 mmproj", comment: "Remove local mmproj"), systemImage: "xmark.circle")
+                }
+            }
+
+            LocalModelParameterTextField(
+                descriptor: LocalLLMParameterCatalog.descriptor(for: "imageMinTokens"),
+                text: $imageMinTokensText,
+                isEnabled: overrideEnabledBinding(\.imageMinTokens, defaultValue: LocalModelRecord.defaultImageMinTokens),
+                keyboardType: .numbersAndPunctuation
+            )
+            LocalModelParameterTextField(
+                descriptor: LocalLLMParameterCatalog.descriptor(for: "imageMaxTokens"),
+                text: $imageMaxTokensText,
+                isEnabled: overrideEnabledBinding(\.imageMaxTokens, defaultValue: LocalModelRecord.defaultImageMaxTokens),
+                keyboardType: .numbersAndPunctuation
+            )
+        } header: {
+            Text(NSLocalizedString("多模态", comment: "Local model multimodal section"))
+        } footer: {
+            Text(NSLocalizedString("视觉 GGUF 通常需要单独的 mmproj 文件；Image Token 仅影响支持动态分辨率的多模态模型。", comment: "Local multimodal footer"))
+                .etFont(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -518,6 +742,34 @@ private struct LocalModelDetailView: View {
         dismiss()
     }
 
+    private func discardAndDismiss() {
+        cleanupUnsavedProjectorIfNeeded()
+        dismiss()
+    }
+
+    private func cleanupUnsavedProjectorIfNeeded() {
+        guard let relativePath = draft.mmprojRelativePath,
+              relativePath != savedSnapshot.mmprojRelativePath else {
+            return
+        }
+        store.deleteProjectorFile(relativePath: relativePath)
+    }
+
+    private func importProjector(_ result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            let previousUnsavedProjector = draft.mmprojRelativePath == savedSnapshot.mmprojRelativePath
+                ? nil
+                : draft.mmprojRelativePath
+            _ = try store.copyMultimodalProjector(from: url, into: &draft)
+            if let previousUnsavedProjector {
+                store.deleteProjectorFile(relativePath: previousUnsavedProjector)
+            }
+        } catch {
+            detailErrorMessage = error.localizedDescription
+        }
+    }
+
     private func draftApplyingTextFields(_ source: LocalModelRecord, clearsAdvancedArguments: Bool) -> LocalModelRecord {
         var updatedDraft = source
         if updatedDraft.contextSize != nil, let contextSize = Int(contextSizeText.trimmingCharacters(in: .whitespacesAndNewlines)) {
@@ -562,6 +814,12 @@ private struct LocalModelDetailView: View {
         if updatedDraft.presencePenalty != nil, let presencePenalty = Double(presencePenaltyText.trimmingCharacters(in: .whitespacesAndNewlines)) {
             updatedDraft.presencePenalty = presencePenalty
         }
+        if updatedDraft.imageMinTokens != nil, let imageMinTokens = Int(imageMinTokensText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            updatedDraft.imageMinTokens = imageMinTokens
+        }
+        if updatedDraft.imageMaxTokens != nil, let imageMaxTokens = Int(imageMaxTokensText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            updatedDraft.imageMaxTokens = imageMaxTokens
+        }
         if clearsAdvancedArguments {
             updatedDraft.advancedArguments = ""
         }
@@ -584,6 +842,8 @@ private struct LocalModelDetailView: View {
         repeatPenaltyText = LocalModelFormat.decimal(draft.effectiveRepeatPenalty)
         frequencyPenaltyText = LocalModelFormat.decimal(draft.effectiveFrequencyPenalty)
         presencePenaltyText = LocalModelFormat.decimal(draft.effectivePresencePenalty)
+        imageMinTokensText = "\(draft.effectiveImageMinTokens)"
+        imageMaxTokensText = "\(draft.effectiveImageMaxTokens)"
     }
 
     private func parseSeed(_ rawValue: String) -> UInt32? {

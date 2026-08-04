@@ -136,7 +136,9 @@ final class PersistenceGRDBStore {
                     audio_file_name TEXT,
                     image_file_names_json BLOB,
                     file_file_names_json BLOB,
+                    video_analysis_results_json BLOB,
                     full_error_content TEXT,
+                    sent_system_prompt_snapshot TEXT,
                     response_metrics_json BLOB,
                     response_group_id TEXT,
                     response_attempt_id TEXT,
@@ -245,6 +247,7 @@ final class PersistenceGRDBStore {
                     image_file_names_json BLOB,
                     file_file_names_json BLOB,
                     full_error_content TEXT,
+                    sent_system_prompt_snapshot TEXT,
                     response_metrics_json BLOB,
                     response_group_id TEXT,
                     response_attempt_id TEXT,
@@ -261,7 +264,7 @@ final class PersistenceGRDBStore {
                     content_versions_json, current_version_index,
                     reasoning_content, tool_calls_json, tool_calls_placement,
                     token_usage_json, audio_file_name, image_file_names_json, file_file_names_json,
-                    full_error_content, response_metrics_json,
+                    full_error_content, sent_system_prompt_snapshot, response_metrics_json,
                     response_group_id, response_attempt_id, response_attempt_index, selected_response_attempt_id,
                     position, created_at
                 )
@@ -290,6 +293,7 @@ final class PersistenceGRDBStore {
                     image_file_names_json,
                     file_file_names_json,
                     full_error_content,
+                    NULL,
                     response_metrics_json,
                     NULL,
                     NULL,
@@ -438,6 +442,52 @@ final class PersistenceGRDBStore {
             try Self.createSessionTagTables(db)
         }
 
+        migrator.registerMigration("v6_add_sent_system_prompt_snapshot") { db in
+            let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(messages)")
+            let hasSnapshotColumn = columns.contains { row in
+                let name: String = row["name"]
+                return name == "sent_system_prompt_snapshot"
+            }
+            if !hasSnapshotColumn {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN sent_system_prompt_snapshot TEXT")
+            }
+        }
+
+        migrator.registerMigration("v7_conversation_continuation_contexts") { db in
+            try Self.createConversationContinuationContextTable(db)
+        }
+
+        migrator.registerMigration("v8_conversation_continuation_link_visibility") { db in
+            let columns = try Row.fetchAll(
+                db,
+                sql: "PRAGMA table_info(conversation_continuation_contexts)"
+            )
+            let columnNames = Set(columns.compactMap { row -> String? in row["name"] })
+            if !columnNames.contains("source_session_link_hidden") {
+                try db.execute(sql: """
+                    ALTER TABLE conversation_continuation_contexts
+                    ADD COLUMN source_session_link_hidden INTEGER NOT NULL DEFAULT 0
+                """)
+            }
+            if !columnNames.contains("continuation_session_link_hidden") {
+                try db.execute(sql: """
+                    ALTER TABLE conversation_continuation_contexts
+                    ADD COLUMN continuation_session_link_hidden INTEGER NOT NULL DEFAULT 0
+                """)
+            }
+        }
+
+        migrator.registerMigration("v9_video_analysis_results") { db in
+            let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(messages)")
+            let hasColumn = columns.contains { row in
+                let name: String = row["name"]
+                return name == "video_analysis_results_json"
+            }
+            if !hasColumn {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN video_analysis_results_json BLOB")
+            }
+        }
+
         try migrator.migrate(dbPool)
         try repairCoreSchemaIfNeeded()
     }
@@ -445,12 +495,23 @@ final class PersistenceGRDBStore {
     private func repairCoreSchemaIfNeeded() throws {
         try dbPool.write { db in
             try createCoreTablesIfMissing(db)
+            try Self.createConversationContinuationContextTable(db)
             try requireColumns(db, table: "sessions", columns: ["id", "name"])
             try requireColumns(db, table: "messages", columns: ["id", "session_id", "role", "content"])
             try requireColumns(db, table: "request_logs", columns: ["id", "request_id", "provider_name", "model_id"])
             try requireColumns(db, table: "session_folders", columns: ["id", "name"])
             try requireColumns(db, table: "session_tags", columns: ["id", "name"])
             try requireColumns(db, table: "session_tag_assignments", columns: ["session_id", "tag_id"])
+            try requireColumns(
+                db,
+                table: "conversation_continuation_contexts",
+                columns: [
+                    "id", "child_session_id", "source_session_id", "source_session_name_snapshot",
+                    "source_through_message_id", "summary", "retained_messages_json",
+                    "retained_round_count", "compression_model_identifier", "prompt_version",
+                    "source_message_count", "summarized_message_count", "created_at"
+                ]
+            )
 
             try ensureColumn(db, table: "sessions", column: "topic_prompt", definition: "topic_prompt TEXT")
             try ensureColumn(db, table: "sessions", column: "enhanced_prompt", definition: "enhanced_prompt TEXT")
@@ -462,6 +523,19 @@ final class PersistenceGRDBStore {
             try ensureColumn(db, table: "sessions", column: "updated_at", definition: "updated_at REAL NOT NULL DEFAULT 0")
             try ensureColumn(db, table: "sessions", column: "conversation_summary", definition: "conversation_summary TEXT")
             try ensureColumn(db, table: "sessions", column: "conversation_summary_updated_at", definition: "conversation_summary_updated_at REAL")
+
+            try ensureColumn(
+                db,
+                table: "conversation_continuation_contexts",
+                column: "source_session_link_hidden",
+                definition: "source_session_link_hidden INTEGER NOT NULL DEFAULT 0"
+            )
+            try ensureColumn(
+                db,
+                table: "conversation_continuation_contexts",
+                column: "continuation_session_link_hidden",
+                definition: "continuation_session_link_hidden INTEGER NOT NULL DEFAULT 0"
+            )
 
             try ensureColumn(db, table: "messages", column: "requested_at", definition: "requested_at REAL")
             try ensureColumn(db, table: "messages", column: "content_versions_json", definition: "content_versions_json BLOB NOT NULL DEFAULT X'5B5D'")
@@ -476,6 +550,7 @@ final class PersistenceGRDBStore {
             try ensureColumn(db, table: "messages", column: "image_file_names_json", definition: "image_file_names_json BLOB")
             try ensureColumn(db, table: "messages", column: "file_file_names_json", definition: "file_file_names_json BLOB")
             try ensureColumn(db, table: "messages", column: "full_error_content", definition: "full_error_content TEXT")
+            try ensureColumn(db, table: "messages", column: "sent_system_prompt_snapshot", definition: "sent_system_prompt_snapshot TEXT")
             try ensureColumn(db, table: "messages", column: "response_metrics_json", definition: "response_metrics_json BLOB")
             try ensureColumn(db, table: "messages", column: "response_group_id", definition: "response_group_id TEXT")
             try ensureColumn(db, table: "messages", column: "response_attempt_id", definition: "response_attempt_id TEXT")
@@ -549,7 +624,9 @@ final class PersistenceGRDBStore {
                 audio_file_name TEXT,
                 image_file_names_json BLOB,
                 file_file_names_json BLOB,
+                video_analysis_results_json BLOB,
                 full_error_content TEXT,
+                sent_system_prompt_snapshot TEXT,
                 response_metrics_json BLOB,
                 response_group_id TEXT,
                 response_attempt_id TEXT,

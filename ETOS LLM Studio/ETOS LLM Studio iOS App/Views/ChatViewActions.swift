@@ -36,59 +36,119 @@ extension ChatView {
     func exportConversation(
         format: ChatTranscriptExportFormat,
         includeReasoning: Bool,
+        includeSystemPrompt: Bool,
         upToMessage: ChatMessage?
     ) {
-        do {
-            let output = try transcriptExportService.export(
-                session: viewModel.currentSession,
-                messages: ChatResponseAttemptSupport.visibleMessages(from: viewModel.allMessagesForSession),
-                format: format,
-                includeReasoning: includeReasoning,
-                upToMessageID: upToMessage?.id
-            )
-            applyExportOutput(output)
-        } catch {
-            exportErrorMessage = error.localizedDescription
-        }
+        beginTranscriptExport(
+            session: viewModel.currentSession,
+            messages: viewModel.allMessagesForSession,
+            format: format,
+            includeReasoning: includeReasoning,
+            includeSystemPrompt: includeSystemPrompt,
+            upToMessageID: upToMessage?.id
+        )
     }
 
     func exportSession(
         _ session: ChatSession,
         format: ChatTranscriptExportFormat,
-        includeReasoning: Bool
+        includeReasoning: Bool,
+        includeSystemPrompt: Bool
     ) {
-        do {
-            let messages: [ChatMessage]
-            if viewModel.currentSession?.id == session.id {
-                messages = viewModel.allMessagesForSession
-            } else {
-                messages = Persistence.loadMessages(for: session.id)
-            }
-
-            let output = try transcriptExportService.export(
-                session: session,
-                messages: ChatResponseAttemptSupport.visibleMessages(from: messages),
-                format: format,
-                includeReasoning: includeReasoning,
-                upToMessageID: nil
-            )
-            applyExportOutput(output)
-        } catch {
-            exportErrorMessage = error.localizedDescription
-        }
+        let loadedMessages = viewModel.currentSession?.id == session.id
+            ? viewModel.allMessagesForSession
+            : nil
+        beginTranscriptExport(
+            session: session,
+            messages: loadedMessages,
+            format: format,
+            includeReasoning: includeReasoning,
+            includeSystemPrompt: includeSystemPrompt
+        )
     }
 
-    func applyExportOutput(_ output: ChatTranscriptExportOutput) {
-        let fileURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(UUID().uuidString)-\(output.suggestedFileName)")
-        do {
-            try output.data.write(to: fileURL, options: .atomic)
-            exportSharePayload = ChatExportSharePayload(fileURL: fileURL)
-        } catch {
-            exportErrorMessage = String(
-                format: NSLocalizedString("导出失败：%@", comment: "Export failed alert message"),
-                error.localizedDescription
-            )
+    func beginTranscriptExport(
+        session: ChatSession?,
+        messages: [ChatMessage]?,
+        format: ChatTranscriptExportFormat,
+        includeReasoning: Bool,
+        includeSystemPrompt: Bool,
+        upToMessageID: UUID? = nil,
+        selectedMessageIDs: Set<UUID>? = nil
+    ) {
+        Task { @MainActor in
+            do {
+                let imageConfiguration = format == .png
+                    ? transcriptSwiftUIImageConfiguration(session: session)
+                    : nil
+                let exportSource = await Task.detached(priority: .userInitiated) {
+                    let resolvedMessages: [ChatMessage]
+                    if let suppliedMessages = messages {
+                        resolvedMessages = suppliedMessages
+                    } else if let session {
+                        resolvedMessages = Persistence.loadMessages(for: session.id)
+                    } else {
+                        resolvedMessages = []
+                    }
+                    let continuationContext = try? session.flatMap {
+                        try Persistence.loadConversationContinuationContext(for: $0.id)
+                    }
+                    return (resolvedMessages, continuationContext)
+                }.value
+                let sourceMessages = exportSource.0
+                let continuationContext = exportSource.1
+
+                let output: ChatTranscriptExportOutput
+                switch format {
+                case .png:
+                    guard let imageConfiguration else {
+                        throw ChatTranscriptExportError.imageRenderFailed
+                    }
+                    let preparedExport = try await Task.detached(priority: .userInitiated) {
+                        try ChatTranscriptExportService().prepareImageExport(
+                            session: session,
+                            messages: sourceMessages,
+                            includeReasoning: includeReasoning,
+                            continuationContext: continuationContext,
+                            upToMessageID: upToMessageID,
+                            selectedMessageIDs: selectedMessageIDs
+                        )
+                    }.value
+                    let data = try await ChatTranscriptSwiftUIImageRenderer.render(
+                        preparedExport: preparedExport,
+                        sourceMessages: sourceMessages,
+                        includeReasoning: includeReasoning,
+                        configuration: imageConfiguration
+                    )
+                    output = preparedExport.output(data: data)
+                case .pdf, .markdown, .text:
+                    output = try await Task.detached(priority: .userInitiated) {
+                        let visibleMessages = ChatResponseAttemptSupport.visibleMessages(
+                            from: sourceMessages
+                        )
+                        return try ChatTranscriptExportService().export(
+                            session: session,
+                            messages: visibleMessages,
+                            format: format,
+                            includeReasoning: includeReasoning,
+                            includeSystemPrompt: includeSystemPrompt,
+                            continuationContext: continuationContext,
+                            upToMessageID: upToMessageID,
+                            selectedMessageIDs: selectedMessageIDs
+                        )
+                    }.value
+                }
+
+                let fileURL = try await Task.detached(priority: .userInitiated) {
+                    let fileURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("\(UUID().uuidString)-\(output.suggestedFileName)")
+                    try output.data.write(to: fileURL, options: .atomic)
+                    return fileURL
+                }.value
+                exportSharePayload = ChatExportSharePayload(fileURL: fileURL)
+            } catch {
+                exportErrorMessage = error.localizedDescription
+            }
         }
     }
 

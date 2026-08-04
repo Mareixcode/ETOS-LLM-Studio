@@ -56,7 +56,11 @@ extension OpenAIAdapter {
             logger.error("构建聊天请求失败: 无效的 API 基础 URL - \(model.provider.baseURL)")
             return nil
         }
-        let chatURL = baseURL.appendingPathComponent("chat/completions")
+        let chatURL = Provider.appendingEndpointPath(
+            model.provider.normalizedChatEndpointPath,
+            to: baseURL,
+            defaultPath: Provider.defaultChatEndpointPath
+        )
 
         var request = URLRequest(url: chatURL)
         request.timeoutInterval = 600
@@ -76,7 +80,10 @@ extension OpenAIAdapter {
             let audioAttachment = audioAttachments[msg.id]
             let msgImageAttachments = imageAttachments[msg.id] ?? []
             let msgFileAttachments = fileAttachments[msg.id] ?? []
-            let hasMultiContent = (audioAttachment != nil || !msgImageAttachments.isEmpty || !msgFileAttachments.isEmpty) && msg.role == .user
+            let canSendImageContent = msg.role == .user || msg.role == .assistant
+            let canSendUserOnlyContent = msg.role == .user
+            let hasMultiContent = (canSendImageContent && !msgImageAttachments.isEmpty)
+                || (canSendUserOnlyContent && (audioAttachment != nil || !msgFileAttachments.isEmpty))
 
             if hasMultiContent {
                 var contentParts: [[String: Any]] = []
@@ -89,16 +96,18 @@ extension OpenAIAdapter {
                     ])
                 }
 
-                for imageAttachment in msgImageAttachments {
-                    contentParts.append([
-                        "type": "image_url",
-                        "image_url": [
-                            "url": imageAttachment.dataURL
-                        ]
-                    ])
+                if canSendImageContent {
+                    for imageAttachment in msgImageAttachments {
+                        contentParts.append([
+                            "type": "image_url",
+                            "image_url": [
+                                "url": imageAttachment.dataURL
+                            ]
+                        ])
+                    }
                 }
 
-                if let audioAttachment {
+                if let audioAttachment, canSendUserOnlyContent {
                     contentParts.append([
                         "type": "input_audio",
                         "input_audio": [
@@ -108,15 +117,17 @@ extension OpenAIAdapter {
                     ])
                 }
 
-                for fileAttachment in msgFileAttachments {
-                    contentParts.append([
-                        "type": "input_file",
-                        "input_file": [
-                            "data": fileAttachment.data.base64EncodedString(),
-                            "mime_type": fileAttachment.mimeType,
-                            "file_name": fileAttachment.fileName
-                        ]
-                    ])
+                if canSendUserOnlyContent {
+                    for fileAttachment in msgFileAttachments {
+                        contentParts.append([
+                            "type": "input_file",
+                            "input_file": [
+                                "data": fileAttachment.data.base64EncodedString(),
+                                "mime_type": fileAttachment.mimeType,
+                                "file_name": fileAttachment.fileName
+                            ]
+                        ])
+                    }
                 }
 
                 dict["content"] = contentParts.isEmpty ? msg.content : contentParts
@@ -164,8 +175,7 @@ extension OpenAIAdapter {
 
         let shouldIncludeUsageInStream = boolValue(from: commonPayload[Self.streamIncludeUsageControlKey]) ?? true
 
-        var finalPayload = commonPayload
-        finalPayload.merge(overrides) { _, new in new }
+        var finalPayload = mergedRequestPayload(commonPayload, with: overrides)
         finalPayload.removeValue(forKey: Self.streamIncludeUsageControlKey)
         finalPayload.removeValue(forKey: Self.reasoningContentEchoModeControlKey)
         finalPayload["model"] = resolvedRequestModelName(for: model, overrides: overrides)
@@ -188,7 +198,7 @@ extension OpenAIAdapter {
         }
 
         if let tools, !tools.isEmpty {
-            let apiTools = tools.map { tool -> [String: Any] in
+            let apiTools = stableToolDefinitions(tools) { self.sanitizedToolName($0) }.map { tool -> [String: Any] in
                 let rawParams = tool.parameters.toAny() as? [String: Any] ?? [:]
                 let functionParams = normalizedOpenAIToolParameters(rawParams)
                 let function: [String: Any] = [
@@ -198,23 +208,15 @@ extension OpenAIAdapter {
                 ]
                 return ["type": "function", "function": function]
             }
-            finalPayload["tools"] = apiTools
-            finalPayload["tool_choice"] = "auto"
-        } else {
-            removeOpenAIToolFields(from: &finalPayload)
+            finalPayload = mergedRequestPayload(finalPayload, with: ["tools": apiTools])
+            if finalPayload["tool_choice"] == nil {
+                finalPayload["tool_choice"] = "auto"
+            }
         }
 
         do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload, options: [])
-            if let httpBody = request.httpBody {
-                let sanitizedPayload = sanitizedPayloadForDebug(finalPayload)
-                if let sanitizedData = try? JSONSerialization.data(withJSONObject: sanitizedPayload, options: []),
-                   let sanitizedString = String(data: sanitizedData, encoding: .utf8) {
-                    logger.debug("构建的聊天请求体:\n---\n\(sanitizedString)\n---")
-                } else if let jsonString = String(data: httpBody, encoding: .utf8) {
-                    logger.debug("构建的聊天请求体 (无法完全隐藏媒体，输出原始体的 hash): \(jsonString.hashValue)")
-                }
-            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload, options: [.sortedKeys])
+            logger.debug("已构建聊天请求体，共 \(request.httpBody?.count ?? 0) 字节。")
             logChatRequestSnapshot(adapterName: "OpenAI兼容", request: request, payload: finalPayload)
         } catch {
             logger.error("构建聊天请求失败: JSON 序列化错误 - \(error.localizedDescription)")
@@ -258,7 +260,7 @@ extension OpenAIAdapter {
         request.setValue("Bearer \(randomApiKey)", forHTTPHeaderField: "Authorization")
         applyHeaderOverrides(model.provider.headerOverrides, apiKey: randomApiKey, to: &request)
 
-        let inputItems = buildResponsesInputItems(
+        let inputAssembly = buildResponsesInputAssembly(
             from: messages,
             reasoningContentEchoMode: reasoningContentEchoMode,
             audioAttachments: audioAttachments,
@@ -266,15 +268,45 @@ extension OpenAIAdapter {
             fileAttachments: fileAttachments
         )
 
-        var finalPayload = commonPayload
-        finalPayload.merge(overrides) { _, new in new }
+        let forceFullInput = boolValue(from: commonPayload[Self.responsesForceFullInputControlKey])
+            ?? boolValue(from: overrides[Self.responsesForceFullInputControlKey])
+            ?? false
+        var finalPayload = mergedRequestPayload(commonPayload, with: overrides)
         finalPayload.removeValue(forKey: Self.streamIncludeUsageControlKey)
         finalPayload.removeValue(forKey: Self.reasoningContentEchoModeControlKey)
+        finalPayload.removeValue(forKey: Self.responsesForceFullInputControlKey)
         finalPayload["model"] = resolvedRequestModelName(for: model, overrides: overrides)
-        finalPayload["input"] = inputItems
+        finalPayload["input"] = inputAssembly.items
+        if forceFullInput {
+            finalPayload.removeValue(forKey: "previous_response_id")
+        }
+        if finalPayload["conversation"] != nil {
+            finalPayload.removeValue(forKey: "previous_response_id")
+        }
+
+        if model.model.supportsReasoning {
+            let encryptedReasoningInclude = "reasoning.encrypted_content"
+            if var include = finalPayload["include"] as? [Any] {
+                let alreadyIncluded = include.contains {
+                    ($0 as? String) == encryptedReasoningInclude
+                }
+                if !alreadyIncluded {
+                    include.append(encryptedReasoningInclude)
+                    finalPayload["include"] = include
+                }
+            } else if finalPayload["include"] == nil {
+                finalPayload["include"] = [encryptedReasoningInclude]
+            }
+        }
+
+        var responsesTools = (finalPayload["tools"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+        if model.model.outputModalities.contains(.image),
+           !responsesTools.contains(where: { ($0["type"] as? String) == "image_generation" }) {
+            responsesTools.append(["type": "image_generation"])
+        }
 
         if let tools, !tools.isEmpty {
-            let apiTools = tools.map { tool -> [String: Any] in
+            let functionTools = stableToolDefinitions(tools) { self.sanitizedToolName($0) }.map { tool -> [String: Any] in
                 let rawParams = tool.parameters.toAny() as? [String: Any] ?? [:]
                 let functionParams = normalizedOpenAIToolParameters(rawParams)
                 return [
@@ -285,27 +317,46 @@ extension OpenAIAdapter {
                     "strict": false
                 ]
             }
-            finalPayload["tools"] = apiTools
+            for functionTool in functionTools {
+                let name = functionTool["name"] as? String
+                let alreadyIncluded = responsesTools.contains {
+                    ($0["type"] as? String) == "function"
+                        && ($0["name"] as? String) == name
+                }
+                if !alreadyIncluded {
+                    responsesTools.append(functionTool)
+                }
+            }
+        }
+
+        if !responsesTools.isEmpty {
+            finalPayload["tools"] = responsesTools
             if finalPayload["tool_choice"] == nil {
                 finalPayload["tool_choice"] = "auto"
             } else if let normalizedChoice = makeResponsesToolChoicePayload(finalPayload["tool_choice"]) {
                 finalPayload["tool_choice"] = normalizedChoice
             }
-        } else {
-            removeOpenAIToolFields(from: &finalPayload)
+        } else if finalPayload["tools"] != nil,
+                  let normalizedChoice = makeResponsesToolChoicePayload(finalPayload["tool_choice"]) {
+            finalPayload["tool_choice"] = normalizedChoice
+        }
+
+        if !forceFullInput,
+           finalPayload["previous_response_id"] == nil,
+           finalPayload["conversation"] == nil,
+           let requestSignature = responsesRequestSignature(from: finalPayload),
+           let incremental = responsesIncrementalInput(
+                assembly: inputAssembly,
+                messages: messages,
+                requestSignature: requestSignature
+           ) {
+            finalPayload["previous_response_id"] = incremental.previousResponseID
+            finalPayload["input"] = incremental.inputItems
         }
 
         do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload, options: [])
-            if let httpBody = request.httpBody {
-                let sanitizedPayload = sanitizedPayloadForDebug(finalPayload)
-                if let sanitizedData = try? JSONSerialization.data(withJSONObject: sanitizedPayload, options: []),
-                   let sanitizedString = String(data: sanitizedData, encoding: .utf8) {
-                    logger.debug("构建的 Responses 请求体:\n---\n\(sanitizedString)\n---")
-                } else if let jsonString = String(data: httpBody, encoding: .utf8) {
-                    logger.debug("构建的 Responses 请求体 (无法完全隐藏媒体，输出原始体的 hash): \(jsonString.hashValue)")
-                }
-            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload, options: [.sortedKeys])
+            logger.debug("已构建 Responses 请求体，共 \(request.httpBody?.count ?? 0) 字节。")
             logChatRequestSnapshot(adapterName: "OpenAI兼容 (Responses)", request: request, payload: finalPayload)
         } catch {
             logger.error("构建 Responses 请求失败: JSON 序列化错误 - \(error.localizedDescription)")
@@ -587,6 +638,11 @@ extension OpenAIAdapter {
 
             do {
                 request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+                logImageGenerationRequestSnapshot(
+                    adapterName: NSLocalizedString("OpenAI 兼容生图", comment: "OpenAI compatible image generation adapter log name"),
+                    request: request,
+                    payload: payload
+                )
                 return request
             } catch {
                 logger.error("构建生图请求失败: 无法编码 JSON - \(error.localizedDescription)")
@@ -647,6 +703,12 @@ extension OpenAIAdapter {
 
         body.appendString("--\(boundary)--\r\n")
         request.httpBody = body
+        logImageGenerationRequestSnapshot(
+            adapterName: NSLocalizedString("OpenAI 兼容图片编辑", comment: "OpenAI compatible image edit adapter log name"),
+            request: request,
+            prompt: prompt,
+            referenceImageCount: referenceImages.count
+        )
         return request
     }
 

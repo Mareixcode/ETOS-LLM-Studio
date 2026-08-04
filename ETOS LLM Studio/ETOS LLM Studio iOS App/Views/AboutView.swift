@@ -13,11 +13,95 @@ import ETOSCore
 import UIKit
 #endif
 
+enum OfficialCommunity: String, Identifiable, Equatable {
+    case qq
+    case telegram
+    case testFlight
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .qq:
+            return NSLocalizedString("QQ 群", comment: "官方 QQ 社群")
+        case .telegram:
+            return NSLocalizedString("Telegram 社群", comment: "官方 Telegram 社群")
+        case .testFlight:
+            return NSLocalizedString("加入 TestFlight", comment: "关于页 TestFlight 邀请入口")
+        }
+    }
+
+    var account: String? {
+        switch self {
+        case .qq:
+            return "974605250"
+        case .telegram:
+            return "@ETOSLLMStudio"
+        case .testFlight:
+            return nil
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .qq:
+            return "person.3.fill"
+        case .telegram:
+            return "paperplane.fill"
+        case .testFlight:
+            return "airplane"
+        }
+    }
+
+    var appURL: URL {
+        switch self {
+        case .qq:
+            return URL(string: "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=974605250&card_type=group&source=qrcode")!
+        case .telegram:
+            return URL(string: "tg://resolve?domain=ETOSLLMStudio")!
+        case .testFlight:
+            return URL(string: "https://testflight.apple.com/join/d4PgF4CK")!
+        }
+    }
+
+    var fallbackURL: URL? {
+        switch self {
+        case .qq:
+            return nil
+        case .telegram:
+            return URL(string: "https://t.me/ETOSLLMStudio")!
+        case .testFlight:
+            return nil
+        }
+    }
+
+    static func visibleCommunities(for channel: UpdateTimelineChannel) -> [OfficialCommunity] {
+        switch channel {
+        case .appStore:
+            return [.qq, .telegram, .testFlight]
+        case .testFlight:
+            return [.qq, .telegram]
+        }
+    }
+}
+
 struct AboutView: View {
     @Environment(\.openURL) private var openURL
     @State private var versionTapCount = 0
     @State private var lastVersionTapAt: Date = .distantPast
     @State private var showAppLogs = false
+    @State private var isSynchronizingOfficialData = false
+    @State private var officialDataAlertTitle = ""
+    @State private var officialDataAlertMessage = ""
+    @State private var showOfficialDataAlert = false
+    @State private var showClearTelemetryConfirmation = false
+    @StateObject private var telemetryCenter = PerformanceTelemetryCenter.shared
+    @ObservedObject private var appConfig = AppConfigStore.shared
+    private let officialCommunities: [OfficialCommunity]
+
+    init(distributionChannel: UpdateTimelineChannel = UpdateTimelineManager.currentDistributionChannel()) {
+        officialCommunities = OfficialCommunity.visibleCommunities(for: distributionChannel)
+    }
     
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? NSLocalizedString("N/A", comment: "Unavailable app info")
@@ -101,6 +185,90 @@ struct AboutView: View {
                     Label(NSLocalizedString("检查更新", comment: "About page update check entry"), systemImage: "arrow.clockwise")
                 }
             }
+
+            Section {
+                Toggle(
+                    NSLocalizedString("帮助 ETOS LLM Studio 改进性能", comment: "Performance telemetry toggle"),
+                    isOn: $appConfig.performanceTelemetryEnabled
+                )
+
+                LabeledContent(
+                    NSLocalizedString("待发送性能数据", comment: "Pending telemetry data"),
+                    value: String(
+                        format: NSLocalizedString("%d 项 · %@", comment: "Telemetry count and size"),
+                        telemetryCenter.pendingRecords.count,
+                        formatTelemetryByteCount(telemetryCenter.pendingBytes)
+                    )
+                )
+
+                Button(NSLocalizedString("清除待发送性能数据", comment: "Clear pending telemetry")) {
+                    showClearTelemetryConfirmation = true
+                }
+                .disabled(telemetryCenter.pendingRecords.isEmpty)
+            } header: {
+                Text(NSLocalizedString("性能与诊断", comment: "Performance and diagnostics section"))
+            } footer: {
+                Text(
+                    NSLocalizedString(
+                        "开启后，App 会发送 Apple MetricKit 提供的 CPU、内存、启动、卡顿、磁盘、网络和匿名诊断调用栈，以及关键功能阶段的耗时。不会发送聊天内容、请求体、响应体、API Key、服务器地址或用户标识。待发送原文可在应用日志中查看，关闭后会停止收集并清除待发送数据。",
+                        comment: "Performance telemetry disclosure"
+                    )
+                )
+            }
+
+            // MARK: - 官方社群
+            Section(
+                header: Text(NSLocalizedString("官方社群", comment: "关于页官方社群分组")),
+                footer: Text(NSLocalizedString("轻点即可在对应 App 中打开。", comment: "iOS 官方社群操作提示"))
+            ) {
+                ForEach(officialCommunities) { community in
+                    Button {
+                        openCommunity(community)
+                    } label: {
+                        LabeledContent {
+                            if let account = community.account {
+                                Text(account)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Image(systemName: "arrow.up.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } label: {
+                            Label(community.title, systemImage: community.systemImage)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // MARK: - 软件服务
+            Section(
+                header: Text(NSLocalizedString("软件服务", comment: "关于页软件服务分组")),
+                footer: Text(
+                    NSLocalizedString(
+                        "从官方服务重新下载配置与资源。已有同名文件会安全更新。",
+                        comment: "官方数据同步说明"
+                    )
+                )
+            ) {
+                Button {
+                    synchronizeOfficialData()
+                } label: {
+                    if isSynchronizingOfficialData {
+                        HStack {
+                            ProgressView()
+                            Text(NSLocalizedString("正在同步官方数据…", comment: "官方数据同步进度"))
+                        }
+                    } else {
+                        Label(
+                            NSLocalizedString("同步官方数据", comment: "官方数据同步按钮"),
+                            systemImage: "arrow.down.doc"
+                        )
+                    }
+                }
+                .disabled(isSynchronizingOfficialData)
+            }
             
             // MARK: - Links
             Section(header: Text(NSLocalizedString("链接", comment: ""))) {
@@ -175,6 +343,77 @@ struct AboutView: View {
                 AppLogsView()
             }
         }
+        .alert(officialDataAlertTitle, isPresented: $showOfficialDataAlert) {
+            Button(NSLocalizedString("好", comment: "关闭提示按钮"), role: .cancel) {}
+        } message: {
+            Text(officialDataAlertMessage)
+        }
+        .confirmationDialog(
+            NSLocalizedString("确认清除待发送性能数据？", comment: "Confirm clearing telemetry"),
+            isPresented: $showClearTelemetryConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(NSLocalizedString("清除待发送性能数据", comment: "Clear pending telemetry"), role: .destructive) {
+                Task {
+                    await telemetryCenter.clearPendingData()
+                }
+            }
+            Button(NSLocalizedString("取消", comment: ""), role: .cancel) {}
+        } message: {
+            Text(
+                NSLocalizedString(
+                    "只会清除尚未发送的性能遥测，不会删除请求与响应日志。",
+                    comment: "Telemetry clear scope"
+                )
+            )
+        }
+        .task {
+            await telemetryCenter.refreshVisibleRecords()
+        }
+    }
+
+    private func synchronizeOfficialData() {
+        guard !isSynchronizingOfficialData else { return }
+        isSynchronizingOfficialData = true
+
+        Task {
+            let result = await ConfigLoader.synchronizeOfficialData(overwriteExisting: true)
+            isSynchronizingOfficialData = false
+
+            if result.isAlreadyRunning {
+                officialDataAlertTitle = NSLocalizedString("同步未完成", comment: "官方数据同步失败标题")
+                officialDataAlertMessage = NSLocalizedString(
+                    "官方数据正在同步，请稍后再试。",
+                    comment: "官方数据同步任务冲突提示"
+                )
+            } else if !result.isComplete {
+                officialDataAlertTitle = NSLocalizedString("同步未完成", comment: "官方数据同步失败标题")
+                officialDataAlertMessage = NSLocalizedString(
+                    "部分官方文件下载失败，请检查网络后重试。",
+                    comment: "官方数据同步失败说明"
+                )
+            } else if result.didWriteFiles {
+                officialDataAlertTitle = NSLocalizedString("官方数据已更新", comment: "官方数据同步成功标题")
+                officialDataAlertMessage = String(
+                    format: NSLocalizedString("已同步 %d 个官方文件。", comment: "官方数据同步成功数量"),
+                    result.downloadedCount
+                )
+            } else {
+                officialDataAlertTitle = NSLocalizedString("官方数据已是最新", comment: "官方数据无需更新标题")
+                officialDataAlertMessage = NSLocalizedString(
+                    "没有需要更新的官方文件。",
+                    comment: "官方数据无需更新说明"
+                )
+            }
+            showOfficialDataAlert = true
+        }
+    }
+
+    private func openCommunity(_ community: OfficialCommunity) {
+        openURL(community.appURL) { accepted in
+            guard !accepted, let fallbackURL = community.fallbackURL else { return }
+            openURL(fallbackURL)
+        }
     }
 
     private func handleVersionTap() {
@@ -188,10 +427,6 @@ struct AboutView: View {
         guard versionTapCount >= 7 else { return }
         versionTapCount = 0
         showAppLogs = true
-        AppLog.userOperation(
-            category: NSLocalizedString("调试入口", comment: "App log category"),
-            action: NSLocalizedString("打开应用日志页", comment: "App log action")
-        )
         Task {
             let hasUnlocked = AchievementCenter.shared.hasUnlocked(id: .forbiddenPlace)
             guard !hasUnlocked else { return }
@@ -202,6 +437,13 @@ struct AboutView: View {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         #endif
     }
+}
+
+private func formatTelemetryByteCount(_ value: Int64) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    formatter.allowedUnits = [.useBytes, .useKB, .useMB]
+    return formatter.string(fromByteCount: value)
 }
 
 // MARK: - Privacy Policy View

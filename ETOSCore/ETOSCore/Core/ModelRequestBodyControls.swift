@@ -39,6 +39,11 @@ public struct ModelRequestBodyControl: Codable, Identifiable, Hashable, Sendable
     public var isEnabled: Bool
     public var defaultIsActive: Bool
     public var defaultOptionID: String?
+    public var isSliderEnabled: Bool
+    public var sliderGranularity: Double?
+    public var sliderStartColorHex: String?
+    public var sliderEndColorHex: String?
+    public var usesRainbowAtMaximum: Bool
     public var payload: [String: JSONValue]
     public var options: [ModelRequestBodyControlOption]
 
@@ -49,6 +54,11 @@ public struct ModelRequestBodyControl: Codable, Identifiable, Hashable, Sendable
         isEnabled: Bool = true,
         defaultIsActive: Bool = false,
         defaultOptionID: String? = nil,
+        isSliderEnabled: Bool = false,
+        sliderGranularity: Double? = nil,
+        sliderStartColorHex: String? = nil,
+        sliderEndColorHex: String? = nil,
+        usesRainbowAtMaximum: Bool = false,
         payload: [String: JSONValue] = [:],
         options: [ModelRequestBodyControlOption] = []
     ) {
@@ -58,25 +68,294 @@ public struct ModelRequestBodyControl: Codable, Identifiable, Hashable, Sendable
         self.isEnabled = isEnabled
         self.defaultIsActive = defaultIsActive
         self.defaultOptionID = defaultOptionID
+        self.isSliderEnabled = isSliderEnabled
+        self.sliderGranularity = sliderGranularity
+        self.sliderStartColorHex = sliderStartColorHex
+        self.sliderEndColorHex = sliderEndColorHex
+        self.usesRainbowAtMaximum = usesRainbowAtMaximum
         self.payload = payload
         self.options = options
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case kind
+        case isEnabled
+        case defaultIsActive
+        case defaultOptionID
+        case isSliderEnabled
+        case sliderGranularity
+        case sliderStartColorHex
+        case sliderEndColorHex
+        case usesRainbowAtMaximum
+        case payload
+        case options
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        kind = try container.decode(Kind.self, forKey: .kind)
+        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+        defaultIsActive = try container.decode(Bool.self, forKey: .defaultIsActive)
+        defaultOptionID = try container.decodeIfPresent(String.self, forKey: .defaultOptionID)
+        isSliderEnabled = try container.decodeIfPresent(Bool.self, forKey: .isSliderEnabled) ?? false
+        sliderGranularity = try container.decodeIfPresent(Double.self, forKey: .sliderGranularity)
+        sliderStartColorHex = try container.decodeIfPresent(String.self, forKey: .sliderStartColorHex)
+        sliderEndColorHex = try container.decodeIfPresent(String.self, forKey: .sliderEndColorHex)
+        usesRainbowAtMaximum = try container.decodeIfPresent(Bool.self, forKey: .usesRainbowAtMaximum) ?? false
+        payload = try container.decode([String: JSONValue].self, forKey: .payload)
+        options = try container.decode([ModelRequestBodyControlOption].self, forKey: .options)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        try container.encode(defaultIsActive, forKey: .defaultIsActive)
+        try container.encodeIfPresent(defaultOptionID, forKey: .defaultOptionID)
+        try container.encode(isSliderEnabled, forKey: .isSliderEnabled)
+        try container.encodeIfPresent(sliderGranularity, forKey: .sliderGranularity)
+        try container.encodeIfPresent(sliderStartColorHex, forKey: .sliderStartColorHex)
+        try container.encodeIfPresent(sliderEndColorHex, forKey: .sliderEndColorHex)
+        try container.encode(usesRainbowAtMaximum, forKey: .usesRainbowAtMaximum)
+        try container.encode(payload, forKey: .payload)
+        try container.encode(options, forKey: .options)
+    }
+}
+
+public extension ModelRequestBodyControl {
+    /// 首次填写完成后，仅向其后仍为空白的选项传播一次参数结构。
+    var initialOptionPayloadSuggestions: [String: [String: JSONValue]] {
+        guard kind == .optionGroup else { return [:] }
+        var latestPayload: [String: JSONValue]?
+        var suggestions: [String: [String: JSONValue]] = [:]
+        for option in options {
+            if !option.payload.isEmpty {
+                latestPayload = option.payload
+            } else if let latestPayload {
+                suggestions[option.id] = latestPayload
+            }
+        }
+        return suggestions
+    }
+
+    /// 新增末尾选项时只参考紧邻的上一项，避免异构档位被整组模板覆盖。
+    func payloadSuggestionForAppendingOption(
+        existingSuggestions: [String: [String: JSONValue]]
+    ) -> [String: JSONValue]? {
+        guard kind == .optionGroup, let previousOption = options.last else { return nil }
+        if !previousOption.payload.isEmpty {
+            return previousOption.payload
+        }
+        return existingSuggestions[previousOption.id]
+    }
+
+    /// 复制配置内容并重建控制与选项 ID，避免导入后与现有运行状态串联。
+    func duplicatedWithNewIdentifiers() -> ModelRequestBodyControl {
+        var optionIDMap: [String: String] = [:]
+        let duplicatedOptions = options.map { option in
+            let newID = UUID().uuidString
+            optionIDMap[option.id] = newID
+            return ModelRequestBodyControlOption(
+                id: newID,
+                title: option.title,
+                payload: option.payload
+            )
+        }
+
+        return ModelRequestBodyControl(
+            id: UUID().uuidString,
+            title: title,
+            kind: kind,
+            isEnabled: isEnabled,
+            defaultIsActive: defaultIsActive,
+            defaultOptionID: defaultOptionID.flatMap { optionIDMap[$0] },
+            isSliderEnabled: isSliderEnabled,
+            sliderGranularity: sliderGranularity,
+            sliderStartColorHex: sliderStartColorHex,
+            sliderEndColorHex: sliderEndColorHex,
+            usesRainbowAtMaximum: usesRainbowAtMaximum,
+            payload: payload,
+            options: duplicatedOptions
+        )
+    }
+}
+
+public enum ModelRequestBodyControlSplitter {
+    public static func canSplit(_ control: ModelRequestBodyControl) -> Bool {
+        leafPaths(for: control).count > 1
+    }
+
+    /// 按最终字典叶子拆成并列控制；数组保持整体，确保拆分结果仍可由现有合并器还原。
+    public static func split(_ control: ModelRequestBodyControl) -> [ModelRequestBodyControl]? {
+        switch control.kind {
+        case .toggle:
+            let leaves = leafValues(in: control.payload)
+            let paths = sortedPaths(in: [leaves])
+            guard paths.count > 1 else { return nil }
+            return paths.map { path in
+                copiedControl(
+                    from: control,
+                    payload: nestedPayload(path: path, value: leaves[path]),
+                    options: [],
+                    defaultOptionID: nil
+                )
+            }
+
+        case .optionGroup:
+            let leavesByOption = control.options.map { leafValues(in: $0.payload) }
+            let paths = sortedPaths(in: leavesByOption)
+            guard paths.count > 1 else { return nil }
+
+            return paths.map { path in
+                var mappedDefaultOptionID: String?
+                let options = zip(control.options, leavesByOption).map { option, leaves in
+                    let optionID = UUID().uuidString
+                    if option.id == control.defaultOptionID {
+                        mappedDefaultOptionID = optionID
+                    }
+                    return ModelRequestBodyControlOption(
+                        id: optionID,
+                        title: option.title,
+                        payload: nestedPayload(path: path, value: leaves[path])
+                    )
+                }
+                return copiedControl(
+                    from: control,
+                    payload: [:],
+                    options: options,
+                    defaultOptionID: mappedDefaultOptionID
+                )
+            }
+        }
+    }
+}
+
+private extension ModelRequestBodyControlSplitter {
+    struct LeafPath: Hashable {
+        let components: [String]
+    }
+
+    static func leafPaths(for control: ModelRequestBodyControl) -> [LeafPath] {
+        switch control.kind {
+        case .toggle:
+            return sortedPaths(in: [leafValues(in: control.payload)])
+        case .optionGroup:
+            return sortedPaths(in: control.options.map { leafValues(in: $0.payload) })
+        }
+    }
+
+    static func leafValues(
+        in payload: [String: JSONValue],
+        parentPath: [String] = []
+    ) -> [LeafPath: JSONValue] {
+        var leaves: [LeafPath: JSONValue] = [:]
+        for key in payload.keys.sorted() {
+            guard let value = payload[key] else { continue }
+            let path = parentPath + [key]
+            if case let .dictionary(dictionary) = value, !dictionary.isEmpty {
+                leaves.merge(leafValues(in: dictionary, parentPath: path)) { _, nested in nested }
+            } else {
+                // 数组和空字典作为一个叶子保留，避免现有整体覆盖语义丢失数据。
+                leaves[LeafPath(components: path)] = value
+            }
+        }
+        return leaves
+    }
+
+    static func sortedPaths(in leafMaps: [[LeafPath: JSONValue]]) -> [LeafPath] {
+        Set(leafMaps.flatMap { $0.keys }).sorted { lhs, rhs in
+            lhs.components.lexicographicallyPrecedes(rhs.components)
+        }
+    }
+
+    static func nestedPayload(path: LeafPath, value: JSONValue?) -> [String: JSONValue] {
+        guard let value, let leafKey = path.components.last else { return [:] }
+        var nestedValue = JSONValue.dictionary([leafKey: value])
+        for key in path.components.dropLast().reversed() {
+            nestedValue = .dictionary([key: nestedValue])
+        }
+        guard case let .dictionary(payload) = nestedValue else { return [:] }
+        return payload
+    }
+
+    static func copiedControl(
+        from control: ModelRequestBodyControl,
+        payload: [String: JSONValue],
+        options: [ModelRequestBodyControlOption],
+        defaultOptionID: String?
+    ) -> ModelRequestBodyControl {
+        ModelRequestBodyControl(
+            id: UUID().uuidString,
+            title: control.title,
+            kind: control.kind,
+            isEnabled: control.isEnabled,
+            defaultIsActive: control.defaultIsActive,
+            defaultOptionID: defaultOptionID,
+            isSliderEnabled: control.isSliderEnabled,
+            sliderGranularity: control.sliderGranularity,
+            sliderStartColorHex: control.sliderStartColorHex,
+            sliderEndColorHex: control.sliderEndColorHex,
+            usesRainbowAtMaximum: control.usesRainbowAtMaximum,
+            payload: payload,
+            options: options
+        )
     }
 }
 
 public struct ModelRequestBodyControlState: Codable, Hashable, Sendable {
     public var toggleValuesByControlID: [String: Bool]
     public var selectedOptionIDsByControlID: [String: String]
+    public var sliderPositionsByControlID: [String: Double]
 
     public init(
         toggleValuesByControlID: [String: Bool] = [:],
-        selectedOptionIDsByControlID: [String: String] = [:]
+        selectedOptionIDsByControlID: [String: String] = [:],
+        sliderPositionsByControlID: [String: Double] = [:]
     ) {
         self.toggleValuesByControlID = toggleValuesByControlID
         self.selectedOptionIDsByControlID = selectedOptionIDsByControlID
+        self.sliderPositionsByControlID = sliderPositionsByControlID
     }
 
     public var isEmpty: Bool {
-        toggleValuesByControlID.isEmpty && selectedOptionIDsByControlID.isEmpty
+        toggleValuesByControlID.isEmpty
+            && selectedOptionIDsByControlID.isEmpty
+            && sliderPositionsByControlID.isEmpty
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case toggleValuesByControlID
+        case selectedOptionIDsByControlID
+        case sliderPositionsByControlID
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        toggleValuesByControlID = try container.decodeIfPresent(
+            [String: Bool].self,
+            forKey: .toggleValuesByControlID
+        ) ?? [:]
+        selectedOptionIDsByControlID = try container.decodeIfPresent(
+            [String: String].self,
+            forKey: .selectedOptionIDsByControlID
+        ) ?? [:]
+        sliderPositionsByControlID = try container.decodeIfPresent(
+            [String: Double].self,
+            forKey: .sliderPositionsByControlID
+        ) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(toggleValuesByControlID, forKey: .toggleValuesByControlID)
+        try container.encode(selectedOptionIDsByControlID, forKey: .selectedOptionIDsByControlID)
+        try container.encode(sliderPositionsByControlID, forKey: .sliderPositionsByControlID)
     }
 }
 
@@ -94,6 +373,11 @@ public enum ModelRequestBodyControlCompiler {
                 guard isActive else { continue }
                 result = merged(result, control.payload)
             case .optionGroup:
+                if control.isSliderEnabled,
+                   let descriptor = ModelRequestBodyControlSliderDescriptor(control: control) {
+                    result = merged(result, descriptor.payload(for: descriptor.position(in: state)))
+                    continue
+                }
                 guard let selectedOptionID = state.selectedOptionIDsByControlID[control.id] ?? control.defaultOptionID,
                       let option = control.options.first(where: { $0.id == selectedOptionID }) else {
                     continue
@@ -129,10 +413,17 @@ public enum ModelRequestBodyControlCompiler {
             guard let validOptionIDs = validOptionIDsByControlID[controlID] else { return false }
             return validOptionIDs.contains(optionID)
         }
+        let validSliderIDs = Set(controls.filter {
+            $0.kind == .optionGroup && $0.isSliderEnabled && $0.options.count >= 2
+        }.map(\.id))
+        let sliderPositionsByControlID = state.sliderPositionsByControlID.compactMapValues { position in
+            position.isFinite ? min(max(position, 0), 1) : nil
+        }.filter { validSliderIDs.contains($0.key) }
 
         return ModelRequestBodyControlState(
             toggleValuesByControlID: toggleValuesByControlID,
-            selectedOptionIDsByControlID: selectedOptionIDsByControlID
+            selectedOptionIDsByControlID: selectedOptionIDsByControlID,
+            sliderPositionsByControlID: sliderPositionsByControlID
         )
     }
 
@@ -186,6 +477,12 @@ public enum ProviderAPIFormatFamily {
 }
 
 public enum ModelRequestBodyControlDefaults {
+    public static func isThinkingControl(_ control: ModelRequestBodyControl) -> Bool {
+        guard control.kind == .optionGroup else { return false }
+        let payloads = [control.payload] + control.options.map(\.payload)
+        return payloads.contains(where: containsThinkingParameter)
+    }
+
     public static func temperatureControl() -> ModelRequestBodyControl {
         ModelRequestBodyControl(
             title: NSLocalizedString("温度", comment: ""),
@@ -209,32 +506,50 @@ public enum ModelRequestBodyControlDefaults {
                 title: NSLocalizedString("思考预算", comment: ""),
                 kind: .optionGroup,
                 defaultOptionID: "medium",
+                isSliderEnabled: true,
                 options: [
-                    ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: ["effort": .string("low")]),
-                    ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: ["effort": .string("medium")]),
-                    ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: ["effort": .string("high")]),
-                    ModelRequestBodyControlOption(id: "budget-2048", title: "2048", payload: ["thinking": .dictionary(["type": .string("enabled"), "budget_tokens": .int(2048)])])
+                    ModelRequestBodyControlOption(
+                        id: "off",
+                        title: NSLocalizedString("关闭", comment: ""),
+                        payload: ["thinking": .dictionary(["type": .string("disabled")])]
+                    ),
+                    ModelRequestBodyControlOption(
+                        id: "auto",
+                        title: NSLocalizedString("自动", comment: ""),
+                        payload: anthropicThinkingPayload()
+                    ),
+                    ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: anthropicThinkingPayload(effort: "low")),
+                    ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: anthropicThinkingPayload(effort: "medium")),
+                    ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: anthropicThinkingPayload(effort: "high")),
+                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: anthropicThinkingPayload(effort: "xhigh"))
                 ]
             )
         case .gemini:
+            // Gemini 适配器统一使用当前的 thinkingLevel，不根据模型名称猜测协议能力。
+            let offConfig: [String: JSONValue] = ["includeThoughts": .bool(true), "thinkingLevel": .string("minimal")]
+            let lowConfig: [String: JSONValue] = ["includeThoughts": .bool(true), "thinkingLevel": .string("low")]
+            let mediumConfig: [String: JSONValue] = ["includeThoughts": .bool(true), "thinkingLevel": .string("medium")]
+            let highConfig: [String: JSONValue] = ["includeThoughts": .bool(true), "thinkingLevel": .string("high")]
             return ModelRequestBodyControl(
                 title: NSLocalizedString("思考预算", comment: ""),
                 kind: .optionGroup,
                 defaultOptionID: "medium",
+                isSliderEnabled: true,
                 options: [
-                    ModelRequestBodyControlOption(id: "minimal", title: NSLocalizedString("minimal", comment: ""), payload: ["thinking_level": .string("MINIMAL")]),
-                    ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: ["thinking_level": .string("LOW")]),
-                    ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: ["thinking_level": .string("MEDIUM")]),
-                    ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: ["thinking_level": .string("HIGH")]),
-                    ModelRequestBodyControlOption(id: "auto", title: NSLocalizedString("自动", comment: ""), payload: ["thinkingBudget": .int(-1)]),
-                    ModelRequestBodyControlOption(id: "off", title: NSLocalizedString("关闭", comment: ""), payload: ["thinkingBudget": .int(0)])
+                    ModelRequestBodyControlOption(id: "off", title: NSLocalizedString("关闭", comment: ""), payload: geminiThinkingPayload(offConfig)),
+                    ModelRequestBodyControlOption(id: "auto", title: NSLocalizedString("自动", comment: ""), payload: geminiThinkingPayload(["includeThoughts": .bool(true)])),
+                    ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: geminiThinkingPayload(lowConfig)),
+                    ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: geminiThinkingPayload(mediumConfig)),
+                    ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: geminiThinkingPayload(highConfig)),
+                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: geminiThinkingPayload(highConfig))
                 ]
             )
-        case .openAICompatible, .openAIResponses:
+        case .openAICompatible:
             return ModelRequestBodyControl(
                 title: NSLocalizedString("思考预算", comment: ""),
                 kind: .optionGroup,
                 defaultOptionID: "medium",
+                isSliderEnabled: true,
                 options: [
                     ModelRequestBodyControlOption(id: "none", title: NSLocalizedString("none", comment: ""), payload: ["reasoning_effort": .string("none")]),
                     ModelRequestBodyControlOption(id: "minimal", title: NSLocalizedString("minimal", comment: ""), payload: ["reasoning_effort": .string("minimal")]),
@@ -242,6 +557,21 @@ public enum ModelRequestBodyControlDefaults {
                     ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: ["reasoning_effort": .string("medium")]),
                     ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: ["reasoning_effort": .string("high")]),
                     ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: ["reasoning_effort": .string("xhigh")])
+                ]
+            )
+        case .openAIResponses:
+            return ModelRequestBodyControl(
+                title: NSLocalizedString("思考预算", comment: ""),
+                kind: .optionGroup,
+                defaultOptionID: "medium",
+                isSliderEnabled: true,
+                options: [
+                    ModelRequestBodyControlOption(id: "none", title: NSLocalizedString("none", comment: ""), payload: openAIResponsesThinkingPayload(effort: "none")),
+                    ModelRequestBodyControlOption(id: "minimal", title: NSLocalizedString("minimal", comment: ""), payload: openAIResponsesThinkingPayload(effort: "minimal")),
+                    ModelRequestBodyControlOption(id: "low", title: NSLocalizedString("low", comment: ""), payload: openAIResponsesThinkingPayload(effort: "low")),
+                    ModelRequestBodyControlOption(id: "medium", title: NSLocalizedString("medium", comment: ""), payload: openAIResponsesThinkingPayload(effort: "medium")),
+                    ModelRequestBodyControlOption(id: "high", title: NSLocalizedString("high", comment: ""), payload: openAIResponsesThinkingPayload(effort: "high")),
+                    ModelRequestBodyControlOption(id: "xhigh", title: NSLocalizedString("xhigh", comment: ""), payload: openAIResponsesThinkingPayload(effort: "xhigh"))
                 ]
             )
         }
@@ -255,6 +585,54 @@ public enum ModelRequestBodyControlDefaults {
             return ModelRequestBodyControl(title: "", kind: .optionGroup)
         }
         return thinkingOptionGroup(for: apiFormat)
+    }
+
+    private static func openAIResponsesThinkingPayload(effort: String) -> [String: JSONValue] {
+        ["reasoning": .dictionary(["effort": .string(effort)])]
+    }
+
+    private static func geminiThinkingPayload(_ config: [String: JSONValue]) -> [String: JSONValue] {
+        [
+            "generationConfig": .dictionary([
+                "thinkingConfig": .dictionary(config)
+            ])
+        ]
+    }
+
+    private static func anthropicThinkingPayload(effort: String? = nil) -> [String: JSONValue] {
+        var payload: [String: JSONValue] = [
+            "thinking": .dictionary([
+                "type": .string("adaptive")
+            ])
+        ]
+        if let effort {
+            payload["output_config"] = .dictionary(["effort": .string(effort)])
+        }
+        return payload
+    }
+
+    private static func containsThinkingParameter(_ payload: [String: JSONValue]) -> Bool {
+        for (key, value) in payload {
+            let normalizedKey = key
+                .lowercased()
+                .replacingOccurrences(of: "_", with: "")
+                .replacingOccurrences(of: "-", with: "")
+            if [
+                "reasoningeffort",
+                "thinkingbudget",
+                "thinking",
+                "thinkingconfig",
+                "thinkinglevel",
+                "effort"
+            ].contains(normalizedKey) {
+                return true
+            }
+            if case let .dictionary(nestedPayload) = value,
+               containsThinkingParameter(nestedPayload) {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -289,6 +667,55 @@ public enum ModelRequestBodyControlRuntimeStore {
         saveState(normalized, forKey: perModelPrefix + modelKey, userDefaults: userDefaults)
         saveState(normalized, forKey: signaturePrefix + signature(for: controls), userDefaults: userDefaults)
         saveState(normalized, forKey: inheritedStateKey, userDefaults: userDefaults)
+    }
+
+    /// 仅更新单个开关，保留同一模型中其他控制项的运行态。
+    public static func saveToggleValue(
+        _ isActive: Bool,
+        forControlID controlID: String,
+        forModelKey modelKey: String,
+        controls: [ModelRequestBodyControl],
+        userDefaults: UserDefaults = .standard
+    ) {
+        var currentState = state(
+            forModelKey: modelKey,
+            controls: controls,
+            userDefaults: userDefaults
+        )
+        currentState.toggleValuesByControlID[controlID] = isActive
+        save(
+            currentState,
+            forModelKey: modelKey,
+            controls: controls,
+            userDefaults: userDefaults
+        )
+    }
+
+    /// 更新滑块位置时同步最近档位，保证关闭滑块后仍能沿用当前选择。
+    public static func saveSliderPosition(
+        _ position: Double,
+        for control: ModelRequestBodyControl,
+        forModelKey modelKey: String,
+        controls: [ModelRequestBodyControl],
+        userDefaults: UserDefaults = .standard
+    ) {
+        guard let descriptor = ModelRequestBodyControlSliderDescriptor(control: control) else { return }
+        var currentState = state(
+            forModelKey: modelKey,
+            controls: controls,
+            userDefaults: userDefaults
+        )
+        let normalizedPosition = descriptor.normalized(position)
+        currentState.sliderPositionsByControlID[control.id] = normalizedPosition
+        currentState.selectedOptionIDsByControlID[control.id] = descriptor.nearestOptionID(
+            at: normalizedPosition
+        )
+        save(
+            currentState,
+            forModelKey: modelKey,
+            controls: controls,
+            userDefaults: userDefaults
+        )
     }
 
     private static func loadState(forKey key: String, userDefaults: UserDefaults) -> ModelRequestBodyControlState? {
@@ -337,6 +764,7 @@ public enum ModelRequestBodyControlRuntimeStore {
             components.append(control.id)
             components.append(control.kind.rawValue)
             components.append(control.isEnabled ? "1" : "0")
+            components.append(control.isSliderEnabled ? "slider-1" : "slider-0")
             for (key, value) in control.payload.sorted(by: { $0.key < $1.key }) {
                 components.append("payload")
                 components.append(key)

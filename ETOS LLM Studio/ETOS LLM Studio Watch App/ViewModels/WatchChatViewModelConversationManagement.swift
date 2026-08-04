@@ -21,6 +21,10 @@ extension ChatViewModel {
         chatService.deleteMessage(message)
     }
 
+    func deleteMessages(withIDs messageIDs: Set<UUID>) {
+        chatService.deleteMessages(withIDs: messageIDs)
+    }
+
     func responseAttemptVersionInfo(for message: ChatMessage) -> ChatResponseAttemptVersionInfo? {
         ChatResponseAttemptSupport.versionInfo(for: message, in: allMessagesForSession)
     }
@@ -175,6 +179,29 @@ extension ChatViewModel {
         chatService.createNewSession()
     }
 
+    func isTemporaryChatEnabled(for sessionID: UUID?) -> Bool {
+        chatService.isTemporaryChatEnabled(for: sessionID)
+    }
+
+    func temporaryChatMemoryMode(for sessionID: UUID?) -> TemporaryChatMemoryMode? {
+        chatService.temporaryChatMemoryMode(for: sessionID)
+    }
+
+    func performTemporaryChatTap(
+        preferredMemoryMode: TemporaryChatMemoryMode,
+        canEnable: Bool
+    ) -> TemporaryChatTapOutcome {
+        chatService.performTemporaryChatTap(
+            preferredMemoryMode: preferredMemoryMode,
+            canEnable: canEnable
+        )
+    }
+
+    @discardableResult
+    func saveCurrentTemporarySession() -> Bool {
+        chatService.saveCurrentTemporaryChat()
+    }
+
     func reloadPersistedDataAfterLegacyJSONMigration() {
         chatService.reloadSessionStateFromPersistenceAfterMigration()
     }
@@ -187,8 +214,7 @@ extension ChatViewModel {
         let coordinator = DailyPulseDeliveryCoordinator.shared
         await DailyPulseManager.shared.generateForScheduledDeliveryIfNeeded(
             reminderEnabled: coordinator.reminderEnabled,
-            reminderHour: coordinator.reminderHour,
-            reminderMinute: coordinator.reminderMinute,
+            deliveryTimes: coordinator.deliveryTimes,
             referenceDate: referenceDate
         )
     }
@@ -237,6 +263,10 @@ extension ChatViewModel {
 
     func addMemory(content: String) async {
         await MemoryManager.shared.addMemory(content: content)
+    }
+
+    func addMemory(_ request: MemoryWriteRequest) async {
+        await MemoryManager.shared.addMemory(request)
     }
 
     func updateMemory(item: MemoryItem) async {

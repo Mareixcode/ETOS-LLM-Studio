@@ -51,26 +51,29 @@ struct WorldbookEngineTests {
         #expect(result.after.count == 80)
     }
 
-    @Test("常驻激活条目每轮注入且不受触发规则阻挡")
-    func testConstantEntriesInjectEveryTurnWithoutTriggerRules() {
+    @Test("常驻条目跳过关键词但仍遵守酒馆定时与概率规则")
+    func testConstantEntriesSkipKeywordsButRespectTimedAndProbabilityRules() {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("worldbook-runtime-constant-every-turn-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tempURL) }
         let runtime = WorldbookRuntimeStateStore(storageURL: tempURL)
-        let engine = WorldbookEngine(runtimeStore: runtime, randomSource: { 1 })
-        let entry = WorldbookEntry(
-            content: "常驻设定",
+        let engine = WorldbookEngine(runtimeStore: runtime, randomSource: { 0.5 })
+        let delayed = WorldbookEntry(
+            content: "等待消息数的常驻设定",
+            keys: [],
+            constant: true,
+            position: .after,
+            delay: 2
+        )
+        let probabilistic = WorldbookEntry(
+            content: "未通过概率的常驻设定",
             keys: [],
             constant: true,
             position: .after,
             useProbability: true,
-            probability: 0,
-            cooldown: 99,
-            delay: 99,
-            preventRecursion: true,
-            delayUntilRecursion: true
+            probability: 0
         )
-        let book = Worldbook(name: "常驻书", entries: [entry])
+        let book = Worldbook(name: "常驻书", entries: [delayed, probabilistic])
         let sessionID = UUID()
 
         let first = engine.evaluate(
@@ -86,14 +89,19 @@ struct WorldbookEngineTests {
             .init(
                 sessionID: sessionID,
                 worldbooks: [book],
-                messages: [ChatMessage(role: .user, content: "依旧没有关键词")],
+                messages: [
+                    ChatMessage(role: .user, content: "依旧没有关键词"),
+                    ChatMessage(role: .assistant, content: "第二条消息")
+                ],
                 topicPrompt: nil,
                 enhancedPrompt: nil
             )
         )
 
-        #expect(first.after.contains(where: { $0.content == "常驻设定" }))
-        #expect(second.after.contains(where: { $0.content == "常驻设定" }))
+        #expect(!first.after.contains(where: { $0.content == "等待消息数的常驻设定" }))
+        #expect(second.after.contains(where: { $0.content == "等待消息数的常驻设定" }))
+        #expect(!first.after.contains(where: { $0.content == "未通过概率的常驻设定" }))
+        #expect(!second.after.contains(where: { $0.content == "未通过概率的常驻设定" }))
     }
 
     @Test("engine handles secondary logic, probability and sticky")
@@ -144,7 +152,7 @@ struct WorldbookEngineTests {
         let book = Worldbook(
             name: "规则测试",
             entries: [always, andAll, probabilistic, sticky],
-            settings: WorldbookSettings(scanDepth: 4, maxRecursionDepth: 1, maxInjectedEntries: 20, maxInjectedCharacters: 9999)
+            settings: WorldbookSettings(scanDepth: 1, maxRecursionDepth: 1, maxInjectedEntries: 20, maxInjectedCharacters: 9999)
         )
 
         let sessionID = UUID()
@@ -169,13 +177,32 @@ struct WorldbookEngineTests {
             .init(
                 sessionID: sessionID,
                 worldbooks: [book],
-                messages: [ChatMessage(role: .user, content: "no keyword")],
+                messages: [
+                    ChatMessage(role: .user, content: "apple banana hello"),
+                    ChatMessage(role: .assistant, content: "no keyword")
+                ],
                 topicPrompt: nil,
                 enhancedPrompt: nil
             )
         )
 
         #expect(second.after.contains(where: { $0.content.contains("粘性") }))
+
+        let third = engine.evaluate(
+            .init(
+                sessionID: sessionID,
+                worldbooks: [book],
+                messages: [
+                    ChatMessage(role: .user, content: "apple banana hello"),
+                    ChatMessage(role: .assistant, content: "no keyword"),
+                    ChatMessage(role: .user, content: "still no keyword")
+                ],
+                topicPrompt: nil,
+                enhancedPrompt: nil
+            )
+        )
+
+        #expect(!third.after.contains(where: { $0.content.contains("粘性") }))
     }
 
     @Test("engine treats negative injected character budget as unlimited")
@@ -210,8 +237,8 @@ struct WorldbookEngineTests {
         #expect(result.after.contains(where: { $0.content == longContent }))
     }
 
-    @Test("engine ignores injected entry budget when entries match")
-    func testInjectedEntryBudgetDoesNotSuppressMatchedEntries() {
+    @Test("engine enforces explicit per-book entry and character budgets")
+    func testInjectedEntryBudgetSuppressesLowerPriorityEntries() {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("worldbook-runtime-per-book-budget-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tempURL) }
@@ -219,12 +246,12 @@ struct WorldbookEngineTests {
         let engine = WorldbookEngine(runtimeStore: runtime, randomSource: { 0 })
 
         let book = Worldbook(
-            name: "显式预算不裁剪",
+            name: "显式预算裁剪",
             entries: [
                 WorldbookEntry(content: "budget-first-hit", keys: ["hero"], position: .after, order: 100),
                 WorldbookEntry(content: "budget-second-hit", keys: ["hero"], position: .after, order: 90)
             ],
-            settings: WorldbookSettings(maxInjectedEntries: 1, maxInjectedCharacters: 10)
+            settings: WorldbookSettings(maxInjectedEntries: 1, maxInjectedCharacters: "budget-first-hit".count)
         )
 
         let result = engine.evaluate(
@@ -238,7 +265,7 @@ struct WorldbookEngineTests {
         )
 
         #expect(result.after.contains(where: { $0.content == "budget-first-hit" }))
-        #expect(result.after.contains(where: { $0.content == "budget-second-hit" }))
+        #expect(!result.after.contains(where: { $0.content == "budget-second-hit" }))
     }
 
     @Test("engine keeps matching entries when different worldbooks reuse entry IDs")
@@ -273,8 +300,8 @@ struct WorldbookEngineTests {
         #expect(result.after.contains(where: { $0.content == "same-entry-id-second" }))
     }
 
-    @Test("engine keeps all matching entries in the same group")
-    func testGroupDoesNotSuppressMatchingEntries() {
+    @Test("engine selects one weighted winner from the same inclusion group")
+    func testGroupSelectsSingleWinner() {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("worldbook-runtime-group-scope-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tempURL) }
@@ -282,7 +309,7 @@ struct WorldbookEngineTests {
         let engine = WorldbookEngine(runtimeStore: runtime, randomSource: { 0 })
 
         let book = Worldbook(
-            name: "同组条目全部发送",
+            name: "同组条目选出一个",
             entries: [
                 WorldbookEntry(content: "group-high-hit", keys: ["hero"], order: 100, group: "shared"),
                 WorldbookEntry(content: "group-low-hit", keys: ["hero"], order: 10, group: "shared")
@@ -300,7 +327,91 @@ struct WorldbookEngineTests {
         )
 
         #expect(result.after.contains(where: { $0.content == "group-high-hit" }))
-        #expect(result.after.contains(where: { $0.content == "group-low-hit" }))
+        #expect(!result.after.contains(where: { $0.content == "group-low-hit" }))
+    }
+
+    @Test("engine gives group override priority over weighted selection")
+    func testGroupOverrideWins() {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worldbook-runtime-group-override-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let engine = WorldbookEngine(
+            runtimeStore: WorldbookRuntimeStateStore(storageURL: tempURL),
+            randomSource: { 0 }
+        )
+        let book = Worldbook(
+            name: "组优先级",
+            entries: [
+                WorldbookEntry(content: "普通高权重", keys: ["hero"], order: 100, group: "route", groupWeight: 100),
+                WorldbookEntry(content: "强制优先", keys: ["hero"], order: 10, group: "route", groupOverride: true, groupWeight: 1)
+            ]
+        )
+
+        let result = engine.evaluate(.init(
+            sessionID: UUID(),
+            worldbooks: [book],
+            messages: [ChatMessage(role: .user, content: "hero")],
+            topicPrompt: nil,
+            enhancedPrompt: nil
+        ))
+
+        #expect(result.after.map(\.content) == ["强制优先"])
+    }
+
+    @Test("engine parses SillyTavern slash-delimited regex keyword flags")
+    func testSlashDelimitedRegexKeyword() {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worldbook-runtime-regex-literal-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let engine = WorldbookEngine(runtimeStore: WorldbookRuntimeStateStore(storageURL: tempURL), randomSource: { 0 })
+        let entry = WorldbookEntry(
+            content: "regex-hit",
+            keys: [#"/^hero\s+arrives$/im"#],
+            useRegex: true
+        )
+        let book = Worldbook(name: "正则关键词", entries: [entry])
+
+        let result = engine.evaluate(.init(
+            sessionID: UUID(),
+            worldbooks: [book],
+            messages: [ChatMessage(role: .user, content: "前文\nHero arrives\n后文")],
+            topicPrompt: nil,
+            enhancedPrompt: nil
+        ))
+
+        #expect(result.after.contains(where: { $0.content == "regex-hit" }))
+    }
+
+    @Test("ignoreBudget metadata bypasses explicit budgets")
+    func testIgnoreBudgetMetadata() {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worldbook-runtime-ignore-budget-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let engine = WorldbookEngine(runtimeStore: WorldbookRuntimeStateStore(storageURL: tempURL), randomSource: { 0 })
+        let book = Worldbook(
+            name: "预算豁免",
+            entries: [
+                WorldbookEntry(content: "normal", keys: ["hero"], order: 100),
+                WorldbookEntry(
+                    content: "ignore-budget",
+                    keys: ["hero"],
+                    order: 90,
+                    metadata: ["ignoreBudget": .bool(true)]
+                )
+            ],
+            settings: WorldbookSettings(maxInjectedEntries: 1, maxInjectedCharacters: 6)
+        )
+
+        let result = engine.evaluate(.init(
+            sessionID: UUID(),
+            worldbooks: [book],
+            messages: [ChatMessage(role: .user, content: "hero")],
+            topicPrompt: nil,
+            enhancedPrompt: nil
+        ))
+
+        #expect(result.after.contains(where: { $0.content == "normal" }))
+        #expect(result.after.contains(where: { $0.content == "ignore-budget" }))
     }
 
     @Test("engine supports atDepth / emTop / emBottom positions")
@@ -467,7 +578,7 @@ struct WorldbookEngineTests {
         #expect(!result.after.contains(where: { $0.content == "native secondary still checked" }))
     }
 
-    @Test("engine ignores group scoring and keeps every matching group entry")
+    @Test("分组覆盖条目会抑制同组的其他命中条目")
     func testEngineGroupFieldsDoNotSuppressEntries() {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("worldbook-runtime-group-\(UUID().uuidString).json")
@@ -513,9 +624,7 @@ struct WorldbookEngineTests {
             )
         )
 
-        #expect(result.after.contains(where: { $0.content == "score winner" }))
-        #expect(result.after.contains(where: { $0.content == "score loser" }))
-        #expect(result.after.contains(where: { $0.content == "group override keep" }))
+        #expect(result.after.map(\.content) == ["group override keep"])
     }
 
     @Test("engine supports recursion and entry-level scanDepth override")
@@ -625,7 +734,7 @@ struct WorldbookEngineTests {
             content: "delayed",
             keys: ["trigger"],
             position: .after,
-            delay: 1
+            delay: 2
         )
         let cooldown = WorldbookEntry(
             content: "cooldown",
@@ -640,7 +749,16 @@ struct WorldbookEngineTests {
         #expect(!first.after.contains(where: { $0.content == "delayed" }))
         #expect(first.after.contains(where: { $0.content == "cooldown" }))
 
-        let second = engine.evaluate(.init(sessionID: sessionID, worldbooks: [book], messages: [ChatMessage(role: .user, content: "trigger")], topicPrompt: nil, enhancedPrompt: nil))
+        let second = engine.evaluate(.init(
+            sessionID: sessionID,
+            worldbooks: [book],
+            messages: [
+                ChatMessage(role: .user, content: "trigger"),
+                ChatMessage(role: .assistant, content: "second message")
+            ],
+            topicPrompt: nil,
+            enhancedPrompt: nil
+        ))
         #expect(second.after.contains(where: { $0.content == "delayed" }))
         #expect(!second.after.contains(where: { $0.content == "cooldown" }))
     }
@@ -670,5 +788,89 @@ struct WorldbookEngineTests {
         #expect(result.after.count == 2)
         #expect(result.after.first?.content == "high")
         #expect(result.after.last?.content == "low")
+    }
+
+    @Test("最小激活数会把扫描深度扩展到配置上限")
+    func testMinimumActivationsExpandScanDepth() {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worldbook-runtime-minimum-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let engine = WorldbookEngine(
+            runtimeStore: WorldbookRuntimeStateStore(storageURL: tempURL),
+            randomSource: { 0 }
+        )
+        let entry = WorldbookEntry(content: "深层激活", keys: ["旧线索"])
+        let book = Worldbook(
+            name: "最小激活",
+            entries: [entry],
+            settings: .init(scanDepth: 1),
+            metadata: ["min_activations": .int(1), "min_activations_depth_max": .int(3)]
+        )
+
+        let result = engine.evaluate(.init(
+            sessionID: UUID(),
+            worldbooks: [book],
+            messages: [
+                ChatMessage(role: .user, content: "旧线索"),
+                ChatMessage(role: .assistant, content: "中间回复"),
+                ChatMessage(role: .user, content: "最新消息")
+            ]
+        ))
+
+        #expect(result.after.map(\.content) == ["深层激活"])
+    }
+
+    @Test("条目可扫描 Persona 与角色资料并接受外部向量激活")
+    func testContextAndVectorActivation() {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worldbook-runtime-context-vector-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let engine = WorldbookEngine(
+            runtimeStore: WorldbookRuntimeStateStore(storageURL: tempURL),
+            randomSource: { 0 }
+        )
+        let persona = WorldbookEntry(
+            content: "Persona 命中",
+            keys: ["北方旅人"],
+            metadata: ["extensions": .dictionary(["match_persona_description": .bool(true)])]
+        )
+        let vector = WorldbookEntry(
+            content: "向量命中",
+            keys: ["不会出现的关键词"],
+            metadata: ["extensions": .dictionary(["vectorized": .bool(true)])]
+        )
+        let scenario = WorldbookEntry(
+            content: "场景命中",
+            keys: ["海边车站"],
+            metadata: ["extensions": .dictionary(["match_scenario": .bool(true)])]
+        )
+        let book = Worldbook(name: "上下文与向量", entries: [persona, vector, scenario])
+
+        let result = engine.evaluate(.init(
+            sessionID: UUID(),
+            worldbooks: [book],
+            messages: [ChatMessage(role: .user, content: "普通消息")],
+            personaDescription: "来自北方旅人家族",
+            scenario: "故事发生在海边车站",
+            vectorActivatedEntryIDs: [vector.id]
+        ))
+
+        #expect(Set(result.after.map(\.content)) == ["Persona 命中", "向量命中", "场景命中"])
+    }
+
+    @Test("向量匹配在系统嵌入不可用时仍可通过本地向量回退激活")
+    func testVectorMatcherFallback() async {
+        let matching = WorldbookEntry(content: "海边车站与北方旅人", keys: [])
+        let unrelated = WorldbookEntry(content: "量子处理器性能参数", keys: [])
+        let matcher = WorldbookVectorMatcher()
+
+        let activated = await matcher.activatedEntryIDs(
+            entries: [matching, unrelated],
+            query: "海边车站与北方旅人",
+            maximumEntries: 1,
+            scoreThreshold: 0.2
+        )
+
+        #expect(activated == [matching.id])
     }
 }

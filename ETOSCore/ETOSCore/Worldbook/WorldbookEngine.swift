@@ -242,19 +242,40 @@ public struct WorldbookEngine {
         public var messages: [ChatMessage]
         public var topicPrompt: String?
         public var enhancedPrompt: String?
+        public var personaDescription: String?
+        public var characterDescription: String?
+        public var characterPersonality: String?
+        public var characterDepthPrompt: String?
+        public var scenario: String?
+        public var creatorNotes: String?
+        public var vectorActivatedEntryIDs: Set<UUID>
 
         public init(
             sessionID: UUID,
             worldbooks: [Worldbook],
             messages: [ChatMessage],
-            topicPrompt: String?,
-            enhancedPrompt: String?
+            topicPrompt: String? = nil,
+            enhancedPrompt: String? = nil,
+            personaDescription: String? = nil,
+            characterDescription: String? = nil,
+            characterPersonality: String? = nil,
+            characterDepthPrompt: String? = nil,
+            scenario: String? = nil,
+            creatorNotes: String? = nil,
+            vectorActivatedEntryIDs: Set<UUID> = []
         ) {
             self.sessionID = sessionID
             self.worldbooks = worldbooks
             self.messages = messages
             self.topicPrompt = topicPrompt
             self.enhancedPrompt = enhancedPrompt
+            self.personaDescription = personaDescription
+            self.characterDescription = characterDescription
+            self.characterPersonality = characterPersonality
+            self.characterDepthPrompt = characterDepthPrompt
+            self.scenario = scenario
+            self.creatorNotes = creatorNotes
+            self.vectorActivatedEntryIDs = vectorActivatedEntryIDs
         }
     }
 
@@ -270,18 +291,42 @@ public struct WorldbookEngine {
         self.randomSource = randomSource
     }
 
+    public func evaluateAsync(_ context: Context) async -> WorldbookEvaluationResult {
+        let vectorEntries = context.worldbooks.flatMap(\.entries).filter { $0.isEnabled && $0.vectorized }
+        guard !vectorEntries.isEmpty else { return evaluate(context) }
+        let query = buildScanBuffer(
+            messages: context.messages,
+            scanDepth: context.worldbooks.map(\.settings.scanDepth).max() ?? 4,
+            topicPrompt: context.topicPrompt,
+            enhancedPrompt: context.enhancedPrompt
+        )
+        var resolved = context
+        resolved.vectorActivatedEntryIDs = await WorldbookVectorMatcher.shared.activatedEntryIDs(
+            entries: vectorEntries,
+            query: query
+        )
+        return evaluate(resolved)
+    }
+
     public func evaluate(_ context: Context) -> WorldbookEvaluationResult {
         let activeBooks = context.worldbooks
         guard !activeBooks.isEmpty else { return .empty }
 
-        let turn = runtimeStore.nextTurn(for: context.sessionID)
+        // 酒馆按当前聊天消息数计算 sticky/cooldown，而不是按评估调用次数计算。
+        let turn = context.messages.count
         let maxRecursionDepth = activeBooks.map { $0.settings.maxRecursionDepth }.max() ?? 0
+        let minimumActivations = activeBooks.map(\.minimumActivations).max() ?? 0
+        let configuredMinimumDepth = activeBooks.map(\.minimumActivationDepthMax).max() ?? 0
+        let minimumActivationDepthMax = configuredMinimumDepth > 0 ? configuredMinimumDepth : context.messages.count
 
         var triggered: [WorldbookInjection] = []
         var triggeredIDs = Set<WorldbookEntryRuntimeKey>()
         var recursionBuffer: [String] = []
+        var previousStates: [WorldbookEntryRuntimeKey: WorldbookTimedEffectState] = [:]
+        var activatedGroupNames = Set<String>()
 
         for recursionLevel in 0...maxRecursionDepth {
+            let levelStartIndex = triggered.count
             let entries = collectEntries(activeBooks)
             var newlyTriggeredContents: [String] = []
 
@@ -291,70 +336,75 @@ public struct WorldbookEngine {
                 let entryKey = WorldbookEntryRuntimeKey(worldbookID: item.book.id, entryID: entry.id)
                 if triggeredIDs.contains(entryKey) { continue }
                 if !entry.isEnabled { continue }
-                if entry.constant {
-                    var updatedState = runtimeStore.state(for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
-                    updatedState.lastTriggeredTurn = turn
-                    updatedState.delayUntilTurn = nil
-                    runtimeStore.updateState(updatedState, for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
+                let state = runtimeStore.state(for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
+                let promptTemplateActivated: Bool
+                if case .bool(true) = entry.metadata["__etos_prompt_template_activated"] {
+                    promptTemplateActivated = true
+                } else {
+                    promptTemplateActivated = false
+                }
 
-                    let injection = WorldbookInjection(
-                        worldbookID: item.book.id,
-                        worldbookName: item.book.name,
-                        entryID: entry.id,
-                        entryComment: entry.comment,
-                        content: entry.content,
-                        position: entry.position,
-                        outletName: entry.outletName,
-                        order: entry.order,
-                        depth: entry.depth,
-                        role: entry.role,
-                        triggerScore: 1
-                    )
-                    triggered.append(injection)
-                    triggeredIDs.insert(entryKey)
-                    newlyTriggeredContents.append(entry.content)
+                // SillyTavern 的 delay 是最低聊天消息数，不是首次命中后的等待轮数。
+                if let delay = entry.delay,
+                   delay > 0,
+                   context.messages.count < delay,
+                   !promptTemplateActivated {
                     continue
                 }
-                if recursionLevel > 0 && entry.preventRecursion { continue }
-                if recursionLevel == 0 && entry.delayUntilRecursion { continue }
-
-                var state = runtimeStore.state(for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
 
                 let stickyActive = isStickyActive(entry: entry, state: state, currentTurn: turn)
                 let inCooldown = isCooldownActive(entry: entry, state: state, currentTurn: turn)
-                if inCooldown && !stickyActive {
+                if inCooldown && !stickyActive && !promptTemplateActivated {
                     continue
                 }
+                if recursionLevel == 0 && entry.recursionDelayLevel > 0 && !stickyActive && !promptTemplateActivated { continue }
+                if recursionLevel > 0 && entry.recursionDelayLevel > recursionLevel && !stickyActive && !promptTemplateActivated { continue }
+                if recursionLevel > 0 && entry.excludeRecursion && !stickyActive && !promptTemplateActivated { continue }
 
-                let scanDepth = max(1, entry.scanDepth ?? item.book.settings.scanDepth)
-                let baseBuffer = buildScanBuffer(messages: context.messages, scanDepth: scanDepth, topicPrompt: context.topicPrompt, enhancedPrompt: context.enhancedPrompt)
-                let effectiveBuffer: String
-                if recursionLevel == 0 || entry.excludeRecursion {
-                    effectiveBuffer = baseBuffer
+                let matchResult: (matched: Bool, score: Double)
+                if entry.constant || stickyActive || promptTemplateActivated {
+                    matchResult = (true, 0)
                 } else {
-                    effectiveBuffer = baseBuffer + "\n" + recursionBuffer.joined(separator: "\n")
-                }
+                    let scanDepth = max(1, entry.scanDepth ?? item.book.settings.scanDepth)
+                    let baseBuffer = buildScanBuffer(
+                        messages: context.messages,
+                        scanDepth: scanDepth,
+                        topicPrompt: context.topicPrompt,
+                        enhancedPrompt: context.enhancedPrompt,
+                        entry: entry,
+                        context: context
+                    )
+                    let effectiveBuffer: String
+                    if recursionLevel == 0 {
+                        effectiveBuffer = baseBuffer
+                    } else {
+                        effectiveBuffer = baseBuffer + "\n" + recursionBuffer.joined(separator: "\n")
+                    }
 
-                let matchResult = evaluateKeywordMatch(entry: entry, buffer: effectiveBuffer)
-                let keywordMatched = stickyActive || entry.constant || matchResult.matched
-                if !keywordMatched {
+                    var evaluatedMatch = entry.vectorized
+                        ? (matched: context.vectorActivatedEntryIDs.contains(entry.id), score: 1.0)
+                        : evaluateKeywordMatch(entry: entry, buffer: effectiveBuffer)
+                    if !evaluatedMatch.matched,
+                       minimumActivations > triggered.count,
+                       minimumActivationDepthMax > scanDepth,
+                       !entry.vectorized {
+                        let expanded = buildScanBuffer(
+                            messages: context.messages,
+                            scanDepth: minimumActivationDepthMax,
+                            topicPrompt: context.topicPrompt,
+                            enhancedPrompt: context.enhancedPrompt,
+                            entry: entry,
+                            context: context
+                        )
+                        evaluatedMatch = evaluateKeywordMatch(entry: entry, buffer: expanded)
+                    }
+                    matchResult = evaluatedMatch
+                }
+                if !matchResult.matched {
                     continue
                 }
 
-                if let delay = entry.delay, delay > 0, !stickyActive {
-                    if let due = state.delayUntilTurn {
-                        if turn < due {
-                            runtimeStore.updateState(state, for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
-                            continue
-                        }
-                    } else {
-                        state.delayUntilTurn = turn + delay
-                        runtimeStore.updateState(state, for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
-                        continue
-                    }
-                }
-
-                if entry.useProbability && !stickyActive {
+                if entry.useProbability && !stickyActive && !promptTemplateActivated {
                     let roll = randomSource() * 100
                     if roll > max(0, min(100, entry.probability)) {
                         continue
@@ -362,13 +412,18 @@ public struct WorldbookEngine {
                 }
 
                 var updatedState = state
-                updatedState.lastTriggeredTurn = turn
-                updatedState.delayUntilTurn = nil
-                if let sticky = entry.sticky, sticky > 0 {
-                    updatedState.stickyUntilTurn = turn + sticky
-                }
-                if let cooldown = entry.cooldown, cooldown > 0 {
-                    updatedState.cooldownUntilTurn = turn + cooldown
+                previousStates[entryKey] = state
+                if !stickyActive {
+                    updatedState.lastTriggeredTurn = turn
+                    updatedState.delayUntilTurn = nil
+                    let stickyDuration = max(0, entry.sticky ?? 0)
+                    if stickyDuration > 0 {
+                        updatedState.stickyUntilTurn = turn + stickyDuration
+                    }
+                    if let cooldown = entry.cooldown, cooldown > 0 {
+                        // 酒馆会在 sticky 结束时重新开始 cooldown。
+                        updatedState.cooldownUntilTurn = turn + stickyDuration + cooldown
+                    }
                 }
                 runtimeStore.updateState(updatedState, for: context.sessionID, worldbookID: item.book.id, entryID: entry.id)
 
@@ -393,13 +448,57 @@ public struct WorldbookEngine {
                 newlyTriggeredContents.append(entry.content)
             }
 
+            let levelCandidates = Array(triggered[levelStartIndex...])
+            let levelAccepted = filterInclusionGroups(
+                levelCandidates,
+                books: activeBooks,
+                sessionID: context.sessionID,
+                currentTurn: turn,
+                lockedGroupNames: activatedGroupNames,
+                statesBeforeEvaluation: previousStates
+            )
+            triggered.removeSubrange(levelStartIndex..<triggered.count)
+            triggered.append(contentsOf: levelAccepted)
+            let levelAcceptedKeys = Set(levelAccepted.map {
+                WorldbookEntryRuntimeKey(worldbookID: $0.worldbookID, entryID: $0.entryID)
+            })
+            for candidate in levelCandidates {
+                let key = WorldbookEntryRuntimeKey(worldbookID: candidate.worldbookID, entryID: candidate.entryID)
+                guard !levelAcceptedKeys.contains(key), let state = previousStates.removeValue(forKey: key) else { continue }
+                runtimeStore.updateState(
+                    state,
+                    for: context.sessionID,
+                    worldbookID: key.worldbookID,
+                    entryID: key.entryID
+                )
+            }
+            let entryByKey = Dictionary(uniqueKeysWithValues: activeBooks.flatMap { book in
+                book.entries.map { (WorldbookEntryRuntimeKey(worldbookID: book.id, entryID: $0.id), $0) }
+            })
+            newlyTriggeredContents = levelAccepted.compactMap { injection in
+                let key = WorldbookEntryRuntimeKey(worldbookID: injection.worldbookID, entryID: injection.entryID)
+                return entryByKey[key]?.preventRecursion == true ? nil : injection.content
+            }
+            activatedGroupNames.formUnion(groupNames(for: levelAccepted, books: activeBooks))
+
             if newlyTriggeredContents.isEmpty {
                 break
             }
             recursionBuffer.append(contentsOf: newlyTriggeredContents)
         }
 
-        let budgeted = sortedInjections(triggered)
+        let budgeted = applyBudgets(sortedInjections(triggered), books: activeBooks)
+        let acceptedKeys = Set(budgeted.map {
+            WorldbookEntryRuntimeKey(worldbookID: $0.worldbookID, entryID: $0.entryID)
+        })
+        for (key, state) in previousStates where !acceptedKeys.contains(key) {
+            runtimeStore.updateState(
+                state,
+                for: context.sessionID,
+                worldbookID: key.worldbookID,
+                entryID: key.entryID
+            )
+        }
 
         if !budgeted.isEmpty {
             logger.info("世界书激活完成: turn=\(turn), entries=\(budgeted.count)")
@@ -429,21 +528,25 @@ public struct WorldbookEngine {
 
     private func isStickyActive(entry: WorldbookEntry, state: WorldbookTimedEffectState, currentTurn: Int) -> Bool {
         guard entry.sticky != nil else { return false }
+        guard state.lastTriggeredTurn.map({ currentTurn > $0 }) ?? false else { return false }
         guard let stickyUntil = state.stickyUntilTurn else { return false }
-        return currentTurn <= stickyUntil
+        return currentTurn < stickyUntil
     }
 
     private func isCooldownActive(entry: WorldbookEntry, state: WorldbookTimedEffectState, currentTurn: Int) -> Bool {
         guard entry.cooldown != nil else { return false }
+        guard state.lastTriggeredTurn.map({ currentTurn > $0 }) ?? false else { return false }
         guard let cooldownUntil = state.cooldownUntilTurn else { return false }
-        return currentTurn <= cooldownUntil
+        return currentTurn < cooldownUntil
     }
 
     private func buildScanBuffer(
         messages: [ChatMessage],
         scanDepth: Int,
         topicPrompt: String?,
-        enhancedPrompt: String?
+        enhancedPrompt: String?,
+        entry: WorldbookEntry? = nil,
+        context: Context? = nil
     ) -> String {
         let filtered = messages.filter { $0.role == .user || $0.role == .assistant || $0.role == .tool }
         let limited = Array(filtered.suffix(max(1, scanDepth)))
@@ -454,6 +557,36 @@ public struct WorldbookEngine {
         }
         if let enhancedPrompt, !enhancedPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append("[Enhanced]\n\(enhancedPrompt)")
+        }
+        if entry?.matchPersonaDescription == true,
+           let value = context?.personaDescription,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("[Persona]\n\(value)")
+        }
+        if entry?.matchCharacterDescription == true,
+           let value = context?.characterDescription,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("[Character Description]\n\(value)")
+        }
+        if entry?.matchCharacterPersonality == true,
+           let value = context?.characterPersonality,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("[Character Personality]\n\(value)")
+        }
+        if entry?.matchCharacterDepthPrompt == true,
+           let value = context?.characterDepthPrompt,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("[Character Depth Prompt]\n\(value)")
+        }
+        if entry?.matchScenario == true,
+           let value = context?.scenario,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("[Scenario]\n\(value)")
+        }
+        if entry?.matchCreatorNotes == true,
+           let value = context?.creatorNotes,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append("[Creator Notes]\n\(value)")
         }
 
         for message in limited {
@@ -517,8 +650,8 @@ public struct WorldbookEngine {
 
     private func keyword(_ key: String, matchesIn buffer: String, entry: WorldbookEntry) -> Bool {
         if entry.useRegex {
-            let options: NSRegularExpression.Options = entry.caseSensitive ? [] : [.caseInsensitive]
-            guard let regex = try? NSRegularExpression(pattern: key, options: options) else {
+            let parsed = parsedRegex(key, caseSensitive: entry.caseSensitive)
+            guard let regex = try? NSRegularExpression(pattern: parsed.pattern, options: parsed.options) else {
                 return false
             }
             let range = NSRange(buffer.startIndex..<buffer.endIndex, in: buffer)
@@ -540,6 +673,175 @@ public struct WorldbookEngine {
             return buffer.contains(key)
         }
         return buffer.localizedCaseInsensitiveContains(key)
+    }
+
+    private func parsedRegex(
+        _ raw: String,
+        caseSensitive: Bool
+    ) -> (pattern: String, options: NSRegularExpression.Options) {
+        var options: NSRegularExpression.Options = caseSensitive ? [] : [.caseInsensitive]
+        guard raw.hasPrefix("/"), let closing = raw.lastIndex(of: "/"), closing > raw.startIndex else {
+            return (raw, options)
+        }
+        let pattern = String(raw[raw.index(after: raw.startIndex)..<closing])
+        let flags = String(raw[raw.index(after: closing)...])
+        if flags.contains("i") { options.insert(.caseInsensitive) }
+        if flags.contains("m") { options.insert(.anchorsMatchLines) }
+        if flags.contains("s") { options.insert(.dotMatchesLineSeparators) }
+        if flags.contains("x") { options.insert(.allowCommentsAndWhitespace) }
+        return (pattern, options)
+    }
+
+    private func filterInclusionGroups(
+        _ injections: [WorldbookInjection],
+        books: [Worldbook],
+        sessionID: UUID,
+        currentTurn: Int,
+        lockedGroupNames: Set<String>,
+        statesBeforeEvaluation: [WorldbookEntryRuntimeKey: WorldbookTimedEffectState]
+    ) -> [WorldbookInjection] {
+        let entries = Dictionary(uniqueKeysWithValues: books.flatMap { book in
+            book.entries.map { (WorldbookEntryRuntimeKey(worldbookID: book.id, entryID: $0.id), $0) }
+        })
+        var kept = injections
+        var groups: [String: [WorldbookInjection]] = [:]
+        for injection in injections {
+            let key = WorldbookEntryRuntimeKey(worldbookID: injection.worldbookID, entryID: injection.entryID)
+            guard let group = entries[key]?.group else { continue }
+            for name in group.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where !name.isEmpty {
+                groups[name, default: []].append(injection)
+            }
+        }
+        for name in groups.keys.sorted() {
+            guard let original = groups[name] else { continue }
+            let candidates = original.filter { candidate in
+                kept.contains { $0.worldbookID == candidate.worldbookID && $0.entryID == candidate.entryID }
+            }
+            if lockedGroupNames.contains(name) {
+                kept.removeAll { candidates.contains($0) }
+                continue
+            }
+            guard candidates.count > 1 else { continue }
+
+            let sticky = candidates.filter { candidate in
+                let key = WorldbookEntryRuntimeKey(worldbookID: candidate.worldbookID, entryID: candidate.entryID)
+                guard let entry = entries[key] else { return false }
+                let state = statesBeforeEvaluation[key] ?? runtimeStore.state(
+                    for: sessionID,
+                    worldbookID: candidate.worldbookID,
+                    entryID: candidate.entryID
+                )
+                return isStickyActive(entry: entry, state: state, currentTurn: currentTurn)
+            }
+            if !sticky.isEmpty {
+                let stickyKeys = Set(sticky.map { WorldbookEntryRuntimeKey(worldbookID: $0.worldbookID, entryID: $0.entryID) })
+                kept.removeAll { candidate in
+                    candidates.contains(candidate) && !stickyKeys.contains(
+                        WorldbookEntryRuntimeKey(worldbookID: candidate.worldbookID, entryID: candidate.entryID)
+                    )
+                }
+                continue
+            }
+
+            let overrideCandidates = candidates.filter { candidate in
+                let key = WorldbookEntryRuntimeKey(worldbookID: candidate.worldbookID, entryID: candidate.entryID)
+                return entries[key]?.groupOverride == true
+            }
+            let scoringEnabled = candidates.contains { candidate in
+                let key = WorldbookEntryRuntimeKey(worldbookID: candidate.worldbookID, entryID: candidate.entryID)
+                return entries[key]?.useGroupScoring == true
+            }
+            let selectionPool: [WorldbookInjection]
+            if !overrideCandidates.isEmpty {
+                selectionPool = [overrideCandidates.sorted(by: injectionSort).first].compactMap { $0 }
+            } else if scoringEnabled, let maxScore = candidates.map(\.triggerScore).max() {
+                selectionPool = candidates.filter { $0.triggerScore == maxScore }
+            } else {
+                selectionPool = candidates
+            }
+            guard let winner = weightedWinner(selectionPool, entries: entries) else { continue }
+            kept.removeAll { candidate in
+                candidates.contains(candidate)
+                    && !(candidate.worldbookID == winner.worldbookID && candidate.entryID == winner.entryID)
+            }
+        }
+        return kept
+    }
+
+    private func groupNames(
+        for injections: [WorldbookInjection],
+        books: [Worldbook]
+    ) -> Set<String> {
+        let entries = Dictionary(uniqueKeysWithValues: books.flatMap { book in
+            book.entries.map { (WorldbookEntryRuntimeKey(worldbookID: book.id, entryID: $0.id), $0) }
+        })
+        var names = Set<String>()
+        for injection in injections {
+            let key = WorldbookEntryRuntimeKey(worldbookID: injection.worldbookID, entryID: injection.entryID)
+            guard let group = entries[key]?.group else { continue }
+            for name in group.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where !name.isEmpty {
+                names.insert(name)
+            }
+        }
+        return names
+    }
+
+    private func weightedWinner(
+        _ candidates: [WorldbookInjection],
+        entries: [WorldbookEntryRuntimeKey: WorldbookEntry]
+    ) -> WorldbookInjection? {
+        guard !candidates.isEmpty else { return nil }
+        let weights = candidates.map { candidate -> Double in
+            let key = WorldbookEntryRuntimeKey(worldbookID: candidate.worldbookID, entryID: candidate.entryID)
+            return max(0, entries[key]?.groupWeight ?? 1)
+        }
+        let total = weights.reduce(0, +)
+        guard total > 0 else { return candidates.first }
+        let roll = randomSource() * total
+        var cursor = 0.0
+        for (index, candidate) in candidates.enumerated() {
+            cursor += weights[index]
+            if roll <= cursor { return candidate }
+        }
+        return candidates.last
+    }
+
+    private func applyBudgets(
+        _ injections: [WorldbookInjection],
+        books: [Worldbook]
+    ) -> [WorldbookInjection] {
+        let settings = Dictionary(uniqueKeysWithValues: books.map { ($0.id, $0.settings) })
+        let entries = Dictionary(uniqueKeysWithValues: books.flatMap { book in
+            book.entries.map { (WorldbookEntryRuntimeKey(worldbookID: book.id, entryID: $0.id), $0) }
+        })
+        var accepted: [WorldbookInjection] = []
+        var counts: [UUID: Int] = [:]
+        var characters: [UUID: Int] = [:]
+        for injection in injections {
+            let key = WorldbookEntryRuntimeKey(worldbookID: injection.worldbookID, entryID: injection.entryID)
+            if entries[key]?.ignoresBudget == true {
+                accepted.append(injection)
+                continue
+            }
+            guard let bookSettings = settings[injection.worldbookID] else {
+                accepted.append(injection)
+                continue
+            }
+            let nextCount = counts[injection.worldbookID, default: 0] + 1
+            let nextCharacters = characters[injection.worldbookID, default: 0] + injection.content.count
+            if bookSettings.maxInjectedEntries >= 0, nextCount > bookSettings.maxInjectedEntries { continue }
+            if bookSettings.maxInjectedCharacters >= 0, nextCharacters > bookSettings.maxInjectedCharacters { continue }
+            counts[injection.worldbookID] = nextCount
+            characters[injection.worldbookID] = nextCharacters
+            accepted.append(injection)
+        }
+        return accepted
+    }
+
+    private func injectionSort(_ lhs: WorldbookInjection, _ rhs: WorldbookInjection) -> Bool {
+        if lhs.order != rhs.order { return lhs.order > rhs.order }
+        if lhs.triggerScore != rhs.triggerScore { return lhs.triggerScore > rhs.triggerScore }
+        return lhs.entryID.uuidString < rhs.entryID.uuidString
     }
 
     private func sortedInjections(_ items: [WorldbookInjection]) -> [WorldbookInjection] {

@@ -59,6 +59,49 @@ struct DatabaseEncryptionManagerTests {
         #expect(try manager.withPassphraseDataIfAvailable { $0.count } == nil)
     }
 
+    @Test("关闭 Keychain 保存后主密码只保留在内存")
+    func testManualUnlockModeKeepsPassphraseInMemoryOnly() throws {
+        DatabaseEncryptionBootstrapStore.save(.disabled)
+        defer { DatabaseEncryptionBootstrapStore.save(.disabled) }
+
+        let store = InMemoryDatabaseEncryptionPassphraseStore()
+        let manager = DatabaseEncryptionManager(passphraseStore: store)
+
+        try manager.setActivePassphrase(
+            "database-passphrase",
+            confirmation: "database-passphrase",
+            storesPassphraseInKeychain: false
+        )
+
+        #expect(manager.hasStoredPassphrase == false)
+        #expect(manager.hasAvailablePassphrase == true)
+        #expect(manager.isManualUnlockModeEnabled == true)
+        #expect(manager.requiresManualUnlock == false)
+
+        let loaded = try manager.withPassphraseDataIfAvailable { passphrase in
+            String(decoding: passphrase, as: UTF8.self)
+        }
+        #expect(loaded == "database-passphrase")
+    }
+
+    @Test("手动模式清空内存主密码后需要重新解锁")
+    func testManualUnlockModeRequiresUnlockAfterClearingMemory() throws {
+        DatabaseEncryptionBootstrapStore.save(.disabled)
+        defer { DatabaseEncryptionBootstrapStore.save(.disabled) }
+
+        let manager = DatabaseEncryptionManager(passphraseStore: InMemoryDatabaseEncryptionPassphraseStore())
+        try manager.setActivePassphrase(
+            "database-passphrase",
+            confirmation: "database-passphrase",
+            storesPassphraseInKeychain: false
+        )
+
+        manager.clearManualUnlockSession()
+
+        #expect(manager.hasAvailablePassphrase == false)
+        #expect(manager.requiresManualUnlock == true)
+    }
+
     @Test("数据库加密设置不会进入 AppConfig 同步快照")
     @MainActor
     func testDatabaseEncryptionSettingIsLocalOnly() {
@@ -71,29 +114,16 @@ struct DatabaseEncryptionManagerTests {
         #expect(snapshot[AppConfigKey.databaseEncryptionEnabled.rawValue] == nil)
     }
 
-    @Test("数据库配置会在存在主密码时创建 SQLCipher 加密库")
-    @MainActor
+    @Test("加密数据库配置会创建 SQLCipher 加密库")
     func testDatabaseConfigurationCreatesEncryptedDatabase() throws {
-        let backup = AppConfigStore.shared.databaseEncryptionEnabled
-        let previousOverride = Persistence.grdbEnabledOverrideForTests
-        Persistence.grdbEnabledOverrideForTests = true
-        Persistence.resetGRDBStoreForTests()
-        defer {
-            try? DatabaseEncryptionManager.shared.deletePassphrase(verificationPassphrase: "database-passphrase")
-            AppConfigStore.shared.databaseEncryptionEnabled = backup
-            Persistence.grdbEnabledOverrideForTests = previousOverride
-            Persistence.resetGRDBStoreForTests()
-        }
-
-        try DatabaseEncryptionManager.shared.savePassphrase("database-passphrase", confirmation: "database-passphrase")
-        AppConfigStore.shared.databaseEncryptionEnabled = true
+        let passphrase = Data("database-passphrase".utf8)
 
         let databaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("ETOS-SQLCipher-Test-\(UUID().uuidString)", isDirectory: false)
             .appendingPathExtension("sqlite")
         defer { try? FileManager.default.removeItem(at: databaseURL) }
 
-        let configuration = Persistence.makeDatabaseConfiguration(qos: .userInitiated, mmapSize: 1_048_576)
+        let configuration = Persistence.makeEncryptedDatabaseConfiguration(passphrase: passphrase)
         let queue = try DatabaseQueue(path: databaseURL.path, configuration: configuration)
         try queue.write { db in
             try db.execute(sql: "CREATE TABLE encrypted_data(value TEXT)")
@@ -102,8 +132,28 @@ struct DatabaseEncryptionManagerTests {
         }
         try queue.close()
 
-        #expect(Persistence.isDatabaseHealthy(at: databaseURL, encrypted: true) == true)
+        #expect(Persistence.isDatabaseHealthy(at: databaseURL, encrypted: true, passphrase: passphrase) == true)
         #expect(Persistence.isDatabaseHealthy(at: databaseURL, encrypted: false) == false)
+    }
+
+    @Test("启动状态机会等待手动数据库解锁")
+    @MainActor
+    func testLaunchStateWaitsForManualDatabaseUnlock() throws {
+        try? DatabaseEncryptionManager.shared.deletePassphraseWithoutVerification()
+        try DatabaseEncryptionManager.shared.setActivePassphrase(
+            "database-passphrase",
+            confirmation: "database-passphrase",
+            storesPassphraseInKeychain: false
+        )
+        DatabaseEncryptionManager.shared.clearManualUnlockSession()
+        defer {
+            try? DatabaseEncryptionManager.shared.deletePassphraseWithoutVerification()
+        }
+
+        let stateMachine = AppLaunchStateMachine()
+        stateMachine.startIfNeeded()
+
+        #expect(stateMachine.phase == .waitingForDatabaseUnlock)
     }
 }
 

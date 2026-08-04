@@ -12,7 +12,7 @@ import Foundation
 
 extension PersistenceTests {
     @Test("GRDB 启动迁移后自动清理旧 JSON 会话文件")
-    func testBootstrapGRDBImportAndCleanupLegacyJSON() throws {
+    func testBootstrapGRDBImportAndCleanupLegacyJSON() async throws {
         cleanup(sessions: [])
 
         let sessionID = UUID()
@@ -38,6 +38,10 @@ extension PersistenceTests {
         }
 
         Persistence.bootstrapGRDBStoreOnLaunch()
+        _ = try await Persistence.migrateLegacyJSONIncrementally(
+            shouldCleanupLegacyJSONAfterImport: true,
+            throttleInterval: 0
+        )
 
         let loadedSessions = Persistence.loadChatSessions()
         #expect(loadedSessions.contains(where: { $0.id == sessionID }))
@@ -54,8 +58,7 @@ extension PersistenceTests {
     func testLaunchBackupCreatesSlimChatStoreBackup() {
         cleanup(sessions: [])
 
-        let defaults = UserDefaults.standard
-        let previousBackupEnabled = defaults.object(forKey: Persistence.launchBackupEnabledKey)
+        let previousBackupEnabled = enableLaunchBackupForTest()
         let previousOverride = Persistence.grdbEnabledOverrideForTests
         let session = ChatSession(id: UUID(), name: "Launch Backup Session", isTemporary: false)
         let messages = [
@@ -63,15 +66,10 @@ extension PersistenceTests {
             ChatMessage(role: .assistant, content: "launch-backup-assistant")
         ]
 
-        defaults.set(true, forKey: Persistence.launchBackupEnabledKey)
         Persistence.grdbEnabledOverrideForTests = true
         Persistence.resetGRDBStoreForTests()
         defer {
-            if let previousBackupEnabled = previousBackupEnabled as? Bool {
-                defaults.set(previousBackupEnabled, forKey: Persistence.launchBackupEnabledKey)
-            } else {
-                defaults.removeObject(forKey: Persistence.launchBackupEnabledKey)
-            }
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
             Persistence.grdbEnabledOverrideForTests = previousOverride
             Persistence.resetGRDBStoreForTests()
             cleanup(sessions: [session])
@@ -515,12 +513,11 @@ extension PersistenceTests {
         #expect(Persistence.loadMessages(for: snapshotSession.id).map(\.content) == ["strong-snapshot-source"])
     }
 
-    @Test("启动检测到 chat-store 损坏时会按备份重建并重建 FTS")
-    func testLaunchBackupRestoresCorruptedChatStoreAndRebuildsFTS() throws {
+    @Test("启动检测到 chat-store 损坏时会先请求确认再按备份重建")
+    func testLaunchBackupRequestsConfirmationBeforeRestoringCorruptedChatStore() throws {
         cleanup(sessions: [])
 
-        let defaults = UserDefaults.standard
-        let previousBackupEnabled = defaults.object(forKey: Persistence.launchBackupEnabledKey)
+        let previousBackupEnabled = enableLaunchBackupForTest()
         let previousOverride = Persistence.grdbEnabledOverrideForTests
         let session = ChatSession(id: UUID(), name: "Corrupted Launch Session", isTemporary: false)
         let messages = [
@@ -528,15 +525,10 @@ extension PersistenceTests {
             ChatMessage(role: .assistant, content: "recover-assistant")
         ]
 
-        defaults.set(true, forKey: Persistence.launchBackupEnabledKey)
         Persistence.grdbEnabledOverrideForTests = true
         Persistence.resetGRDBStoreForTests()
         defer {
-            if let previousBackupEnabled = previousBackupEnabled as? Bool {
-                defaults.set(previousBackupEnabled, forKey: Persistence.launchBackupEnabledKey)
-            } else {
-                defaults.removeObject(forKey: Persistence.launchBackupEnabledKey)
-            }
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
             Persistence.grdbEnabledOverrideForTests = previousOverride
             Persistence.resetGRDBStoreForTests()
             cleanup(sessions: [session])
@@ -555,6 +547,14 @@ extension PersistenceTests {
         Persistence.resetGRDBStoreForTests()
         Persistence.bootstrapGRDBStoreOnLaunch()
 
+        let request = Persistence.currentLaunchRecoveryRequest()
+        #expect(request?.databaseNames.contains("聊天数据库") == true)
+        #expect(request?.message.contains("启动") == true)
+
+        let restoreMessage = try Persistence.restorePendingLaunchBackupRequest()
+        #expect(restoreMessage.contains("聊天数据库"))
+        #expect(Persistence.currentLaunchRecoveryRequest() == nil)
+
         let restoredMessages = Persistence.loadMessages(for: session.id)
         #expect(restoredMessages.map(\.content) == messages.map(\.content))
         let recoveryNotice = Persistence.consumeLaunchRecoveryNotice()
@@ -569,8 +569,7 @@ extension PersistenceTests {
     func testLaunchBackupKeepsPreviousBackupWhenNewBackupFails() throws {
         cleanup(sessions: [])
 
-        let defaults = UserDefaults.standard
-        let previousBackupEnabled = defaults.object(forKey: Persistence.launchBackupEnabledKey)
+        let previousBackupEnabled = enableLaunchBackupForTest()
         let previousOverride = Persistence.grdbEnabledOverrideForTests
         let oldSession = ChatSession(id: UUID(), name: "Old Backup Session", isTemporary: false)
         let oldMessages = [
@@ -582,7 +581,6 @@ extension PersistenceTests {
         ]
         var didRestrictBackupDirectory = false
 
-        defaults.set(true, forKey: Persistence.launchBackupEnabledKey)
         Persistence.grdbEnabledOverrideForTests = true
         Persistence.resetGRDBStoreForTests()
         defer {
@@ -592,11 +590,7 @@ extension PersistenceTests {
                     ofItemAtPath: chatStoreBackupDirectory.path
                 )
             }
-            if let previousBackupEnabled = previousBackupEnabled as? Bool {
-                defaults.set(previousBackupEnabled, forKey: Persistence.launchBackupEnabledKey)
-            } else {
-                defaults.removeObject(forKey: Persistence.launchBackupEnabledKey)
-            }
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
             Persistence.grdbEnabledOverrideForTests = previousOverride
             Persistence.resetGRDBStoreForTests()
             cleanup(sessions: [oldSession, newSession])
@@ -623,27 +617,67 @@ extension PersistenceTests {
         #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = 'should-not-replace-old-backup'") == 0)
     }
 
+    @Test("启动备份轮换成功后会清理临时文件和上一份备份")
+    func testLaunchBackupRotationCleansTemporaryAndPreviousFiles() throws {
+        cleanup(sessions: [])
+
+        let previousBackupEnabled = enableLaunchBackupForTest()
+        let previousOverride = Persistence.grdbEnabledOverrideForTests
+        let oldSession = ChatSession(id: UUID(), name: "Old Rotation Backup", isTemporary: false)
+        let newSession = ChatSession(id: UUID(), name: "New Rotation Backup", isTemporary: false)
+        let creatingURL = chatStoreBackupSQLiteURL.appendingPathExtension("creating")
+        let legacyTemporaryURL = chatStoreBackupSQLiteURL.appendingPathExtension("tmp")
+        let previousURL = chatStoreBackupSQLiteURL.appendingPathExtension("previous")
+
+        Persistence.grdbEnabledOverrideForTests = true
+        Persistence.resetGRDBStoreForTests()
+        defer {
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
+            Persistence.grdbEnabledOverrideForTests = previousOverride
+            Persistence.resetGRDBStoreForTests()
+            removeIfExists(creatingURL)
+            removeIfExists(legacyTemporaryURL)
+            removeIfExists(previousURL)
+            cleanup(sessions: [oldSession, newSession])
+        }
+
+        Persistence.saveChatSessions([oldSession])
+        Persistence.saveMessages([ChatMessage(role: .user, content: "rotation-old-backup")], for: oldSession.id)
+        Persistence.createLaunchBackupPointIfEnabled()
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = 'rotation-old-backup'") == 1)
+
+        try Data([0x01, 0x02, 0x03]).write(to: creatingURL, options: .atomic)
+        try Data([0x04, 0x05, 0x06]).write(to: legacyTemporaryURL, options: .atomic)
+        try FileManager.default.copyItem(at: chatStoreBackupSQLiteURL, to: previousURL)
+
+        Persistence.resetGRDBStoreForTests()
+        Persistence.saveChatSessions([newSession])
+        Persistence.saveMessages([ChatMessage(role: .assistant, content: "rotation-new-backup")], for: newSession.id)
+        Persistence.createLaunchBackupPointIfEnabled()
+
+        #expect(FileManager.default.fileExists(atPath: chatStoreBackupSQLiteURL.path))
+        #expect(!FileManager.default.fileExists(atPath: creatingURL.path))
+        #expect(!FileManager.default.fileExists(atPath: legacyTemporaryURL.path))
+        #expect(!FileManager.default.fileExists(atPath: previousURL.path))
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = 'rotation-new-backup'") == 1)
+        #expect(sqliteCount(chatStoreBackupSQLiteURL, sql: "SELECT COUNT(*) FROM messages WHERE content = 'rotation-old-backup'") == 0)
+    }
+
     @Test("启动预热不会立即创建还原点")
     func testBootstrapGRDBDoesNotCreateLaunchBackupImmediately() {
         cleanup(sessions: [])
 
-        let defaults = UserDefaults.standard
-        let previousBackupEnabled = defaults.object(forKey: Persistence.launchBackupEnabledKey)
+        let previousBackupEnabled = enableLaunchBackupForTest()
         let previousOverride = Persistence.grdbEnabledOverrideForTests
         let session = ChatSession(id: UUID(), name: "Deferred Backup Session", isTemporary: false)
         let messages = [
             ChatMessage(role: .user, content: "deferred-backup-user")
         ]
 
-        defaults.set(true, forKey: Persistence.launchBackupEnabledKey)
         Persistence.grdbEnabledOverrideForTests = true
         Persistence.resetGRDBStoreForTests()
         defer {
-            if let previousBackupEnabled = previousBackupEnabled as? Bool {
-                defaults.set(previousBackupEnabled, forKey: Persistence.launchBackupEnabledKey)
-            } else {
-                defaults.removeObject(forKey: Persistence.launchBackupEnabledKey)
-            }
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
             Persistence.grdbEnabledOverrideForTests = previousOverride
             Persistence.resetGRDBStoreForTests()
             cleanup(sessions: [session])
@@ -661,23 +695,17 @@ extension PersistenceTests {
     func testScheduleLaunchBackupAfterStartupCreatesBackup() async {
         cleanup(sessions: [])
 
-        let defaults = UserDefaults.standard
-        let previousBackupEnabled = defaults.object(forKey: Persistence.launchBackupEnabledKey)
+        let previousBackupEnabled = enableLaunchBackupForTest()
         let previousOverride = Persistence.grdbEnabledOverrideForTests
         let session = ChatSession(id: UUID(), name: "Scheduled Backup Session", isTemporary: false)
         let messages = [
             ChatMessage(role: .assistant, content: "scheduled-backup-assistant")
         ]
 
-        defaults.set(true, forKey: Persistence.launchBackupEnabledKey)
         Persistence.grdbEnabledOverrideForTests = true
         Persistence.resetGRDBStoreForTests()
         defer {
-            if let previousBackupEnabled = previousBackupEnabled as? Bool {
-                defaults.set(previousBackupEnabled, forKey: Persistence.launchBackupEnabledKey)
-            } else {
-                defaults.removeObject(forKey: Persistence.launchBackupEnabledKey)
-            }
+            restoreLaunchBackupAfterTest(previousBackupEnabled)
             Persistence.grdbEnabledOverrideForTests = previousOverride
             Persistence.resetGRDBStoreForTests()
             cleanup(sessions: [session])

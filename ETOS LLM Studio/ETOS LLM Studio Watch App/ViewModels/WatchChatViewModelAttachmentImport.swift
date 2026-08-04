@@ -52,6 +52,10 @@ struct WatchAttachmentImportProgress: Equatable, Sendable {
         guard totalBytes > 0 else { return 0 }
         return min(max(Double(bytesReceived) / Double(totalBytes), 0), 1)
     }
+
+    nonisolated var displayPercentage: Int {
+        min(Int((fractionCompleted * 100).rounded()), 99)
+    }
 }
 
 private enum WatchAttachmentImportError: LocalizedError {
@@ -227,6 +231,14 @@ extension ChatViewModel {
             return "audio/aac"
         case "flac":
             return "audio/flac"
+        case "mp4", "m4v":
+            return "video/mp4"
+        case "mov":
+            return "video/quicktime"
+        case "webm":
+            return "video/webm"
+        case "mpeg", "mpg":
+            return "video/mpeg"
         case "txt":
             return "text/plain"
         case "json":

@@ -241,6 +241,14 @@ extension SyncEngine {
         let mergedModelReference = incoming.modelReference ?? local.modelReference
         let mergedCostEstimate = incoming.costEstimate ?? local.costEstimate
         let mergedRequestedAt = minOptional(local.requestedAt, incoming.requestedAt)
+        let mergedReasoningProviderSpecificFields = mergeMetadataDictionary(
+            local.reasoningProviderSpecificFields,
+            incoming.reasoningProviderSpecificFields
+        )
+        let mergedProviderResponseMetadata = mergeMetadataDictionary(
+            local.providerResponseMetadata,
+            incoming.providerResponseMetadata
+        )
 
         var merged = buildMessage(
             from: local,
@@ -248,6 +256,8 @@ extension SyncEngine {
             currentVersionIndex: contentMerge.currentVersionIndex,
             requestedAt: mergedRequestedAt,
             reasoningContent: reasoningMerge.value,
+            reasoningProviderSpecificFields: mergedReasoningProviderSpecificFields,
+            providerResponseMetadata: mergedProviderResponseMetadata,
             toolCalls: toolCallsMerge.value,
             toolCallsPlacement: toolCallsPlacement.value,
             tokenUsage: mergedTokenUsage,
@@ -263,6 +273,7 @@ extension SyncEngine {
         merged.responseAttemptID = local.responseAttemptID ?? incoming.responseAttemptID
         merged.responseAttemptIndex = local.responseAttemptIndex ?? incoming.responseAttemptIndex
         merged.selectedResponseAttemptID = local.selectedResponseAttemptID ?? incoming.selectedResponseAttemptID
+        merged.sentSystemPromptSnapshot = local.sentSystemPromptSnapshot ?? incoming.sentSystemPromptSnapshot
 
         if local.id != incoming.id, local.content == incoming.content {
             merged.id = local.id
@@ -298,6 +309,8 @@ extension SyncEngine {
         currentVersionIndex: Int,
         requestedAt: Date?,
         reasoningContent: String?,
+        reasoningProviderSpecificFields: [String: JSONValue]?,
+        providerResponseMetadata: [String: JSONValue]?,
         toolCalls: [InternalToolCall]?,
         toolCallsPlacement: ToolCallsPlacement?,
         tokenUsage: MessageTokenUsage?,
@@ -316,6 +329,8 @@ extension SyncEngine {
             content: safeVersions[0],
             requestedAt: requestedAt,
             reasoningContent: reasoningContent,
+            reasoningProviderSpecificFields: reasoningProviderSpecificFields,
+            providerResponseMetadata: providerResponseMetadata,
             toolCalls: toolCalls,
             toolCallsPlacement: toolCallsPlacement,
             tokenUsage: tokenUsage,
@@ -335,6 +350,17 @@ extension SyncEngine {
             message.switchToVersion(safeCurrentIndex)
         }
         return message
+    }
+
+    static func mergeMetadataDictionary(
+        _ local: [String: JSONValue]?,
+        _ incoming: [String: JSONValue]?
+    ) -> [String: JSONValue]? {
+        var merged = local ?? [:]
+        for (key, value) in incoming ?? [:] {
+            merged[key] = value
+        }
+        return merged.isEmpty ? nil : merged
     }
 
     static func mergeMessageVersions(

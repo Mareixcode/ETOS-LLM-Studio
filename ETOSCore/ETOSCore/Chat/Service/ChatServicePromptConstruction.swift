@@ -20,7 +20,7 @@ extension ChatService {
         worldbookAfter: [WorldbookInjection] = [],
         worldbookANTop: [WorldbookInjection] = [],
         worldbookANBottom: [WorldbookInjection] = [],
-        worldbookOutlet: [WorldbookInjection] = []
+        roleplayPrompt: String? = nil
     ) -> String {
         var parts: [String] = []
 
@@ -36,12 +36,13 @@ extension ChatService {
         if !worldbookANBottom.isEmpty {
             parts.append(makeWorldbookPromptBlock(tag: "worldbook_an_bottom", entries: worldbookANBottom))
         }
-        if !worldbookOutlet.isEmpty {
-            parts.append(contentsOf: makeWorldbookOutletBlocks(entries: worldbookOutlet))
-        }
-
         if let global, !global.isEmpty {
             parts.append("<system_prompt>\n\(global)\n</system_prompt>")
+        }
+
+        if let roleplayPrompt,
+           !roleplayPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(roleplayPrompt)
         }
 
         if let topic, !topic.isEmpty {
@@ -55,11 +56,23 @@ extension ChatService {
         if !memories.isEmpty {
             let sendUpdateTime = shouldSendMemoryUpdateTime()
             let memoryStrings = memories.map { memory in
-                guard sendUpdateTime else {
-                    return "- \(memory.content)"
+                var metadata = ["type=\(memory.kind.promptLabel)"]
+                metadata.append("importance=\(String(format: "%.2f", memory.importance))")
+                metadata.append("confidence=\(String(format: "%.2f", memory.confidence))")
+                if !memory.entities.isEmpty {
+                    metadata.append("entities=\(memory.entities.joined(separator: ", "))")
                 }
-                let displayDate = (memory.updatedAt ?? memory.createdAt).formatted(date: .abbreviated, time: .shortened)
-                return "- (\(displayDate)): \(memory.content)"
+                if let validFrom = memory.validFrom {
+                    metadata.append("valid_from=\(validFrom.formatted(date: .abbreviated, time: .shortened))")
+                }
+                if let validUntil = memory.validUntil {
+                    metadata.append("valid_until=\(validUntil.formatted(date: .abbreviated, time: .shortened))")
+                }
+                if sendUpdateTime {
+                    let displayDate = (memory.updatedAt ?? memory.createdAt).formatted(date: .abbreviated, time: .shortened)
+                    metadata.append("updated_at=\(displayDate)")
+                }
+                return "- [\(metadata.joined(separator: "; "))] \(memory.content)"
             }
             let memoriesContent = memoryStrings.joined(separator: "\n")
             parts.append(BuiltInPromptStore.render(
@@ -85,7 +98,7 @@ extension ChatService {
             parts.append(BuiltInPromptStore.render(
                 .userProfileMemory,
                 variables: [
-                    "memory": conversationProfile.content,
+                    "memory": conversationProfile.promptRepresentation,
                     "updated_at": profileUpdatedAt
                 ]
             ))
@@ -94,7 +107,11 @@ extension ChatService {
         return parts.joined(separator: "\n\n")
     }
 
-    func makeEnhancedPromptSystemMessage(_ enhancedPrompt: String?) -> ChatMessage? {
+    func makeEnhancedPromptMessage(
+        _ enhancedPrompt: String?,
+        apiFormat: String,
+        openAIUsesSystemRole: Bool
+    ) -> ChatMessage? {
         guard let enhancedPrompt else { return nil }
         let trimmed = enhancedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -102,11 +119,77 @@ extension ChatService {
             .enhancedPrompt,
             variables: ["instruction": trimmed]
         )
-        return ChatMessage(role: .system, content: content)
+        return ChatMessage(
+            role: tailContextRole(apiFormat: apiFormat, openAIUsesSystemRole: openAIUsesSystemRole),
+            content: content
+        )
     }
 
-    func makeSystemTimeSystemMessage() -> ChatMessage {
-        ChatMessage(role: .system, content: makeSystemTimePromptBlock())
+    func tailContextRole(apiFormat: String, openAIUsesSystemRole: Bool) -> MessageRole {
+        let normalizedAPIFormat = apiFormat.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedAPIFormat == LocalModelProviderBridge.apiFormat {
+            // 本地 GGUF chat template 直接接收角色序列，可以在尾部生成模型对应的 system token。
+            return .system
+        }
+        switch ProviderAPIFormatFamily(apiFormat: normalizedAPIFormat) {
+        case .anthropic, .gemini:
+            // 这两类协议会把所有 system 消息提升到请求前缀，尾部上下文统一使用 user。
+            return .user
+        case .openAICompatible, .openAIResponses:
+            return openAIUsesSystemRole ? .system : .user
+        }
+    }
+
+    func makeTailSystemTimeMessage(apiFormat: String, openAIUsesSystemRole: Bool) -> ChatMessage {
+        ChatMessage(
+            role: tailContextRole(apiFormat: apiFormat, openAIUsesSystemRole: openAIUsesSystemRole),
+            content: makeSystemTimePromptBlock()
+        )
+    }
+
+    func appendTailContextMessage(
+        _ message: ChatMessage,
+        to messages: inout [ChatMessage],
+        apiFormat: String
+    ) {
+        guard message.role == .user else {
+            messages.append(message)
+            return
+        }
+
+        let normalizedAPIFormat = apiFormat.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let movesSystemMessagesToPrefix: Bool
+        switch ProviderAPIFormatFamily(apiFormat: normalizedAPIFormat) {
+        case .anthropic, .gemini:
+            movesSystemMessagesToPrefix = true
+        case .openAICompatible, .openAIResponses:
+            movesSystemMessagesToPrefix = false
+        }
+
+        if !movesSystemMessagesToPrefix {
+            guard messages.last?.role == .user else {
+                messages.append(message)
+                return
+            }
+            let lastIndex = messages.index(before: messages.endIndex)
+            let separator = messages[lastIndex].content.isEmpty ? "" : "\n\n"
+            messages[lastIndex].content += separator + message.content
+            return
+        }
+
+        guard let userIndex = messages.lastIndex(where: { $0.role == .user }) else {
+            messages.append(message)
+            return
+        }
+
+        let messagesAfterUser = messages[messages.index(after: userIndex)...]
+        guard messagesAfterUser.allSatisfy({ $0.role == .system }) else {
+            messages.append(message)
+            return
+        }
+
+        let separator = messages[userIndex].content.isEmpty ? "" : "\n\n"
+        messages[userIndex].content += separator + message.content
     }
 
     func makeSystemTimePromptBlock() -> String {
@@ -143,18 +226,14 @@ extension ChatService {
         return "<\(tag)\(attrs)>\n\(lines)\n</\(tag)>"
     }
 
-    func makeWorldbookOutletBlocks(entries: [WorldbookInjection]) -> [String] {
+    func makeWorldbookOutletValues(entries: [WorldbookInjection]) -> [String: String] {
         let grouped = Dictionary(grouping: entries) { injection -> String in
-            let trimmed = injection.outletName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return trimmed.isEmpty ? "default" : trimmed
+            injection.outletName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
-        return grouped.keys.sorted().compactMap { outletName in
-            guard let outletEntries = grouped[outletName], !outletEntries.isEmpty else { return nil }
-            return makeWorldbookPromptBlock(
-                tag: "worldbook_outlet",
-                entries: outletEntries,
-                attributes: ["name": outletName]
-            )
+        return grouped.reduce(into: [:]) { result, item in
+            let (outletName, outletEntries) = item
+            guard !outletName.isEmpty, !outletEntries.isEmpty else { return }
+            result[outletName] = outletEntries.map(\.content).joined(separator: "\n")
         }
     }
 

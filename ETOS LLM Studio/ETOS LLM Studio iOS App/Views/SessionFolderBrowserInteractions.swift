@@ -51,9 +51,7 @@ extension SessionFolderBrowserView {
             .onChange(of: searchText) { _, newValue in
                 guard isRoot else { return }
                 if !SessionHistorySearchSupport.normalizedQuery(newValue).isEmpty, isBatchSelecting {
-                    isBatchSelecting = false
-                    selectedSessionIDs.removeAll()
-                    selectedFolderIDs.removeAll()
+                    setBatchSelecting(false)
                 }
                 isLoadingMoreSearchResults = false
                 loadedSearchResultItems = []
@@ -196,6 +194,22 @@ extension SessionFolderBrowserView {
         content
             .sheet(item: $sessionInfo) { info in
                 SessionInfoSheet(payload: info)
+            }
+            .sheet(item: $contextCompressionSourceSession) { session in
+                ContextCompressionOptionsView(
+                    session: session,
+                    models: viewModel.activatedChatModels,
+                    selectedModelID: viewModel.selectedModel?.id,
+                    onCompress: { options, progress in
+                        try await viewModel.createCompressedContinuation(
+                            from: session.id,
+                            options: options,
+                            progress: progress
+                        )
+                    }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             }
             .sheet(isPresented: $isShowingTagManager) {
                 SessionTagManagementView(
@@ -385,11 +399,7 @@ extension SessionFolderBrowserView {
             BatchSelectableFolderRow(
                 folder: folder,
                 sessionCount: recursiveSessionCount(in: folder.id),
-                tags: folderTags(in: folder.id),
-                isSelected: selectedFolderIDs.contains(folder.id),
-                onToggle: {
-                    toggleFolderSelection(folder.id)
-                }
+                tags: folderTags(in: folder.id)
             )
         } else {
             NavigationLink {
@@ -465,6 +475,14 @@ extension SessionFolderBrowserView {
                 Label(NSLocalizedString("管理标签", comment: "Manage session tags"), systemImage: "tag")
             }
 
+            if isBatchSelecting {
+                Button {
+                    invertBatchSelection()
+                } label: {
+                    Label(NSLocalizedString("反选", comment: "Invert batch selection"), systemImage: "arrow.left.arrow.right.circle")
+                }
+            }
+
             Button {
                 toggleBatchMode()
             } label: {
@@ -489,11 +507,7 @@ extension SessionFolderBrowserView {
         if isBatchSelecting && !forceRegularMode {
             BatchSelectableSessionRow(
                 session: session,
-                tags: sessionTags(for: session),
-                isSelected: selectedSessionIDs.contains(session.id),
-                onToggle: {
-                    toggleSessionSelection(session.id)
-                }
+                tags: sessionTags(for: session)
             )
         } else {
             SessionRow(
@@ -522,6 +536,9 @@ extension SessionFolderBrowserView {
                     let newSession = viewModel.branchSession(from: session, copyMessages: copyHistory)
                     viewModel.setCurrentSession(newSession)
                     focusOnLatest()
+                },
+                onCompress: {
+                    contextCompressionSourceSession = session
                 },
                 onMoveToFolder: { targetFolderID in
                     viewModel.moveSession(session, toFolderID: targetFolderID)
@@ -596,27 +613,26 @@ extension SessionFolderBrowserView {
     }
 
     func toggleBatchMode() {
-        isBatchSelecting.toggle()
-        if !isBatchSelecting {
+        setBatchSelecting(!isBatchSelecting)
+    }
+
+    func setBatchSelecting(_ enabled: Bool) {
+        isBatchSelecting = enabled
+        if !enabled {
             selectedSessionIDs.removeAll()
             selectedFolderIDs.removeAll()
         }
     }
 
-    func toggleSessionSelection(_ sessionID: UUID) {
-        if selectedSessionIDs.contains(sessionID) {
-            selectedSessionIDs.remove(sessionID)
-        } else {
-            selectedSessionIDs.insert(sessionID)
-        }
-    }
-
-    func toggleFolderSelection(_ folderID: UUID) {
-        if selectedFolderIDs.contains(folderID) {
-            selectedFolderIDs.remove(folderID)
-        } else {
-            selectedFolderIDs.insert(folderID)
-        }
+    func invertBatchSelection() {
+        selectedSessionIDs = BatchSelectionSupport.invertedIDs(
+            selectableIDs: Set(pagedDirectSessions.map(\.id)),
+            selectedIDs: selectedSessionIDs
+        )
+        selectedFolderIDs = BatchSelectionSupport.invertedIDs(
+            selectableIDs: Set(childFolders.map(\.id)),
+            selectedIDs: selectedFolderIDs
+        )
     }
 
     func toggleTagFilter(_ tagID: UUID) {

@@ -10,6 +10,87 @@ import SwiftUI
 import Foundation
 import ETOSCore
 
+struct WatchGlobalToolPermissionView: View {
+    let request: ToolPermissionRequest
+    let onDecision: (ToolPermissionDecision) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var permissionCenter = ToolPermissionCenter.shared
+
+    private var toolName: String {
+        request.displayName ?? request.toolName
+    }
+
+    private var argumentText: String {
+        watchFormattedToolCallJSONOrRaw(request.arguments)
+    }
+
+    private var decisionItems: [(decision: ToolPermissionDecision, label: String, iconName: String)] {
+        [
+            (.allowOnce, NSLocalizedString("允许", comment: ""), "checkmark.circle.fill"),
+            (.deny, NSLocalizedString("拒绝", comment: ""), "xmark.circle.fill"),
+            (.supplement, NSLocalizedString("补充提示", comment: ""), "text.badge.plus"),
+            (.allowForTool, NSLocalizedString("保持允许", comment: ""), "checkmark.shield.fill"),
+            (.allowAll, NSLocalizedString("完全权限", comment: ""), "shield.fill")
+        ]
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Label {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(toolName)
+                                .font(.headline)
+                            Text(NSLocalizedString("等待你的审批后继续执行。", comment: ""))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            if let countdownText {
+                                Text(countdownText)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } icon: {
+                        Image(systemName: "hand.raised.circle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Section(NSLocalizedString("工具参数", comment: "Tool detail arguments section title")) {
+                    WatchToolCallLongTextPreview(
+                        title: NSLocalizedString("工具参数", comment: "Tool detail arguments section title"),
+                        text: argumentText,
+                        usesMonospacedFont: true,
+                        lineLimit: 6
+                    )
+                }
+
+                Section(NSLocalizedString("审批操作", comment: "")) {
+                    ForEach(Array(decisionItems.enumerated()), id: \.offset) { _, item in
+                        Button {
+                            onDecision(item.decision)
+                            dismiss()
+                        } label: {
+                            Label(item.label, systemImage: item.iconName)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(NSLocalizedString("调用工具", comment: ""))
+        }
+    }
+
+    private var countdownText: String? {
+        guard let remaining = permissionCenter.autoApproveRemainingSeconds(for: request) else {
+            return nil
+        }
+        return String(format: NSLocalizedString("将在 %ds 后自动允许", comment: ""), remaining)
+    }
+
+}
+
 struct WatchImportSourceView: View {
     @Binding var source: String
     let history: [String]
@@ -76,6 +157,11 @@ struct WatchImportSourceView: View {
 // 独立的请求控制快速面板，供输入框左划快捷入口使用
 struct WatchQuickRequestControlsView: View {
     let runnableModel: RunnableModel
+    let onDone: () -> Void
+
+    @State private var state: ModelRequestBodyControlState?
+    @State private var pendingSaveTask: Task<Void, Never>?
+    @State private var sliderDescriptors: [String: ModelRequestBodyControlSliderDescriptor] = [:]
 
     var body: some View {
         let controls = runnableModel.model.requestBodyControls.filter(\.isEnabled)
@@ -85,29 +171,146 @@ struct WatchQuickRequestControlsView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(controls) { control in
-                    NavigationLink {
-                        WatchRequestBodyControlDetailView(runnableModel: runnableModel, control: control)
-                    } label: {
-                        Text(control.title)
+                    switch control.kind {
+                    case .toggle:
+                        Toggle(isOn: toggleBinding(for: control)) {
+                            Text(control.title)
+                        }
+                        .disabled(state == nil)
+                    case .optionGroup:
+                        NavigationLink {
+                            if let descriptor = sliderDescriptors[control.id] {
+                                WatchRequestBodySliderView(
+                                    runnableModel: runnableModel,
+                                    control: control,
+                                    descriptor: descriptor,
+                                    onCommit: { position in
+                                        updateSliderPosition(
+                                            position,
+                                            for: control,
+                                            descriptor: descriptor
+                                        )
+                                    },
+                                    onDone: onDone
+                                )
+                            } else {
+                                WatchRequestBodyControlDetailView(
+                                    runnableModel: runnableModel,
+                                    control: control,
+                                    onDone: onDone
+                                )
+                            }
+                        } label: {
+                            HStack {
+                                Text(control.title)
+                                if let descriptor = sliderDescriptors[control.id],
+                                   let state {
+                                    Spacer()
+                                    Text(descriptor.displayValue(at: descriptor.position(in: state)))
+                                        .etFont(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         .navigationTitle(NSLocalizedString("请求控制", comment: ""))
         .navigationBarTitleDisplayMode(.inline)
+        .disabled(state == nil)
+        .task(id: runnableModel.id) {
+            await loadState()
+        }
+    }
+
+    private func toggleBinding(for control: ModelRequestBodyControl) -> Binding<Bool> {
+        Binding(
+            get: {
+                state?.toggleValuesByControlID[control.id] ?? control.defaultIsActive
+            },
+            set: { isActive in
+                guard var updatedState = state else { return }
+                updatedState.toggleValuesByControlID[control.id] = isActive
+                state = updatedState
+                enqueueToggleSave(isActive, controlID: control.id)
+            }
+        )
+    }
+
+    private func loadState() async {
+        state = nil
+        let modelKey = runnableModel.id
+        let modelControls = runnableModel.model.requestBodyControls
+        let loaded = await Task.detached(priority: .userInitiated) {
+            let loadedState = ModelRequestBodyControlRuntimeStore.state(
+                forModelKey: modelKey,
+                controls: modelControls
+            )
+            let descriptors: [String: ModelRequestBodyControlSliderDescriptor] = Dictionary(
+                uniqueKeysWithValues: modelControls.compactMap { control in
+                    guard control.isSliderEnabled,
+                          let descriptor = ModelRequestBodyControlSliderDescriptor(control: control) else {
+                        return nil
+                    }
+                    return (control.id, descriptor)
+                }
+            )
+            return (loadedState, descriptors)
+        }.value
+        guard !Task.isCancelled else { return }
+        state = loaded.0
+        sliderDescriptors = loaded.1
+    }
+
+    private func enqueueToggleSave(_ isActive: Bool, controlID: String) {
+        let previousSaveTask = pendingSaveTask
+        let modelKey = runnableModel.id
+        let modelControls = runnableModel.model.requestBodyControls
+        pendingSaveTask = Task(priority: .utility) {
+            await previousSaveTask?.value
+            guard !Task.isCancelled else { return }
+            await Task.detached(priority: .utility) {
+                ModelRequestBodyControlRuntimeStore.saveToggleValue(
+                    isActive,
+                    forControlID: controlID,
+                    forModelKey: modelKey,
+                    controls: modelControls
+                )
+            }.value
+        }
+    }
+
+    private func updateSliderPosition(
+        _ position: Double,
+        for control: ModelRequestBodyControl,
+        descriptor: ModelRequestBodyControlSliderDescriptor
+    ) {
+        guard var updatedState = state else { return }
+        let normalizedPosition = descriptor.normalized(position)
+        updatedState.sliderPositionsByControlID[control.id] = normalizedPosition
+        updatedState.selectedOptionIDsByControlID[control.id] = descriptor.nearestOptionID(
+            at: normalizedPosition
+        )
+        state = updatedState
     }
 }
 
 private struct WatchRequestBodyControlDetailView: View {
-    @Environment(\.dismiss) private var dismiss
-
     let runnableModel: RunnableModel
     let control: ModelRequestBodyControl
+    let onDone: () -> Void
     @State private var state: ModelRequestBodyControlState
 
-    init(runnableModel: RunnableModel, control: ModelRequestBodyControl) {
+    init(
+        runnableModel: RunnableModel,
+        control: ModelRequestBodyControl,
+        onDone: @escaping () -> Void
+    ) {
         self.runnableModel = runnableModel
         self.control = control
+        self.onDone = onDone
         _state = State(initialValue: runnableModel.requestBodyControlState)
     }
 
@@ -144,9 +347,7 @@ private struct WatchRequestBodyControlDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
-                Button(NSLocalizedString("完成", comment: "")) {
-                    dismiss()
-                }
+                Button(NSLocalizedString("完成", comment: ""), action: onDone)
             }
         }
     }
@@ -176,6 +377,10 @@ private struct WatchRequestBodyControlDetailView: View {
 
 struct WatchAskUserInputView: View {
     let request: AppToolAskUserInputRequest
+    let privacyNotice: String?
+    let navigationTitle: String
+    let dismissesAfterSubmit: Bool
+    let dismissesAfterCancel: Bool
     let onSubmit: ([AppToolAskUserInputQuestionAnswer]) -> Void
     let onCancel: () -> Void
 
@@ -184,6 +389,24 @@ struct WatchAskUserInputView: View {
     @State private var otherTextByQuestion: [String: String] = [:]
     @State private var currentQuestionIndex = 0
     @State private var hasHandledAction = false
+
+    init(
+        request: AppToolAskUserInputRequest,
+        privacyNotice: String? = nil,
+        navigationTitle: String = NSLocalizedString("结构化问答", comment: ""),
+        dismissesAfterSubmit: Bool = true,
+        dismissesAfterCancel: Bool = true,
+        onSubmit: @escaping ([AppToolAskUserInputQuestionAnswer]) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.request = request
+        self.privacyNotice = privacyNotice
+        self.navigationTitle = navigationTitle
+        self.dismissesAfterSubmit = dismissesAfterSubmit
+        self.dismissesAfterCancel = dismissesAfterCancel
+        self.onSubmit = onSubmit
+        self.onCancel = onCancel
+    }
 
     private var canSubmit: Bool {
         request.questions.allSatisfy { question in
@@ -215,6 +438,11 @@ struct WatchAskUserInputView: View {
                     }
                     if let description = request.description, !description.isEmpty {
                         Text(description)
+                            .etFont(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let privacyNotice, !privacyNotice.isEmpty {
+                        Text(privacyNotice)
                             .etFont(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -262,21 +490,23 @@ struct WatchAskUserInputView: View {
                     }
 
                     Section {
-                        TextField(
-                            NSLocalizedString("请输入自定义偏好", comment: ""),
-                            text: Binding(
-                                get: { otherTextByQuestion[question.id, default: ""] },
-                                set: { newValue in
-                                    otherTextByQuestion[question.id] = newValue
-                                    if AppToolAskUserInputAnswerPolicy.shouldClearSelectedOptionsAfterTypingCustomText(
-                                        type: question.type,
-                                        customText: newValue
-                                    ) {
-                                        selectedOptionIDsByQuestion[question.id] = []
+                        if question.allowOther {
+                            TextField(
+                                NSLocalizedString("请输入自定义偏好", comment: ""),
+                                text: Binding(
+                                    get: { otherTextByQuestion[question.id, default: ""] },
+                                    set: { newValue in
+                                        otherTextByQuestion[question.id] = newValue
+                                        if AppToolAskUserInputAnswerPolicy.shouldClearSelectedOptionsAfterTypingCustomText(
+                                            type: question.type,
+                                            customText: newValue
+                                        ) {
+                                            selectedOptionIDsByQuestion[question.id] = []
+                                        }
                                     }
-                                }
+                                )
                             )
-                        )
+                        }
                         Button(skipButtonTitle(for: question)) {
                             handleSkipOrSubmit(for: question)
                         }
@@ -289,7 +519,7 @@ struct WatchAskUserInputView: View {
                     }
                 }
             }
-            .navigationTitle(NSLocalizedString("结构化问答", comment: ""))
+            .navigationTitle(navigationTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -394,6 +624,9 @@ struct WatchAskUserInputView: View {
     }
 
     private func canContinue(from question: AppToolAskUserInputQuestion) -> Bool {
+        if question.required && !isQuestionAnswered(question) {
+            return false
+        }
         if isLastQuestion(question) {
             return canSubmit
         }
@@ -433,13 +666,19 @@ struct WatchAskUserInputView: View {
         }
         hasHandledAction = true
         onSubmit(answers)
-        dismiss()
+        if dismissesAfterSubmit {
+            dismiss()
+        }
     }
 
     private func handleCancelAndDismiss() {
-        hasHandledAction = true
+        if dismissesAfterCancel {
+            hasHandledAction = true
+        }
         onCancel()
-        dismiss()
+        if dismissesAfterCancel {
+            dismiss()
+        }
     }
 
     private func resetSelectionState() {

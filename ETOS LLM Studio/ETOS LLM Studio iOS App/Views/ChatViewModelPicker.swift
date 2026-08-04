@@ -7,7 +7,9 @@
 // ============================================================================
 
 import SwiftUI
+import Foundation
 import ETOSCore
+import UIKit
 
 extension ChatView {
     var nativeModelPickerSheet: some View {
@@ -15,6 +17,20 @@ extension ChatView {
             nativeModelPickerContent
             .navigationTitle(NSLocalizedString("选择模型", comment: ""))
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(item: $quickModelSettingsTarget) { runnable in
+                ChatQuickModelSettingsView(runnableModel: runnable)
+            }
+            .navigationDestination(isPresented: $isQuickPromptEditorPresented) {
+                ChatQuickPromptEditorView(viewModel: viewModel)
+            }
+            .navigationDestination(isPresented: $isQuickWorldbookBindingPresented) {
+                WorldbookSessionBindingView(
+                    currentSession: Binding(
+                        get: { viewModel.currentSession },
+                        set: { viewModel.currentSession = $0 }
+                    )
+                )
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(NSLocalizedString("完成", comment: "")) {
@@ -25,106 +41,357 @@ extension ChatView {
         }
     }
 
+    @ViewBuilder
     var nativeModelPickerContent: some View {
-        List {
-            if viewModel.activatedConversationModels.isEmpty {
-                VStack(spacing: 6) {
-                    Text(NSLocalizedString("暂无可用模型", comment: ""))
-                        .etFont(.headline)
-                    Text(NSLocalizedString("请先在设置中启用模型", comment: ""))
-                        .etFont(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 28)
-            } else {
-                Section {
-                    ForEach(topModelChoices, id: \.id) { runnable in
-                        nativeModelPickerModelRow(runnable)
-                    }
-                } header: {
-                    Text(NSLocalizedString("置顶模型", comment: ""))
-                } footer: {
-                    Text(NSLocalizedString("切换当前对话的模型", comment: ""))
-                }
-
-                if hasModelPickerRequestControls {
-                    Section {
-                        nativeModelPickerRequestControlRows
-                    } header: {
-                        Text(NSLocalizedString("请求控制", comment: ""))
-                    } footer: {
-                        Text(NSLocalizedString("点击控制名称后选择具体参数。", comment: ""))
-                    }
-                }
-
-                if hasMoreModelChoices {
-                    Section {
-                        NavigationLink {
-                            nativeModelPickerAllModelsList
-                        } label: {
-                            Label(NSLocalizedString("更多模型", comment: ""), systemImage: "ellipsis")
-                        }
-                    }
-                }
-            }
+        if viewModel.activatedConversationModels.isEmpty {
+            nativeModelPickerEmptyList
+        } else if appConfig.iOSModelPickerGroupsByProvider {
+            providerGroupedModelPickerContent
+        } else {
+            classicModelPickerList
         }
     }
 
-    var nativeModelPickerAllModelsList: some View {
+    var nativeModelPickerEmptyList: some View {
         List {
-            Section {
-                ForEach(viewModel.activatedConversationModels, id: \.id) { runnable in
-                    nativeModelPickerModelRow(runnable)
-                }
-            } header: {
-                Text(NSLocalizedString("模型", comment: ""))
+            VStack {
+                Text(NSLocalizedString("暂无可用模型", comment: ""))
+                    .etFont(.headline)
+                Text(NSLocalizedString("请先在设置中启用模型", comment: ""))
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical)
         }
-        .navigationTitle(NSLocalizedString("更多模型", comment: ""))
-        .navigationBarTitleDisplayMode(.inline)
     }
 
-    func nativeModelPickerModelRow(_ runnable: RunnableModel) -> some View {
-        Button {
-            viewModel.setSelectedModel(runnable)
-            dismissModelPickerSheet()
-        } label: {
-            MarqueeTitleSubtitleSelectionRow(
-                title: runnable.model.displayName,
-                subtitle: "\(runnable.provider.name) · \(runnable.model.modelName)",
-                isSelected: runnable.id == viewModel.selectedModel?.id,
-                subtitleUIFont: .monospacedSystemFont(ofSize: 12, weight: .regular)
+    var classicModelPickerList: some View {
+        List {
+            modelPickerSection(
+                models: viewModel.activatedConversationModels,
+                showsProviderName: true
             )
+            if appConfig.modelPickerPromptShortcutEnabled {
+                modelPickerPromptSection
+            }
+            if appConfig.modelPickerWorldbookShortcutEnabled {
+                modelPickerWorldbookSection
+            }
+        }
+    }
+
+    var providerGroupedModelPickerContent: some View {
+        List {
+            if modelPickerShowsAllModels {
+                modelPickerSection(
+                    models: viewModel.activatedConversationModels,
+                    showsProviderName: true
+                )
+            } else {
+                selectedProviderModelPickerSections
+                modelPickerShowAllModelsSection
+            }
+            if appConfig.modelPickerPromptShortcutEnabled {
+                modelPickerPromptSection
+            }
+            if appConfig.modelPickerWorldbookShortcutEnabled {
+                modelPickerWorldbookSection
+            }
+        }
+        .id(modelPickerShowsAllModels)
+        // 固定栏与列表共享系统表面，避免额外材质叠层产生色差。
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !modelPickerShowsAllModels {
+                modelPickerProviderStrip
+            }
+        }
+        .onAppear(perform: prepareSelectedModelPickerProvider)
+        .onReceive(viewModel.$activatedConversationModelGroups) { groups in
+            normalizeSelectedModelPickerProvider(using: groups)
+        }
+    }
+
+    var modelPickerProviderStrip: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 12) {
+                    ForEach(viewModel.activatedConversationModelGroups) { group in
+                        modelPickerProviderButton(group)
+                            .id(group.id)
+                    }
+                }
+                .padding(.horizontal)
+            }
+            .scrollIndicators(.hidden)
+            .onAppear {
+                guard let selectedModelPickerProviderID else { return }
+                proxy.scrollTo(selectedModelPickerProviderID, anchor: .center)
+            }
+            .onChange(of: selectedModelPickerProviderID) { _, providerID in
+                guard let providerID else { return }
+                if accessibilityReduceMotion {
+                    proxy.scrollTo(providerID, anchor: .center)
+                } else {
+                    withAnimation(chatPickerAnimation) {
+                        proxy.scrollTo(providerID, anchor: .center)
+                    }
+                }
+            }
+        }
+        .frame(height: modelPickerProviderStripHeight)
+    }
+
+    func modelPickerProviderButton(_ group: RunnableModelProviderGroup) -> some View {
+        let isSelected = !modelPickerShowsAllModels && group.id == selectedModelPickerProviderID
+        return Button {
+            modelPickerShowsAllModels = false
+            selectedModelPickerProviderID = group.id
+        } label: {
+            VStack(spacing: 4) {
+                Text(group.providerInitial)
+                    .etFont(.subheadline)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+                    .frame(width: modelPickerProviderIconSize, height: modelPickerProviderIconSize)
+                    .background(
+                        Circle()
+                            .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.secondary.opacity(0.12))
+                    )
+                    .overlay {
+                        Circle()
+                            .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
+                    }
+
+                Text(group.provider.name)
+                    .etFont(.caption2)
+                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                    .lineLimit(1)
+                    .frame(width: 68)
+            }
+            .contentShape(Rectangle())
+            .animation(accessibilityReduceMotion ? nil : chatPickerAnimation, value: isSelected)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(group.provider.name)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    func modelPickerSection(
+        models: [RunnableModel],
+        showsProviderName: Bool,
+        showsInteractionHint: Bool = true
+    ) -> some View {
+        Section {
+            ForEach(models, id: \.id) { runnable in
+                nativeModelPickerModelRow(runnable, showsProviderName: showsProviderName)
+            }
+        } header: {
+            Text(NSLocalizedString("模型", comment: ""))
+        } footer: {
+            if showsInteractionHint {
+                Text(NSLocalizedString("轻点切换模型，长按打开设置", comment: "模型选择列表操作提示"))
+            }
         }
     }
 
     @ViewBuilder
-    var nativeModelPickerRequestControlRows: some View {
-        if let selectedModel = viewModel.selectedModel {
-            ForEach(selectedModelRequestControls) { control in
-                NavigationLink {
-                    ChatRequestBodyControlDetailView(runnableModel: selectedModel, control: control)
-                } label: {
-                    Text(control.title)
+    var selectedProviderModelPickerSections: some View {
+        if let layout = selectedProviderModelPickerLayout,
+           !layout.groups.isEmpty {
+            Section {
+                nativeModelPickerTreeRows(layout.rootItems)
+            }
+        } else {
+            modelPickerSection(
+                models: selectedProviderModelChoices,
+                showsProviderName: false,
+                showsInteractionHint: false
+            )
+        }
+    }
+
+    func nativeModelPickerTreeRows(_ items: [RunnableModelPickerRootItem]) -> AnyView {
+        AnyView(
+            ForEach(items) { item in
+                switch item {
+                case .model(let runnable):
+                    nativeModelPickerModelRow(runnable, showsProviderName: false)
+                case .group(let group):
+                    DisclosureGroup(
+                        isExpanded: modelPickerGroupExpansionBinding(for: group.id)
+                    ) {
+                        nativeModelPickerTreeRows(group.items)
+                    } label: {
+                        Label(group.name, systemImage: "folder")
+                    }
                 }
+            }
+        )
+    }
+
+    var modelPickerShowAllModelsSection: some View {
+        Section {
+            Button(action: showAllModelsTemporarily) {
+                Label(
+                    NSLocalizedString("全部模型", comment: "模型选择器临时显示全部模型按钮"),
+                    systemImage: "square.grid.2x2"
+                )
+            }
+        } footer: {
+            Text(NSLocalizedString("轻点切换模型，长按打开设置", comment: "模型选择列表操作提示"))
+        }
+    }
+
+    var modelPickerPromptSection: some View {
+        Section {
+            Button(action: presentQuickPromptEditor) {
+                Label(
+                    NSLocalizedString("提示词", comment: "模型选择器快速提示词入口"),
+                    systemImage: "text.quote"
+                )
             }
         }
     }
 
-    var topModelChoices: [RunnableModel] {
-        Array(viewModel.activatedConversationModels.prefix(3))
+    var modelPickerWorldbookSection: some View {
+        Section {
+            Button(action: presentQuickWorldbookBinding) {
+                Label(
+                    NSLocalizedString("世界书", comment: "模型选择器快速世界书入口"),
+                    systemImage: "books.vertical"
+                )
+            }
+            .disabled(viewModel.currentSession == nil)
+        }
     }
 
-    var hasMoreModelChoices: Bool {
-        viewModel.activatedConversationModels.count > topModelChoices.count
+    func nativeModelPickerModelRow(
+        _ runnable: RunnableModel,
+        showsProviderName: Bool
+    ) -> some View {
+        MarqueeTitleSubtitleSelectionRow(
+            title: runnable.model.displayName,
+            subtitle: showsProviderName
+                ? "\(runnable.provider.name) · \(runnable.model.modelName)"
+                : runnable.model.modelName,
+            isSelected: runnable.id == viewModel.selectedModel?.id,
+            subtitleUIFont: .monospacedSystemFont(ofSize: 12, weight: .regular)
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .gesture(
+            LongPressGesture(minimumDuration: 0.45)
+                .exclusively(before: TapGesture())
+                .onEnded { gesture in
+                    switch gesture {
+                    case .first(_):
+                        presentQuickModelSettings(for: runnable)
+                    case .second(_):
+                        viewModel.setSelectedModel(runnable)
+                        dismissModelPickerSheet()
+                    }
+                }
+        )
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            viewModel.setSelectedModel(runnable)
+            dismissModelPickerSheet()
+        }
+        .accessibilityHint(NSLocalizedString("长按可打开模型设置", comment: "模型选择行的无障碍提示"))
+        .accessibilityAction(named: Text(NSLocalizedString("打开模型设置", comment: "模型选择行的无障碍操作"))) {
+            presentQuickModelSettings(for: runnable)
+        }
     }
 
-    var selectedModelRequestControls: [ModelRequestBodyControl] {
-        viewModel.selectedModel?.model.requestBodyControls.filter(\.isEnabled) ?? []
+    func presentQuickModelSettings(for runnable: RunnableModel) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        activeChatPickerDetent = .large
+        quickModelSettingsTarget = runnable
     }
 
-    var hasModelPickerRequestControls: Bool {
-        !selectedModelRequestControls.isEmpty
+    func presentQuickPromptEditor() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        activeChatPickerDetent = .large
+        isQuickPromptEditorPresented = true
+    }
+
+    func presentQuickWorldbookBinding() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        activeChatPickerDetent = .large
+        isQuickWorldbookBindingPresented = true
+    }
+
+    var selectedProviderModelChoices: [RunnableModel] {
+        guard let selectedModelPickerProviderID else { return [] }
+        return viewModel.activatedConversationModelsByProviderID[selectedModelPickerProviderID] ?? []
+    }
+
+    var selectedProviderModelPickerLayout: RunnableModelPickerLayout? {
+        guard let selectedModelPickerProviderID else { return nil }
+        return viewModel.activatedConversationModelLayoutsByProviderID[selectedModelPickerProviderID]
+    }
+
+    func modelPickerGroupExpansionBinding(for groupID: String) -> Binding<Bool> {
+        Binding(
+            get: { appConfig.iOSModelPickerExpandedGroupIDs.contains(groupID) },
+            set: { isExpanded in
+                var expandedGroupIDs = appConfig.iOSModelPickerExpandedGroupIDs
+                if isExpanded {
+                    expandedGroupIDs.insert(groupID)
+                } else {
+                    expandedGroupIDs.remove(groupID)
+                }
+                appConfig.iOSModelPickerExpandedGroupIDs = expandedGroupIDs
+            }
+        )
+    }
+
+    func showAllModelsTemporarily() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        modelPickerShowsAllModels = true
+    }
+
+    func prepareSelectedModelPickerProvider() {
+        normalizeSelectedModelPickerProvider(using: viewModel.activatedConversationModelGroups)
+    }
+
+    func normalizeSelectedModelPickerProvider(using groups: [RunnableModelProviderGroup]) {
+        guard !groups.isEmpty else {
+            selectedModelPickerProviderID = nil
+            return
+        }
+        if let selectedModelPickerProviderID,
+           viewModel.activatedConversationModelsByProviderID[selectedModelPickerProviderID] != nil {
+            return
+        }
+        let currentProviderID = viewModel.selectedModel?.provider.id
+        selectedModelPickerProviderID = currentProviderID.flatMap {
+            viewModel.activatedConversationModelsByProviderID[$0] == nil ? nil : $0
+        } ?? groups.first?.id
+    }
+
+}
+
+private struct ChatQuickModelSettingsView: View {
+    @State private var provider: Provider
+    private let modelID: UUID
+
+    init(runnableModel: RunnableModel) {
+        _provider = State(initialValue: runnableModel.provider)
+        modelID = runnableModel.model.id
+    }
+
+    var body: some View {
+        if let modelIndex = provider.models.firstIndex(where: { $0.id == modelID }) {
+            ModelSettingsView(
+                model: $provider.models[modelIndex],
+                provider: provider,
+                onSave: saveProvider
+            )
+        }
+    }
+
+    private func saveProvider() {
+        ChatService.shared.saveProviderFromManagement(provider)
     }
 }

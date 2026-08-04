@@ -18,6 +18,7 @@ import WebKit
 
 struct ChatBubble: View {
     @ObservedObject var messageState: ChatMessageRenderState
+    let roleplaySessionID: UUID?
     let layoutWidth: CGFloat?
     let reasoningPreviewMaxHeight: CGFloat
     let preparedMarkdownPayload: ETPreparedMarkdownRenderPayload?
@@ -47,7 +48,11 @@ struct ChatBubble: View {
     let onCopy: () -> Void
     let onSwitchToPreviousVersion: () -> Void
     let onSwitchToNextVersion: () -> Void
+    let isSelectionMode: Bool
+    let isSelected: Bool
+    let onToggleSelection: () -> Void
     let onOpenMore: ((ChatMessage) -> Void)?
+    let reportsSendFlightTarget: Bool
     let providers: [Provider]
     
     @StateObject var audioPlayer = AudioPlayerManager()
@@ -62,6 +67,7 @@ struct ChatBubble: View {
 
     init(
         messageState: ChatMessageRenderState,
+        roleplaySessionID: UUID? = nil,
         layoutWidth: CGFloat? = nil,
         reasoningPreviewMaxHeight: CGFloat = 177,
         preparedMarkdownPayload: ETPreparedMarkdownRenderPayload? = nil,
@@ -91,10 +97,15 @@ struct ChatBubble: View {
         onCopy: @escaping () -> Void = {},
         onSwitchToPreviousVersion: @escaping () -> Void,
         onSwitchToNextVersion: @escaping () -> Void,
+        isSelectionMode: Bool = false,
+        isSelected: Bool = false,
+        onToggleSelection: @escaping () -> Void = {},
         onOpenMore: ((ChatMessage) -> Void)? = nil,
+        reportsSendFlightTarget: Bool = false,
         providers: [Provider] = []
     ) {
         self.messageState = messageState
+        self.roleplaySessionID = roleplaySessionID
         self.layoutWidth = layoutWidth
         self.reasoningPreviewMaxHeight = reasoningPreviewMaxHeight
         self.preparedMarkdownPayload = preparedMarkdownPayload
@@ -124,7 +135,11 @@ struct ChatBubble: View {
         self.onCopy = onCopy
         self.onSwitchToPreviousVersion = onSwitchToPreviousVersion
         self.onSwitchToNextVersion = onSwitchToNextVersion
+        self.isSelectionMode = isSelectionMode
+        self.isSelected = isSelected
+        self.onToggleSelection = onToggleSelection
         self.onOpenMore = onOpenMore
+        self.reportsSendFlightTarget = reportsSendFlightTarget
         self.providers = providers
     }
     
@@ -167,6 +182,7 @@ struct ChatBubble: View {
                         bubbleContainer {
                             textContentStack(includeToolCalls: true)
                         }
+                        .background(sendFlightTargetReporter)
                     }
                 }
 
@@ -192,34 +208,77 @@ struct ChatBubble: View {
         .padding(.horizontal, rowHorizontalPadding)
         .padding(.top, mergeWithPrevious ? 0 : rowVerticalPadding)
         .padding(.bottom, mergeWithNext ? 0 : rowVerticalPadding)
-        .modifier(ChatBubbleOpenMoreGestureModifier(onOpenMore: openMoreAction))
-        .sheet(item: $imagePreview) { payload in
-            ZStack {
-                Color.black.ignoresSafeArea()
-                Image(uiImage: payload.image)
-                    .resizable()
-                    .scaledToFit()
-                    .padding(24)
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.red, lineWidth: 2)
+                    .allowsHitTesting(false)
             }
         }
-        .sheet(item: $filePreview) { payload in
+        .modifier(
+            ChatBubbleOpenMoreGestureModifier(
+                isSelectionMode: isSelectionMode,
+                onToggleSelection: onToggleSelection,
+                onOpenMore: openMoreAction
+            )
+        )
+        .fullScreenCover(item: $imagePreview, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { payload in
+            ChatAttachmentImagePreview(payload: payload)
+        }
+        .sheet(item: $filePreview, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { payload in
             ChatFileAttachmentPreviewSheet(payload: payload)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
-        .sheet(item: $selectedToolCallDetailSheetItem) { item in
+        .sheet(item: $selectedToolCallDetailSheetItem, onDismiss: {
+            refreshChatBubbleLocalPresentationBlocker()
+        }) { item in
             toolCallDetailSheet(for: item)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
         .onAppear {
+            refreshChatBubbleLocalPresentationBlocker()
             autoPresentPendingToolCallIfNeeded()
+        }
+        .onDisappear {
+            setChatBubbleLocalPresentationBlocked(false)
+        }
+        .onChange(of: imagePreview != nil) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
+        }
+        .onChange(of: filePreview != nil) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
+        }
+        .onChange(of: selectedToolCallDetailSheetItem?.id) { _, _ in
+            refreshChatBubbleLocalPresentationBlocker()
         }
         .onChange(of: toolPermissionCenter.activeRequest?.id) { _, _ in
             autoPresentPendingToolCallIfNeeded()
         }
+        .onChange(of: toolPermissionCenter.canAutoPresentRequestDetails) { _, canAutoPresent in
+            guard canAutoPresent else { return }
+            autoPresentPendingToolCallIfNeeded()
+        }
         .onChange(of: toolCallAutoPresentationSignature) { _, _ in
             autoPresentPendingToolCallIfNeeded()
+        }
+    }
+
+    /// 只在本次发送目标的正文气泡上测量真实落点，避免用整行宽度反推尺寸。
+    @ViewBuilder
+    private var sendFlightTargetReporter: some View {
+        if reportsSendFlightTarget {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: FlightTargetRectKey.self,
+                    value: proxy.frame(in: .named(ChatView.flightCoordinateSpace))
+                )
+            }
         }
     }
 }

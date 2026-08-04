@@ -11,7 +11,7 @@ import Foundation
 extension OpenAIAdapter {
     struct OpenAIToolCall: Decodable {
         let id: String?
-        let type: String
+        let type: String?
         let index: Int?
         let providerSpecificFields: [String: JSONValue]?
         struct Function: Decodable {
@@ -34,7 +34,7 @@ extension OpenAIAdapter {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             id = try container.decodeIfPresent(String.self, forKey: .id)
-            type = try container.decode(String.self, forKey: .type)
+            type = try container.decodeIfPresent(String.self, forKey: .type)
             index = try container.decodeIfPresent(Int.self, forKey: .index)
             function = try container.decode(Function.self, forKey: .function)
             var mergedProviderSpecificFields = try container.decodeIfPresent([String: JSONValue].self, forKey: .providerSpecificFields)
@@ -61,6 +61,49 @@ extension OpenAIAdapter {
                 let content: String?
                 let tool_calls: [OpenAIToolCall]?
                 let reasoning_content: String?
+
+                struct ContentPart: Decodable {
+                    let textFragment: String?
+
+                    enum CodingKeys: String, CodingKey {
+                        case text
+                        case refusal
+                    }
+
+                    init(from decoder: Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        if let text = try container.decodeIfPresent(String.self, forKey: .text) {
+                            textFragment = text
+                        } else if let refusal = try container.decodeIfPresent(String.self, forKey: .refusal) {
+                            textFragment = refusal
+                        } else {
+                            textFragment = nil
+                        }
+                    }
+                }
+
+                enum CodingKeys: String, CodingKey {
+                    case role
+                    case content
+                    case tool_calls
+                    case reasoning_content
+                }
+
+                init(from decoder: Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    role = try container.decodeIfPresent(String.self, forKey: .role)
+                    tool_calls = try container.decodeIfPresent([OpenAIToolCall].self, forKey: .tool_calls)
+                    reasoning_content = try container.decodeIfPresent(String.self, forKey: .reasoning_content)
+
+                    if let stringContent = try? container.decodeIfPresent(String.self, forKey: .content) {
+                        content = stringContent
+                    } else if let contentParts = try container.decodeIfPresent([ContentPart].self, forKey: .content) {
+                        let text = contentParts.compactMap(\.textFragment).joined()
+                        content = text.isEmpty ? nil : text
+                    } else {
+                        content = nil
+                    }
+                }
             }
             let message: Message?
             let delta: Message?
@@ -76,6 +119,8 @@ extension OpenAIAdapter {
             let prompt_tokens: Int?
             let completion_tokens: Int?
             let total_tokens: Int?
+            let prompt_cache_hit_tokens: Int?
+            let prompt_cache_miss_tokens: Int?
             let prompt_tokens_details: PromptTokensDetails?
             let completion_tokens_details: CompletionTokensDetails?
         }

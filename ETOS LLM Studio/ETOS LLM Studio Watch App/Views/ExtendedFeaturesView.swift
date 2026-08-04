@@ -44,6 +44,22 @@ public struct ExtendedFeaturesView: View {
 
             Section {
                 NavigationLink {
+                    SlashCommandSettingsView()
+                } label: {
+                    settingsNavigationLabel("快速指令", icon: .slashCommands)
+                        .etFont(.headline)
+                        .padding(.vertical, 4)
+                }
+            } footer: {
+                Text(NSLocalizedString("用简短命令快速打开聊天操作和设置页面。", comment: "Watch slash commands entry footer"))
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            WatchBackgroundGenerationSettingsRows()
+
+            Section {
+                NavigationLink {
                     AppLockSettingsView()
                 } label: {
                     settingsNavigationLabel("应用锁", icon: .security)
@@ -154,6 +170,20 @@ public struct ExtendedFeaturesView: View {
                 }
             } footer: {
                 Text(NSLocalizedString("管理可按需加载的技能包，并控制是否向模型暴露 use_skill 工具。", comment: "Agent Skills 入口说明"))
+                    .etFont(.footnote)
+                    .foregroundColor(.secondary)
+            }
+
+            Section {
+                NavigationLink {
+                    RoleplaySettingsView(viewModel: viewModel)
+                } label: {
+                    settingsNavigationLabel("角色扮演与酒馆兼容", icon: .roleplay)
+                        .etFont(.headline)
+                        .padding(.vertical, 4)
+                }
+            } footer: {
+                Text(NSLocalizedString("导入角色卡、设置用户身份，并运行酒馆宏、变量与 HTML。", comment: "Watch roleplay entry detail"))
                     .etFont(.footnote)
                     .foregroundColor(.secondary)
             }

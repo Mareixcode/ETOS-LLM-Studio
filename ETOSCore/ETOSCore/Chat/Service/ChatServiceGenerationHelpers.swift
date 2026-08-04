@@ -170,7 +170,8 @@ extension ChatService {
         guard isConversationProfileDailyUpdateEnabled() else { return }
         guard ConversationMemoryManager.shouldUpdateUserProfile(on: Date()) else { return }
 
-        let existingProfileText = ConversationMemoryManager.loadUserProfile()?.content ?? ""
+        let existingProfile = ConversationMemoryManager.loadUserProfile()
+        let existingProfileText = existingProfile?.promptRepresentation ?? ""
         let profileSystemPrompt = BuiltInPromptStore.render(.conversationProfileUpdateSystem)
         let profileUserPrompt = BuiltInPromptStore.render(
             .conversationProfileUpdateUser,
@@ -189,13 +190,20 @@ extension ChatService {
                 requestSource: .conversationProfile,
                 sessionID: sessionID
             )
-            let profileContent = sanitizeConversationMemoryText(rawProfile)
-            guard !profileContent.isEmpty else { return }
-            try ConversationMemoryManager.saveUserProfile(
-                content: profileContent,
+            guard var generatedProfile = ConversationMemoryManager.decodeGeneratedProfile(
+                rawProfile,
                 updatedAt: Date(),
                 sourceSessionID: sessionID
-            )
+            ) else { return }
+            if generatedProfile.facts.isEmpty, let existingProfile, !existingProfile.facts.isEmpty {
+                generatedProfile = ConversationUserProfile(
+                    content: generatedProfile.content,
+                    updatedAt: generatedProfile.updatedAt,
+                    sourceSessionID: sessionID,
+                    facts: existingProfile.facts
+                )
+            }
+            try ConversationMemoryManager.saveUserProfile(generatedProfile)
         } catch {
             logger.warning("异步用户画像更新失败: \(error.localizedDescription)")
         }
@@ -211,7 +219,7 @@ extension ChatService {
         let systemPrompt = BuiltInPromptStore.render(.conversationProfileDedupSystem)
         let userPrompt = BuiltInPromptStore.render(
             .conversationProfileDedupUser,
-            variables: ["profile": profile.content]
+            variables: ["profile": profile.promptRepresentation]
         )
 
         do {
@@ -223,14 +231,20 @@ extension ChatService {
                 requestSource: .conversationProfile,
                 sessionID: sessionID
             )
-            let profileContent = sanitizeConversationMemoryText(rawProfile)
-            guard !profileContent.isEmpty else { return }
-            try ConversationMemoryManager.saveUserProfile(
-                content: profileContent,
+            guard var generatedProfile = ConversationMemoryManager.decodeGeneratedProfile(
+                rawProfile,
                 updatedAt: Date(),
-                sourceSessionID: profile.sourceSessionID,
-                needsLLMDedup: false
-            )
+                sourceSessionID: profile.sourceSessionID
+            ) else { return }
+            if generatedProfile.facts.isEmpty, !profile.facts.isEmpty {
+                generatedProfile = ConversationUserProfile(
+                    content: generatedProfile.content,
+                    updatedAt: generatedProfile.updatedAt,
+                    sourceSessionID: profile.sourceSessionID,
+                    facts: profile.facts
+                )
+            }
+            try ConversationMemoryManager.saveUserProfile(generatedProfile)
         } catch {
             logger.warning("用户画像同步去重失败: \(error.localizedDescription)")
         }
@@ -329,35 +343,48 @@ extension ChatService {
         temperature: Double = 0.4,
         runnableModel: RunnableModel? = nil,
         requestSource: UsageRequestSource,
-        sessionID: UUID? = nil,
-        appendOutputLanguageInstruction: Bool = true
+        sessionID: UUID? = nil
     ) async throws -> String {
         let trimmedUserPrompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedUserPrompt.isEmpty else { return "" }
 
-        guard let targetModel = runnableModel ?? detachedChatCompletionFallbackModel() else {
-            throw DetachedCompletionError.noAvailableModel
-        }
-
         var requestMessages: [ChatMessage] = []
-        var didAttachLanguageInstruction = false
         if let systemPrompt {
             let trimmedSystemPrompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedSystemPrompt.isEmpty {
-                let systemContent = appendOutputLanguageInstruction
-                    ? ModelPromptLanguage.appendingOutputInstruction(to: trimmedSystemPrompt)
-                    : trimmedSystemPrompt
                 requestMessages.append(ChatMessage(
                     role: .system,
-                    content: systemContent
+                    content: trimmedSystemPrompt
                 ))
-                didAttachLanguageInstruction = appendOutputLanguageInstruction
             }
         }
-        let finalUserPrompt = didAttachLanguageInstruction || !appendOutputLanguageInstruction
-            ? trimmedUserPrompt
-            : ModelPromptLanguage.appendingOutputInstruction(to: trimmedUserPrompt)
-        requestMessages.append(ChatMessage(role: .user, content: finalUserPrompt))
+        requestMessages.append(ChatMessage(role: .user, content: trimmedUserPrompt))
+
+        return try await generateDetachedChatCompletion(
+            messages: requestMessages,
+            temperature: temperature,
+            runnableModel: runnableModel,
+            requestSource: requestSource,
+            sessionID: sessionID
+        )
+    }
+
+    /// 执行保留消息角色与顺序的独立推理请求，不写入主聊天历史。
+    public func generateDetachedChatCompletion(
+        messages: [ChatMessage],
+        temperature: Double = 0.4,
+        runnableModel: RunnableModel? = nil,
+        requestSource: UsageRequestSource,
+        sessionID: UUID? = nil,
+        audioAttachments: [UUID: AudioAttachment] = [:],
+        imageAttachments: [UUID: [ImageAttachment]] = [:],
+        fileAttachments: [UUID: [FileAttachment]] = [:]
+    ) async throws -> String {
+        let requestMessages = messages.filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !requestMessages.isEmpty else { return "" }
+        guard let targetModel = runnableModel ?? detachedChatCompletionFallbackModel() else {
+            throw DetachedCompletionError.noAvailableModel
+        }
 
         let requestContext = RequestLogContext(
             requestID: UUID(),
@@ -371,6 +398,9 @@ extension ChatService {
         )
 
         if LocalModelProviderBridge.isLocalRunnableModel(targetModel) {
+            guard audioAttachments.isEmpty, imageAttachments.isEmpty, fileAttachments.isEmpty else {
+                throw DetachedCompletionError.unsupportedAttachments
+            }
             return try await generateDetachedLocalLLMCompletion(
                 runnableModel: targetModel,
                 requestMessages: requestMessages,
@@ -383,20 +413,35 @@ extension ChatService {
             throw DetachedCompletionError.unsupportedAdapter
         }
 
+        var preparedFileAttachments = fileAttachments
+        var selectedGeminiAPIKey: String?
+        if let geminiAdapter = adapter as? GeminiAdapter {
+            let preparation = try await prepareGeminiNativeVideoAttachments(
+                fileAttachments,
+                provider: targetModel.provider,
+                adapter: geminiAdapter
+            )
+            preparedFileAttachments = preparation.attachments
+            selectedGeminiAPIKey = preparation.apiKey
+        }
+
         let payload: [String: Any] = [
             "temperature": temperature,
             "stream": false
         ]
         var commonPayload = payload
         commonPayload[ReasoningContentEchoPayload.key] = await openAIReasoningContentEchoModeControlValue()
+        if let selectedGeminiAPIKey {
+            commonPayload[GeminiAdapter.apiKeyControlKey] = selectedGeminiAPIKey
+        }
         guard let request = adapter.buildChatRequest(
             for: targetModel,
             commonPayload: commonPayload,
             messages: requestMessages,
             tools: nil,
-            audioAttachments: [:],
-            imageAttachments: [:],
-            fileAttachments: [:]
+            audioAttachments: audioAttachments,
+            imageAttachments: imageAttachments,
+            fileAttachments: preparedFileAttachments
         ) else {
             throw DetachedCompletionError.buildRequestFailed
         }

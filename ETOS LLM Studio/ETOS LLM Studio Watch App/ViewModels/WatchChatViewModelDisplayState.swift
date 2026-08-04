@@ -252,11 +252,16 @@ extension ChatViewModel {
 
     private func scheduleVisualMessagePreparationIfNeeded(for state: ChatMessageRenderState, source message: ChatMessage) {
         let rules = MessageRegexRuleStore.shared.rules
-        guard Self.hasVisualRegexRule(in: rules, for: message) else {
+        let sessionID = currentSession?.id
+        let sourceMessages = allMessagesForSession
+        let supportsRoleplayRendering = message.role == .assistant || message.role == .user
+        let needsRoleplayPreparation = supportsRoleplayRendering && sessionID != nil
+        guard Self.hasVisualRegexRule(in: rules, for: message) || needsRoleplayPreparation else {
             visualMessagePrepareTasks[message.id]?.cancel()
             visualMessagePrepareTasks.removeValue(forKey: message.id)
             visualMessagePrepareGenerations.removeValue(forKey: message.id)
             state.updateVisualMessage(message)
+            state.updateRoleplayHTML(nil)
             scheduleMarkdownPreparationIfNeeded(for: message)
             return
         }
@@ -266,9 +271,40 @@ extension ChatViewModel {
         let generation = (visualMessagePrepareGenerations[messageID] ?? 0) &+ 1
         visualMessagePrepareGenerations[messageID] = generation
         visualMessagePrepareTasks[messageID]?.cancel()
-        visualMessagePrepareTasks[messageID] = Task(priority: .utility) { [weak self, messageID, sourceMessage = message, rules, generation] in
-            let visualMessage = await Task.detached(priority: .utility) {
-                ChatService.visualMessage(from: sourceMessage, rules: rules)
+        visualMessagePrepareTasks[messageID] = Task(priority: .utility) { [weak self, messageID, sourceMessage = message, rules, generation, sessionID, sourceMessages] in
+            let prepared = await Task.detached(priority: .utility) {
+                let visualMessage = ChatService.visualMessage(
+                    from: sourceMessage,
+                    sessionID: sessionID,
+                    messages: sourceMessages,
+                    rules: rules
+                )
+                let htmlRenderingEnabled = sessionID.flatMap {
+                    RoleplayStore.shared.binding(sessionID: $0)?.htmlRenderingEnabled
+                } == true
+                let displayedHTML: String? = sessionID.flatMap { sessionID in
+                    let value = RoleplayStore.shared.variableSnapshot(sessionID: sessionID).value(
+                        scope: .message,
+                        path: RoleplayDisplayedMessageBridge.variableKey,
+                        messageID: sourceMessage.id,
+                        versionIndex: sourceMessage.getCurrentVersionIndex()
+                    )
+                    guard case .string(let html) = value else { return nil }
+                    return html
+                }
+                let html: RoleplayHTMLExtraction?
+                let supportsRoleplayHTML = sourceMessage.role == .assistant || sourceMessage.role == .user
+                if supportsRoleplayHTML, htmlRenderingEnabled, let displayedHTML {
+                    html = RoleplayHTMLExtraction(
+                        remainingText: "",
+                        documents: [RoleplayHTMLDocument(id: 0, source: displayedHTML)]
+                    )
+                } else {
+                    html = supportsRoleplayHTML && htmlRenderingEnabled
+                        ? RoleplayHTMLExtractor.extract(from: visualMessage.content)
+                        : nil
+                }
+                return (visualMessage, html)
             }.value
 
             guard !Task.isCancelled, let self else { return }
@@ -277,8 +313,9 @@ extension ChatViewModel {
                   state.message == sourceMessage else {
                 return
             }
-            state.updateVisualMessage(visualMessage)
-            self.scheduleMarkdownPreparationIfNeeded(for: visualMessage)
+            state.updateVisualMessage(prepared.0)
+            state.updateRoleplayHTML(prepared.1?.containsHTML == true ? prepared.1 : nil)
+            self.scheduleMarkdownPreparationIfNeeded(for: prepared.0)
             if self.visualMessagePrepareGenerations[messageID] == generation {
                 self.visualMessagePrepareTasks[messageID] = nil
             }

@@ -26,14 +26,22 @@ extension DailyPulseManager {
     func generate(
         force: Bool,
         trigger: DailyPulseTrigger,
+        targetDayKey: String? = nil,
         notifyReadyWhenFinished: Bool = false
     ) async {
         if isGenerating { return }
-        guard force || autoGenerateEnabled || trigger == .manual || trigger == .delivery else { return }
-        prunePendingCurationIfNeeded(referenceDate: Date())
+        guard Self.shouldStartGeneration(
+            isDailyPulseEnabled: isDailyPulseEnabled,
+            force: force,
+            trigger: trigger,
+            autoGenerateEnabled: autoGenerateEnabled
+        ) else { return }
+        let now = Date()
+        let generationDayKey = targetDayKey ?? Self.dayKey(for: now)
+        prunePendingCurationIfNeeded(referenceDate: now)
 
         beginGenerationBackgroundTaskIfNeeded()
-        beginPreparation(referenceDate: Date())
+        beginPreparation(dayKey: generationDayKey, referenceDate: now)
         isGenerating = true
         lastErrorMessage = nil
         defer {
@@ -43,7 +51,7 @@ extension DailyPulseManager {
         }
 
         do {
-            let input = await buildGenerationInput()
+            let input = await buildGenerationInput(for: generationDayKey)
             guard input.hasUsableContext else {
                 throw DailyPulseGenerationError.insufficientContext
             }
@@ -54,7 +62,8 @@ extension DailyPulseManager {
             let userPrompt = Self.makeUserPrompt(
                 from: input,
                 cardsPerRun: cardsPerRun,
-                candidateCardsPerRun: candidateCardsPerRun
+                candidateCardsPerRun: candidateCardsPerRun,
+                targetDayKey: generationDayKey
             )
             let raw = try await chatService.generateDetachedChatCompletion(
                 systemPrompt: Self.systemPrompt,
@@ -74,17 +83,15 @@ extension DailyPulseManager {
                 throw DailyPulseGenerationError.invalidModelOutput
             }
 
-            let now = Date()
-            let todayKey = Self.dayKey(for: now)
             let newRun = DailyPulseRun(
-                dayKey: todayKey,
-                generatedAt: now,
+                dayKey: generationDayKey,
+                generatedAt: Date(),
                 headline: Self.normalizedText(parsed.headline, fallback: NSLocalizedString("今天这几条值得你看", comment: "Daily Pulse fallback headline")),
                 cards: cards,
                 sourceDigest: input.sourceDigest
             )
             upsertRun(newRun)
-            if pendingCuration?.targetDayKey == todayKey {
+            if pendingCuration?.targetDayKey == generationDayKey {
                 pendingCuration = nil
                 if !tomorrowCurationText.isEmpty {
                     tomorrowCurationText = ""
@@ -92,6 +99,7 @@ extension DailyPulseManager {
                     Persistence.saveDailyPulsePendingCuration(nil)
                 }
             }
+            await DailyPulseDeliveryCoordinator.shared.refreshReminderSchedule()
             if notifyReadyWhenFinished {
                 await DailyPulseDeliveryCoordinator.shared.notifyReadyIfNeeded(for: newRun)
             }
@@ -110,10 +118,23 @@ extension DailyPulseManager {
         }
     }
 
+    nonisolated static func shouldStartGeneration(
+        isDailyPulseEnabled: Bool,
+        force: Bool,
+        trigger: DailyPulseTrigger,
+        autoGenerateEnabled: Bool
+    ) -> Bool {
+        guard isDailyPulseEnabled else { return false }
+        return force || autoGenerateEnabled || trigger == .manual || trigger == .delivery
+    }
+
     func upsertRun(_ run: DailyPulseRun) {
         var updatedRuns = runs.filter { $0.dayKey != run.dayKey }
         updatedRuns.insert(run, at: 0)
-        runs = Self.trimmedRuns(updatedRuns, limit: retentionLimit)
+        runs = Self.retainedRuns(
+            from: Self.trimmedRuns(updatedRuns, limit: retentionLimit),
+            referenceDate: Date()
+        )
         persistRuns()
     }
 
@@ -143,14 +164,24 @@ extension DailyPulseManager {
             return
         }
 
+        let targetDayKey = Self.nextDayKey(from: referenceDate)
+        let shouldInvalidatePreparedRun = pendingCuration?.text != trimmed
+            && runs.contains(where: { $0.dayKey == targetDayKey })
         let note = DailyPulseCurationNote(
             id: pendingCuration?.id ?? UUID(),
-            targetDayKey: Self.nextDayKey(from: referenceDate),
+            targetDayKey: targetDayKey,
             text: trimmed,
             createdAt: pendingCuration?.createdAt ?? Date()
         )
         pendingCuration = note
         Persistence.saveDailyPulsePendingCuration(note)
+        if shouldInvalidatePreparedRun {
+            runs.removeAll(where: { $0.dayKey == targetDayKey })
+            persistRuns()
+            Task {
+                await DailyPulseDeliveryCoordinator.shared.refreshReminderSchedule()
+            }
+        }
     }
 
     func prunePendingCurationIfNeeded(referenceDate: Date) {
@@ -165,24 +196,23 @@ extension DailyPulseManager {
         }
     }
 
-    func card(cardID: UUID, runID: UUID) -> DailyPulseCard? {
+    public func card(cardID: UUID, runID: UUID) -> DailyPulseCard? {
         runs.first(where: { $0.id == runID })?.cards.first(where: { $0.id == cardID })
     }
 
-    private func buildGenerationInput() async -> DailyPulseGenerationInput {
+    private func buildGenerationInput(for targetDayKey: String) async -> DailyPulseGenerationInput {
         await memoryManager.waitForInitialization()
         prunePendingCurationIfNeeded(referenceDate: Date())
         let sessionExcerpts = buildSessionExcerpts()
         let memories = buildMemoryExcerpts()
         let requestLogSummary = buildRequestLogSummary()
-        let todayKey = Self.dayKey(for: Date())
         let activeTasks = pendingTasks
         let preferenceProfile = Self.makePreferenceProfile(history: feedbackHistory, recentRuns: runs)
         let externalContext = buildExternalContext()
         let globalSystemPrompt = GlobalSystemPromptStore.load().activeSystemPrompt
         return DailyPulseGenerationInput(
             focusText: focusText.trimmingCharacters(in: .whitespacesAndNewlines),
-            curationText: Self.activeCurationText(for: todayKey, pendingCuration: pendingCuration),
+            curationText: Self.activeCurationText(for: targetDayKey, pendingCuration: pendingCuration),
             globalSystemPrompt: globalSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
             sessionExcerpts: sessionExcerpts,
             memories: memories,
@@ -289,8 +319,9 @@ extension DailyPulseManager {
     }
 
     private func buildMemoryExcerpts() -> [String] {
-        memoryManager.currentMemoriesSnapshot()
-            .filter { !$0.isArchived }
+        let now = Date()
+        return memoryManager.currentMemoriesSnapshot()
+            .filter { $0.isValid(at: now) }
             .prefix(maxMemoriesInPrompt)
             .map { Self.truncated($0.content.trimmingCharacters(in: .whitespacesAndNewlines), limit: 120) }
             .filter { !$0.isEmpty }

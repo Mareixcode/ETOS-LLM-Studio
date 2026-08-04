@@ -25,6 +25,77 @@ struct OpenAIAdapterCoreTests {
         model: Model(modelName: "test-model")
     )
 
+    @Test("OpenAI 兼容请求默认使用 Chat Completions 端点")
+    func testOpenAIChatRequestUsesDefaultChatEndpointPath() throws {
+        let messages = [ChatMessage(role: .user, content: "你好")]
+
+        let request = try #require(adapter.buildChatRequest(
+            for: dummyModel,
+            commonPayload: [:],
+            messages: messages,
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+
+        #expect(request.url?.absoluteString == "https://api.test.com/v1/chat/completions")
+    }
+
+    @Test("OpenAI Chat 思考控制使用顶层 reasoning_effort")
+    func testOpenAIChatThinkingControlUsesTopLevelReasoningEffort() throws {
+        var thinkingControl = ModelRequestBodyControlDefaults.thinkingOptionGroup(for: "openai-compatible")
+        thinkingControl.defaultOptionID = "high"
+        let model = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "adapter-only-model",
+                requestBodyControls: [thinkingControl]
+            )
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: model,
+            commonPayload: [:],
+            messages: [ChatMessage(role: .user, content: "你好")],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let payload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+
+        #expect(payload["reasoning_effort"] as? String == "high")
+        #expect(payload["reasoning"] == nil)
+    }
+
+    @Test("OpenAI 兼容请求支持自定义聊天端点后缀")
+    func testOpenAIChatRequestUsesCustomChatEndpointPath() throws {
+        let provider = Provider(
+            id: UUID(),
+            name: "Proxy Provider",
+            baseURL: "https://api.test.com/v1/",
+            chatEndpointPath: "proxy/chat/",
+            apiKeys: ["test-key"],
+            apiFormat: "openai-compatible"
+        )
+        let model = RunnableModel(provider: provider, model: Model(modelName: "test-model"))
+        let messages = [ChatMessage(role: .user, content: "你好")]
+
+        let request = try #require(adapter.buildChatRequest(
+            for: model,
+            commonPayload: [:],
+            messages: messages,
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+
+        #expect(request.url?.absoluteString == "https://api.test.com/v1/proxy/chat")
+    }
+
     @Test("OpenAI 兼容模型列表会识别嵌入模型")
     func testOpenAIModelListInfersEmbeddingCapability() throws {
         let data = Data("""
@@ -70,7 +141,7 @@ struct OpenAIAdapterCoreTests {
         let visionModel = models.first { $0.modelName == "qwen-vl-max" }
         let chatModel = models.first { $0.modelName == "plain-chat" }
 
-        #expect(rerankModel?.kind == .rerank)
+        #expect(rerankModel?.kind == .chat)
         #expect(imageModel?.kind == .image)
         #expect(imageModel?.supportsImageGeneration == true)
         #expect(reasoningModel?.kind == .chat)
@@ -109,6 +180,30 @@ struct OpenAIAdapterCoreTests {
         #expect(functionName == "save_memory")
         #expect(params["type"] as? String == "object")
         #expect(properties["content"] != nil)
+    }
+
+    @Test("OpenAI 工具请求体对工具和 schema 使用稳定排序")
+    func testOpenAIToolPayloadStableOrderingForPromptCache() throws {
+        let messages = [ChatMessage(role: .user, content: "缓存测试")]
+        let alphaTool = stableOrderingTool(
+            name: "alpha_tool",
+            description: "Alpha tool"
+        )
+        let zetaTool = stableOrderingTool(
+            name: "zeta_tool",
+            description: "Zeta tool"
+        )
+
+        let firstBody = try requestBodyString(for: [zetaTool, alphaTool], messages: messages)
+        let secondBody = try requestBodyString(for: [alphaTool, zetaTool], messages: messages)
+
+        #expect(firstBody == secondBody)
+        let alphaRange = try #require(firstBody.range(of: #""name":"alpha_tool""#))
+        let zetaRange = try #require(firstBody.range(of: #""name":"zeta_tool""#))
+        #expect(alphaRange.lowerBound < zetaRange.lowerBound)
+        #expect(firstBody.contains(#""properties":{"a":{"type":"string"},"b":{"type":"string"}}"#))
+        #expect(firstBody.contains(#""required":["a","b"]"#))
+        #expect(firstBody.contains(#""function":{"description":"Alpha tool","name":"alpha_tool","parameters":"#))
     }
 
     @Test("OpenAI 工具 schema 缺失 type 时自动补全")
@@ -171,8 +266,8 @@ struct OpenAIAdapterCoreTests {
         #expect(filtersSchema["type"] as? String == "object")
     }
 
-    @Test("OpenAI 无工具请求会移除覆盖参数里的工具字段")
-    func testOpenAIRequestWithoutToolsRemovesOverrideToolFields() throws {
+    @Test("OpenAI 无工具请求会保留覆盖参数里的工具字段")
+    func testOpenAIRequestWithoutToolsKeepsOverrideToolFields() throws {
         let model = RunnableModel(
             provider: dummyModel.provider,
             model: Model(
@@ -210,11 +305,52 @@ struct OpenAIAdapterCoreTests {
             return
         }
 
-        #expect(jsonPayload["tools"] == nil)
-        #expect(jsonPayload["tool_choice"] == nil)
-        #expect(jsonPayload["functions"] == nil)
-        #expect(jsonPayload["function_call"] == nil)
-        #expect(jsonPayload["parallel_tool_calls"] == nil)
+        let toolsPayload = try #require(jsonPayload["tools"] as? [[String: Any]])
+        let firstTool = try #require(toolsPayload.first)
+        let function = try #require(firstTool["function"] as? [String: Any])
+
+        #expect(function["name"] as? String == "stale_tool")
+        #expect(jsonPayload["tool_choice"] as? String == "auto")
+        #expect((jsonPayload["functions"] as? [[String: Any]])?.first?["name"] as? String == "legacy_tool")
+        #expect(jsonPayload["function_call"] as? String == "auto")
+        #expect(jsonPayload["parallel_tool_calls"] as? Bool == true)
+    }
+
+    @Test("OpenAI 运行时工具会和自定义 tools 合并")
+    func testOpenAIToolsMergeRuntimeAndOverrideTools() throws {
+        let model = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "test-model",
+                overrideParameters: [
+                    "tools": .array([
+                        .dictionary(["googleSearch": .dictionary([:])])
+                    ])
+                ]
+            )
+        )
+        let messages = [ChatMessage(role: .user, content: "你好")]
+
+        guard let request = adapter.buildChatRequest(
+            for: model,
+            commonPayload: [:],
+            messages: messages,
+            tools: [saveMemoryToolDefinition()],
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ),
+        let httpBody = request.httpBody,
+        let jsonPayload = try? JSONSerialization.jsonObject(with: httpBody) as? [String: Any],
+        let toolsPayload = jsonPayload["tools"] as? [[String: Any]] else {
+            Issue.record("无法解析 OpenAI 合并后的工具字段。")
+            return
+        }
+
+        #expect(toolsPayload.count == 2)
+        #expect((toolsPayload.first?["googleSearch"] as? [String: Any]) != nil)
+        let runtimeFunction = toolsPayload.last?["function"] as? [String: Any]
+        #expect(runtimeFunction?["name"] as? String == "save_memory")
     }
 
     @Test("OpenAI 工具 schema 组合类型和叶子节点兜底补全")
@@ -711,6 +847,36 @@ struct OpenAIAdapterCoreTests {
         #expect(usage.thinkingTokens == 7)
     }
 
+    @Test("OpenAI 兼容解析 DeepSeek prompt cache 命中字段")
+    func testParseResponseParsesDeepSeekPromptCacheHitTokens() throws {
+        let json = """
+        {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "完成"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+            "prompt_cache_hit_tokens": 96,
+            "prompt_cache_miss_tokens": 24
+          }
+        }
+        """
+
+        let data = try #require(json.data(using: .utf8))
+        let message = try adapter.parseResponse(data: data)
+        let usage = try #require(message.tokenUsage)
+
+        #expect(usage.promptTokens == 120)
+        #expect(usage.cacheReadTokens == 96)
+    }
+
     @Test("OpenAI 请求会镜像 thought_signature 到 Gemini extra_content")
     func testBuildRequestIncludesGeminiExtraContentThoughtSignature() throws {
         let toolCall = InternalToolCall(
@@ -738,5 +904,41 @@ struct OpenAIAdapterCoreTests {
         }
 
         #expect(thoughtSignature == "sig-gemini-1")
+    }
+
+    private func stableOrderingTool(name: String, description: String) -> InternalToolDefinition {
+        InternalToolDefinition(
+            name: name,
+            description: description,
+            parameters: .dictionary([
+                "required": .array([.string("b"), .string("a")]),
+                "properties": .dictionary([
+                    "b": .dictionary([
+                        "type": .string("string")
+                    ]),
+                    "a": .dictionary([
+                        "type": .string("string")
+                    ])
+                ]),
+                "type": .string("object")
+            ])
+        )
+    }
+
+    private func requestBodyString(
+        for tools: [InternalToolDefinition],
+        messages: [ChatMessage]
+    ) throws -> String {
+        let request = try #require(adapter.buildChatRequest(
+            for: dummyModel,
+            commonPayload: [:],
+            messages: messages,
+            tools: tools,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let body = try #require(request.httpBody)
+        return try #require(String(data: body, encoding: .utf8))
     }
 }

@@ -20,6 +20,22 @@ struct DailyPulseView: View {
     @ObservedObject private var notificationCenter = AppLocalNotificationCenter.shared
 
     @State private var statusMessage: String?
+    @State private var deliveryTimeDrafts: [UUID: String] = [:]
+    @State private var invalidDeliveryTimeIDs: Set<UUID> = []
+    @State private var notificationCardTarget: DailyPulseCardNavigationTarget?
+    @State private var didHandleInitialCardTarget = false
+    private let initialCardTarget: DailyPulseCardNavigationTarget?
+
+    init(initialRunID: UUID? = nil, initialCardID: UUID? = nil) {
+        if let initialRunID, let initialCardID {
+            self.initialCardTarget = DailyPulseCardNavigationTarget(
+                runID: initialRunID,
+                cardID: initialCardID
+            )
+        } else {
+            self.initialCardTarget = nil
+        }
+    }
 
     var body: some View {
         List {
@@ -36,6 +52,7 @@ struct DailyPulseView: View {
             if pulseManager.todayRun == nil && !pulseManager.isPreparingTodayPulse {
                 todayPulseSection
             }
+            pulseAvailabilitySection
         }
         .navigationTitle(NSLocalizedString("每日脉冲", comment: ""))
         .navigationBarTitleDisplayMode(.inline)
@@ -51,15 +68,32 @@ struct DailyPulseView: View {
             await pulseManager.generateIfNeeded()
             pulseManager.markTodayRunViewed()
             await notificationCenter.refreshAuthorizationStatus()
+            openInitialCardIfNeeded()
         }
         .onChange(of: pulseManager.todayRun?.dayKey) { _, _ in
             pulseManager.markTodayRunViewed()
+            openInitialCardIfNeeded()
+        }
+        .navigationDestination(item: $notificationCardTarget) { target in
+            notificationCardDetail(for: target)
         }
     }
 
     private var generationSection: some View {
         Section {
             Toggle(NSLocalizedString("每日首次打开自动补生成", comment: ""), isOn: $pulseManager.autoGenerateEnabled)
+
+            Stepper(
+                value: $pulseManager.cardsPerRun,
+                in: DailyPulseManager.minimumCardsPerRun...DailyPulseManager.maximumCardsPerRun
+            ) {
+                Text(
+                    String(
+                        format: NSLocalizedString("每日卡片数量：%d", comment: "Daily Pulse cards per run"),
+                        pulseManager.cardsPerRun
+                    )
+                )
+            }
 
             if let run = pulseManager.latestRun {
                 VStack(alignment: .leading, spacing: 6) {
@@ -85,6 +119,16 @@ struct DailyPulseView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if pulseManager.tomorrowRun != nil {
+                Label(NSLocalizedString("明日脉冲已预先准备", comment: "Daily Pulse tomorrow run ready status"), systemImage: "calendar.badge.checkmark")
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if pulseManager.isPreparingTomorrowPulse {
+                Label(NSLocalizedString("正在提前准备明日脉冲", comment: "Daily Pulse tomorrow run preparing status"), systemImage: "calendar.badge.clock")
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Button {
                 Task {
                     await pulseManager.generateNow()
@@ -101,24 +145,65 @@ struct DailyPulseView: View {
                     }
                 }
             }
-            .disabled(pulseManager.isGenerating)
+            .disabled(pulseManager.isGenerating || !pulseManager.isDailyPulseEnabled)
         } header: {
             Text(NSLocalizedString("生成", comment: ""))
         } footer: {
-            Text(NSLocalizedString("当前会优先使用最近聊天、记忆系统、请求日志、反馈历史、明日策展和你的关注焦点，并可选结合外部上下文生成约 3 张卡片。为了更接近 Pulse，主界面现在只保留今天这一期。", comment: ""))
+            Text(
+                String(
+                    format: NSLocalizedString("每期生成 %d 张卡片；模型会一次完成整期。系统会优先参考最近聊天、记忆、请求日志、反馈历史、明日策展、关注焦点与已启用的外部上下文。", comment: "Daily Pulse generation footer with card count"),
+                    pulseManager.cardsPerRun
+                )
+            )
+        }
+    }
+
+    private var pulseAvailabilitySection: some View {
+        Section {
+            Toggle(NSLocalizedString("启用每日脉冲", comment: "Daily Pulse enabled toggle"), isOn: $pulseManager.isDailyPulseEnabled)
+        } footer: {
+            Text(NSLocalizedString("关闭后不会再生成新的每日脉冲；已有卡片、任务和反馈记录仍会保留。", comment: "Daily Pulse enabled toggle footer"))
         }
     }
 
     private var deliverySection: some View {
         Section {
-            Toggle(NSLocalizedString("晨间提醒", comment: ""), isOn: $deliveryCoordinator.reminderEnabled)
+            Toggle(NSLocalizedString("定时送达", comment: "Daily Pulse scheduled delivery toggle"), isOn: $deliveryCoordinator.reminderEnabled)
 
             if deliveryCoordinator.reminderEnabled {
-                DatePicker(
-                    NSLocalizedString("提醒时间", comment: ""),
-                    selection: reminderTimeBinding,
-                    displayedComponents: .hourAndMinute
-                )
+                ForEach(Array(deliveryCoordinator.deliveryTimes.enumerated()), id: \.element.id) { index, deliveryTime in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(
+                                String(
+                                    format: NSLocalizedString("第 %d 条送达时间", comment: "Daily Pulse delivery time row"),
+                                    index + 1
+                                )
+                            )
+                            Spacer()
+                            TextField(
+                                NSLocalizedString("送达时间", comment: "Daily Pulse delivery time field"),
+                                text: deliveryTimeTextBinding(for: deliveryTime)
+                            )
+                            .multilineTextAlignment(.trailing)
+                            .monospacedDigit()
+                            .keyboardType(.numbersAndPunctuation)
+                            .frame(width: 96)
+                            .onSubmit {
+                                normalizeDeliveryTimeDraft(id: deliveryTime.id)
+                            }
+                            .onDisappear {
+                                normalizeDeliveryTimeDraft(id: deliveryTime.id)
+                            }
+                        }
+
+                        if invalidDeliveryTimeIDs.contains(deliveryTime.id) {
+                            Text(NSLocalizedString("时间格式不正确或与其他时间重复，请输入 00:00-23:59。", comment: "Daily Pulse delivery time invalid input"))
+                                .etFont(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
 
                 if notificationCenter.authorizationStatus == .denied {
                     Button(NSLocalizedString("打开系统通知设置", comment: "")) {
@@ -381,6 +466,33 @@ struct DailyPulseView: View {
         .padding(.vertical, 6)
     }
 
+    private func openInitialCardIfNeeded() {
+        guard !didHandleInitialCardTarget,
+              notificationCardTarget == nil,
+              let initialCardTarget,
+              pulseManager.card(cardID: initialCardTarget.cardID, runID: initialCardTarget.runID) != nil else {
+            return
+        }
+        didHandleInitialCardTarget = true
+        notificationCardTarget = initialCardTarget
+    }
+
+    @ViewBuilder
+    private func notificationCardDetail(for target: DailyPulseCardNavigationTarget) -> some View {
+        if let card = pulseManager.card(cardID: target.cardID, runID: target.runID) {
+            DailyPulseCardDetailView(
+                cardID: card.id,
+                runID: target.runID,
+                fallbackCard: card,
+                statusMessage: $statusMessage
+            )
+        } else {
+            Text(NSLocalizedString("这张每日脉冲卡片暂时不可用。", comment: "Daily Pulse notification card unavailable"))
+                .etFont(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     @ViewBuilder
     private func feedbackBadge(for card: DailyPulseCard) -> some View {
         switch card.feedback {
@@ -407,7 +519,7 @@ struct DailyPulseView: View {
 
     private func summaryText(for run: DailyPulseRun) -> String {
         let dateText = run.generatedAt.formatted(date: .abbreviated, time: .shortened)
-        return String(format: NSLocalizedString("生成于 %@ · 可见卡片 %d/%d · 仅保留当天", comment: ""), dateText, run.visibleCards.count, run.cards.count)
+        return String(format: NSLocalizedString("生成于 %@ · 可见卡片 %d/%d · 仅展示当天", comment: ""), dateText, run.visibleCards.count, run.cards.count)
     }
 
     private var preparationStatusText: String {
@@ -461,21 +573,63 @@ struct DailyPulseView: View {
         )
     }
 
-    private var reminderTimeBinding: Binding<Date> {
+    private func deliveryTimeTextBinding(for deliveryTime: DailyPulseDeliveryTime) -> Binding<String> {
         Binding(
-            get: {
-                var components = DateComponents()
-                components.calendar = Calendar(identifier: .gregorian)
-                components.hour = deliveryCoordinator.reminderHour
-                components.minute = deliveryCoordinator.reminderMinute
-                return components.date ?? Date()
-            },
+            get: { deliveryTimeDrafts[deliveryTime.id] ?? deliveryTime.timeText },
             set: { newValue in
-                let components = Calendar(identifier: .gregorian).dateComponents([.hour, .minute], from: newValue)
-                deliveryCoordinator.reminderHour = components.hour ?? deliveryCoordinator.reminderHour
-                deliveryCoordinator.reminderMinute = components.minute ?? deliveryCoordinator.reminderMinute
+                deliveryTimeDrafts[deliveryTime.id] = newValue
+                applyDeliveryTimeInput(newValue, id: deliveryTime.id)
             }
         )
+    }
+
+    private func applyDeliveryTimeInput(_ input: String, id: UUID) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            invalidDeliveryTimeIDs.remove(id)
+            return
+        }
+        guard let components = DailyPulseDeliveryCoordinator.reminderTimeComponents(from: trimmed) else {
+            invalidDeliveryTimeIDs.insert(id)
+            return
+        }
+        let totalMinutes = components.hour * 60 + components.minute
+        guard !deliveryCoordinator.deliveryTimes.contains(where: {
+            $0.id != id && $0.totalMinutes == totalMinutes
+        }) else {
+            invalidDeliveryTimeIDs.insert(id)
+            return
+        }
+
+        invalidDeliveryTimeIDs.remove(id)
+    }
+
+    private func normalizeDeliveryTimeDraft(id: UUID) {
+        guard let deliveryTime = deliveryCoordinator.deliveryTimes.first(where: { $0.id == id }) else {
+            deliveryTimeDrafts[id] = nil
+            invalidDeliveryTimeIDs.remove(id)
+            return
+        }
+        let input = deliveryTimeDrafts[id] ?? deliveryTime.timeText
+        if let components = DailyPulseDeliveryCoordinator.reminderTimeComponents(from: input) {
+            _ = deliveryCoordinator.updateDeliveryTime(
+                id: id,
+                hour: components.hour,
+                minute: components.minute
+            )
+        }
+        let normalizedTime = deliveryCoordinator.deliveryTimes.first(where: { $0.id == id })
+        deliveryTimeDrafts[id] = normalizedTime?.timeText
+        invalidDeliveryTimeIDs.remove(id)
+    }
+}
+
+private struct DailyPulseCardNavigationTarget: Identifiable, Hashable {
+    let runID: UUID
+    let cardID: UUID
+
+    var id: String {
+        "\(runID.uuidString)-\(cardID.uuidString)"
     }
 }
 

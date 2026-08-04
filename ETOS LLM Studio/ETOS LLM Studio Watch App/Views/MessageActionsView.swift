@@ -18,12 +18,15 @@ struct MessageActionsView: View {
     let message: ChatMessage
     let canRetry: Bool
     let canRewrite: Bool
-    let onCopy: () -> Void
+    let onInsertText: (String) -> Void
     let onEdit: () -> Void
     let onRewrite: () -> Void
+    let onRewriteSelection: (MessageRewriteSelectionTarget) -> Void
     let onRetry: (ChatMessage) -> Void
+    let onRetryVideoAnalysis: (ChatMessage, String) async throws -> VideoAnalysisResult
     let onSpeak: (ChatMessage) -> Void
     let onStopSpeaking: () -> Void
+    let onSelectMultiple: () -> Void
     let onDelete: () -> Void
     let onDeleteVersion: (Int) -> Void
     let onSwitchVersion: (Int) -> Void
@@ -32,6 +35,7 @@ struct MessageActionsView: View {
     let supportsMathRenderToggle: Bool
     let isMathRenderingEnabled: Bool
     let onToggleMathRendering: () -> Void
+    let mathRenderContent: String?
     let onJumpToMessageIndex: (Int) -> Bool
     let session: ChatSession?
     let allMessages: [ChatMessage]
@@ -44,12 +48,15 @@ struct MessageActionsView: View {
         message: ChatMessage,
         canRetry: Bool,
         canRewrite: Bool,
-        onCopy: @escaping () -> Void,
+        onInsertText: @escaping (String) -> Void,
         onEdit: @escaping () -> Void,
         onRewrite: @escaping () -> Void,
+        onRewriteSelection: @escaping (MessageRewriteSelectionTarget) -> Void,
         onRetry: @escaping (ChatMessage) -> Void,
+        onRetryVideoAnalysis: @escaping (ChatMessage, String) async throws -> VideoAnalysisResult,
         onSpeak: @escaping (ChatMessage) -> Void,
         onStopSpeaking: @escaping () -> Void,
+        onSelectMultiple: @escaping () -> Void,
         onDelete: @escaping () -> Void,
         onDeleteVersion: @escaping (Int) -> Void,
         onSwitchVersion: @escaping (Int) -> Void,
@@ -58,6 +65,7 @@ struct MessageActionsView: View {
         supportsMathRenderToggle: Bool = false,
         isMathRenderingEnabled: Bool = false,
         onToggleMathRendering: @escaping () -> Void = {},
+        mathRenderContent: String? = nil,
         onJumpToMessageIndex: @escaping (Int) -> Bool,
         session: ChatSession?,
         allMessages: [ChatMessage],
@@ -68,12 +76,15 @@ struct MessageActionsView: View {
         self.message = message
         self.canRetry = canRetry
         self.canRewrite = canRewrite
-        self.onCopy = onCopy
+        self.onInsertText = onInsertText
         self.onEdit = onEdit
         self.onRewrite = onRewrite
+        self.onRewriteSelection = onRewriteSelection
         self.onRetry = onRetry
+        self.onRetryVideoAnalysis = onRetryVideoAnalysis
         self.onSpeak = onSpeak
         self.onStopSpeaking = onStopSpeaking
+        self.onSelectMultiple = onSelectMultiple
         self.onDelete = onDelete
         self.onDeleteVersion = onDeleteVersion
         self.onSwitchVersion = onSwitchVersion
@@ -82,6 +93,7 @@ struct MessageActionsView: View {
         self.supportsMathRenderToggle = supportsMathRenderToggle
         self.isMathRenderingEnabled = isMathRenderingEnabled
         self.onToggleMathRendering = onToggleMathRendering
+        self.mathRenderContent = mathRenderContent
         self.onJumpToMessageIndex = onJumpToMessageIndex
         self.session = session
         self.allMessages = allMessages
@@ -99,7 +111,13 @@ struct MessageActionsView: View {
     @State private var pendingRetryMessage: ChatMessage?
     @State private var jumpInput: String = ""
     @State private var jumpError: String?
+    @State private var mathHTMLPageItem: WatchWebHTMLPageItem?
+    @State private var videoAnalysisOverrides: [String: VideoAnalysisResult] = [:]
+    @State private var retryingVideoFileNames: Set<String> = []
+    @State private var videoAnalysisError: String?
+    @ObservedObject private var appConfig = AppConfigStore.shared
     @ObservedObject private var ttsManager = TTSManager.shared
+    @Environment(\.colorScheme) private var colorScheme
 
     private var responseAttemptVersionInfo: ChatResponseAttemptVersionInfo? {
         ChatResponseAttemptSupport.versionInfo(for: message, in: allMessages)
@@ -117,21 +135,23 @@ struct MessageActionsView: View {
         responseAttemptVersionInfo?.currentIndex ?? message.getCurrentVersionIndex()
     }
 
-    private var visibleAllMessages: [ChatMessage] {
-        ChatResponseAttemptSupport.visibleMessages(from: allMessages)
-    }
-
     private var resolvedCostEstimate: MessageCostEstimate? {
         let estimate = MessageCostResolver.resolvedCost(for: message, providers: providers)
         guard let estimate, estimate.totalCost > 0 else { return nil }
         return estimate
     }
 
+    private var videoFileNames: [String] {
+        (message.fileFileNames ?? []).filter { VideoAttachmentSupport.isVideo(fileName: $0) }
+    }
+
     // MARK: - 视图主体
     
     var body: some View {
-        // 有音频或图片附件的消息不显示编辑按钮
-        let hasAttachments = message.audioFileName != nil || (message.imageFileNames?.isEmpty == false)
+        // 有附件的消息不显示编辑按钮，避免修改正文后附件语义与内容不一致。
+        let hasAttachments = message.audioFileName != nil
+            || (message.imageFileNames?.isEmpty == false)
+            || (message.fileFileNames?.isEmpty == false)
         
         Form {
             Section {
@@ -187,12 +207,17 @@ struct MessageActionsView: View {
 
                 if supportsMathRenderToggle {
                     Button {
-                        onToggleMathRendering()
-                        dismiss()
+                        if let mathRenderContent {
+                            openMathRenderingPage(content: mathRenderContent)
+                        } else {
+                            onToggleMathRendering()
+                            dismiss()
+                        }
                     } label: {
+                        let usesToggleFallback = mathRenderContent == nil && isMathRenderingEnabled
                         Label(
-                            isMathRenderingEnabled ? NSLocalizedString("取消渲染公式", comment: "") : NSLocalizedString("渲染公式", comment: ""),
-                            systemImage: isMathRenderingEnabled ? "xmark.circle" : "function"
+                            usesToggleFallback ? NSLocalizedString("取消渲染公式", comment: "") : NSLocalizedString("渲染公式", comment: ""),
+                            systemImage: usesToggleFallback ? "xmark.circle" : "function"
                         )
                     }
                 }
@@ -206,13 +231,33 @@ struct MessageActionsView: View {
                     }
                 }
 
+                NavigationLink {
+                    WatchMessageTextSelectionView(
+                        message: message,
+                        onRewriteSelection: canRewrite ? { target in
+                            onRewriteSelection(target)
+                            dismiss()
+                        } : nil
+                    ) { text in
+                        onInsertText(text)
+                        dismiss()
+                    }
+                } label: {
+                    Label(
+                        NSLocalizedString("选定文字", comment: "Open message text selection"),
+                        systemImage: "character.cursor.ibeam"
+                    )
+                }
+
                 Button {
-                    onCopy()
+                    onSelectMultiple()
                     dismiss()
                 } label: {
-                    Label(NSLocalizedString("复制内容", comment: ""), systemImage: "doc.on.doc")
+                    Label(NSLocalizedString("多选", comment: "Enter message selection mode"), systemImage: "checkmark.circle")
                 }
             }
+
+            videoAnalysisSections
 
             if hasDisplayVersions {
                 Section(NSLocalizedString("版本管理", comment: "")) {
@@ -343,7 +388,7 @@ struct MessageActionsView: View {
                 NavigationLink {
                     ChatExportFormatsView(
                         session: session,
-                        messages: visibleAllMessages,
+                        messages: allMessages,
                         upToMessageID: nil
                     )
                 } label: {
@@ -353,7 +398,7 @@ struct MessageActionsView: View {
                 NavigationLink {
                     ChatExportFormatsView(
                         session: session,
-                        messages: visibleAllMessages,
+                        messages: allMessages,
                         upToMessageID: message.id
                     )
                 } label: {
@@ -384,6 +429,32 @@ struct MessageActionsView: View {
                                 displayVersionCount
                             )
                         )
+                            .etFont(.caption2)
+                    }
+                }
+
+                if let modelReference = message.modelReference {
+                    VStack(alignment: .leading) {
+                        Text(NSLocalizedString("提供商", comment: ""))
+                            .etFont(.caption)
+                            .foregroundColor(.secondary)
+                        Text(modelReference.providerName)
+                            .etFont(.caption2)
+                    }
+
+                    VStack(alignment: .leading) {
+                        Text(NSLocalizedString("模型名称", comment: ""))
+                            .etFont(.caption)
+                            .foregroundColor(.secondary)
+                        Text(modelReference.modelDisplayName)
+                            .etFont(.caption2)
+                    }
+
+                    VStack(alignment: .leading) {
+                        Text(NSLocalizedString("模型ID", comment: ""))
+                            .etFont(.caption)
+                            .foregroundColor(.secondary)
+                        Text(modelReference.modelName)
                             .etFont(.caption2)
                     }
                 }
@@ -422,6 +493,11 @@ struct MessageActionsView: View {
         } message: {
             Text(NSLocalizedString("删除后将无法恢复此版本的内容。", comment: ""))
         }
+        .alert(NSLocalizedString("视频解析失败", comment: "Video analysis failure title"), isPresented: videoAnalysisErrorPresented) {
+            Button(NSLocalizedString("好", comment: "Dismiss alert button"), role: .cancel) { }
+        } message: {
+            Text(videoAnalysisError ?? "")
+        }
         .confirmationDialog(NSLocalizedString("创建分支选项", comment: ""), isPresented: $showBranchOptions, titleVisibility: .visible) {
             Button(NSLocalizedString("仅复制消息历史", comment: "")) {
                 onBranch(false)
@@ -440,6 +516,11 @@ struct MessageActionsView: View {
         .onDisappear {
             performPendingRetryIfNeeded()
         }
+        .sheet(item: $mathHTMLPageItem) { item in
+            NavigationStack {
+                WatchWebHTMLPage(item: item)
+            }
+        }
     }
 
     private var deleteVersionConfirmPresented: Binding<Bool> {
@@ -447,6 +528,68 @@ struct MessageActionsView: View {
             get: { versionIndexToDelete != nil },
             set: { if !$0 { versionIndexToDelete = nil } }
         )
+    }
+
+    private var videoAnalysisErrorPresented: Binding<Bool> {
+        Binding(
+            get: { videoAnalysisError != nil },
+            set: { if !$0 { videoAnalysisError = nil } }
+        )
+    }
+
+    @ViewBuilder
+    private var videoAnalysisSections: some View {
+        ForEach(videoFileNames, id: \.self) { fileName in
+            Section {
+                if let result = videoAnalysisResult(for: fileName) {
+                    NavigationLink {
+                        WatchVideoAnalysisDetailView(result: result)
+                    } label: {
+                        Label(NSLocalizedString("查看视频解析", comment: "View saved video analysis"), systemImage: "doc.text.magnifyingglass")
+                    }
+                } else {
+                    Label(NSLocalizedString("暂无视频解析结果", comment: "No saved video analysis"), systemImage: "doc.text")
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    retryVideoAnalysis(fileName: fileName)
+                } label: {
+                    if retryingVideoFileNames.contains(fileName) {
+                        Label {
+                            Text(NSLocalizedString("正在重新解析视频…", comment: "Video analysis retry progress"))
+                        } icon: {
+                            ProgressView()
+                        }
+                    } else {
+                        Label(NSLocalizedString("重新解析视频", comment: "Retry video analysis"), systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(retryingVideoFileNames.contains(fileName))
+            } header: {
+                Text(fileName)
+            } footer: {
+                Text(NSLocalizedString("重新解析会替换已保存的结果，之后发送和压缩上下文都会使用新内容。", comment: "Video analysis retry explanation"))
+            }
+        }
+    }
+
+    private func videoAnalysisResult(for fileName: String) -> VideoAnalysisResult? {
+        videoAnalysisOverrides[fileName] ?? message.videoAnalysisResult(for: fileName)
+    }
+
+    private func retryVideoAnalysis(fileName: String) {
+        Task { @MainActor in
+            retryingVideoFileNames.insert(fileName)
+            defer { retryingVideoFileNames.remove(fileName) }
+
+            do {
+                videoAnalysisOverrides[fileName] = try await onRetryVideoAnalysis(message, fileName)
+            } catch is CancellationError {
+            } catch {
+                videoAnalysisError = error.localizedDescription
+            }
+        }
     }
 
     private func formatDuration(_ duration: TimeInterval) -> String {
@@ -460,6 +603,21 @@ struct MessageActionsView: View {
             return "\(base) (\(NSLocalizedString("估算", comment: "Estimated")))"
         }
         return base
+    }
+
+    private func openMathRenderingPage(content: String) {
+        let fontScale = FontLibrary.effectiveFontScale(
+            appConfig.fontCustomScale,
+            isCustomFontEnabled: appConfig.fontUseCustomFonts
+        )
+        mathHTMLPageItem = WatchWebHTMLPageItem(
+            title: NSLocalizedString("公式预览", comment: "Math rendering preview title"),
+            html: WatchWebHTMLDocumentFactory.mathDocument(
+                content: content,
+                prefersDarkPalette: colorScheme == .dark,
+                fontScale: fontScale
+            )
+        )
     }
 
     private func submitJump() {
@@ -496,6 +654,30 @@ struct MessageActionsView: View {
             await Task.yield()
             onRetry(message)
         }
+    }
+}
+
+private struct WatchVideoAnalysisDetailView: View {
+    let result: VideoAnalysisResult
+
+    var body: some View {
+        List {
+            Section(NSLocalizedString("视频", comment: "Video details section")) {
+                LabeledContent(NSLocalizedString("文件", comment: "File name label"), value: result.fileName)
+                LabeledContent(NSLocalizedString("解析模型", comment: "Video analysis model label"), value: result.modelDisplayName)
+                LabeledContent {
+                    Text(result.generatedAt, format: .dateTime.year().month().day().hour().minute())
+                } label: {
+                    Text(NSLocalizedString("解析时间", comment: "Video analysis date label"))
+                }
+            }
+
+            Section(NSLocalizedString("解析文字", comment: "Video analysis text section")) {
+                Text(result.content)
+            }
+        }
+        .navigationTitle(NSLocalizedString("视频解析", comment: "Video analysis detail title"))
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

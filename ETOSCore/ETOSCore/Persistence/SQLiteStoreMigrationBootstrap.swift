@@ -30,6 +30,7 @@ public enum SQLiteStoreMigrationBootstrap {
 public final class AppLaunchStateMachine: ObservableObject {
     public enum Phase: Equatable {
         case idle
+        case waitingForDatabaseUnlock
         case preparingPersistence
         case warmingServices
         case ready
@@ -48,12 +49,28 @@ public final class AppLaunchStateMachine: ObservableObject {
     public func startIfNeeded() {
         guard phase == .idle else { return }
         guard bootstrapTask == nil else { return }
+        guard !DatabaseEncryptionManager.shared.requiresManualUnlock else {
+            phase = .waitingForDatabaseUnlock
+            logger.info("启动状态机等待数据库主密码。")
+            return
+        }
         phase = .preparingPersistence
 
         bootstrapTask = Task { [weak self] in
+            let persistenceSignpost = TelemetrySignpost.begin(.databaseBootstrap)
             await Task.detached(priority: .userInitiated) {
                 Persistence.bootstrapGRDBStoreOnLaunch()
             }.value
+            TelemetrySignpost.end(persistenceSignpost)
+
+            if Persistence.hasPendingLaunchRecoveryRequest() {
+                await MainActor.run {
+                    self?.phase = .ready
+                    self?.bootstrapTask = nil
+                    self?.logger.info("启动状态机等待用户确认启动备份恢复。")
+                }
+                return
+            }
 
             guard !Task.isCancelled else {
                 await MainActor.run {
@@ -65,10 +82,12 @@ public final class AppLaunchStateMachine: ObservableObject {
                 self?.phase = .warmingServices
             }
 
+            let warmupSignpost = TelemetrySignpost.begin(.serviceWarmup)
             await Task.detached(priority: .userInitiated) {
                 let chatService = ChatService.shared
                 await chatService.waitForInitialPersistenceStateIfNeeded()
             }.value
+            TelemetrySignpost.end(warmupSignpost)
 
             guard !Task.isCancelled else {
                 await MainActor.run {
@@ -83,5 +102,11 @@ public final class AppLaunchStateMachine: ObservableObject {
             }
             Persistence.scheduleLaunchBackupPointAfterStartupIfEnabled()
         }
+    }
+
+    public func continueAfterDatabaseUnlock() {
+        guard phase == .waitingForDatabaseUnlock else { return }
+        phase = .idle
+        startIfNeeded()
     }
 }

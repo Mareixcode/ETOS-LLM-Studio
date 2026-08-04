@@ -11,6 +11,17 @@ import UIKit
 import ETOSCore
 
 extension ChatView {
+    /// 相连气泡属于同一视觉组，不能被逐条滚动位移撕开连接处。
+    nonisolated static func chatScrollTransitionOffset(
+        phaseValue: CGFloat,
+        configuredOffset: Double,
+        isEnabled: Bool,
+        isConnectedToAdjacentBubble: Bool
+    ) -> CGFloat {
+        guard isEnabled, !isConnectedToAdjacentBubble else { return 0 }
+        return phaseValue * CGFloat(configuredOffset)
+    }
+
     func resolvePendingSearchJumpIfNeeded() {
         guard let target = viewModel.pendingSearchJumpTarget,
               viewModel.currentSession?.id == target.sessionID,
@@ -48,6 +59,7 @@ extension ChatView {
         pendingBottomSnapTask = nil
         needsImmediateBottomSnap = false
         shouldRestorePendingJumpOnAppear = true
+        shouldKeepBottomPinned = false
     }
 
     func shouldMergeTurnMessages(_ message: ChatMessage?, with nextMessage: ChatMessage?) -> Bool {
@@ -92,6 +104,7 @@ extension ChatView {
         animated: Bool = true,
         animation: Animation = .easeOut(duration: 0.25)
     ) {
+        shouldKeepBottomPinned = true
         setScrollTarget(bottomScrollTarget, anchor: .bottom, animated: animated, animation: animation)
     }
 
@@ -101,6 +114,7 @@ extension ChatView {
         shouldRestorePendingJumpOnAppear = false
 
         let shouldResetHistoryWindow = viewModel.usesManualHistoryLoading || viewModel.usesAutomaticHistoryWindow
+        shouldKeepBottomPinned = true
         showScrollToBottom = false
 
         guard shouldResetHistoryWindow else {
@@ -131,6 +145,7 @@ extension ChatView {
     ) {
         guard isFirstDisplayedMessage, viewModel.usesAutomaticHistoryWindow else { return }
         suppressAutoScrollOnce = true
+        shouldKeepBottomPinned = false
         let didLoad = viewModel.loadMoreAutomaticHistoryIfNeeded()
         guard didLoad else { return }
         DispatchQueue.main.async {
@@ -140,6 +155,7 @@ extension ChatView {
 
     func scheduleImmediateBottomSnap() {
         pendingBottomSnapTask?.cancel()
+        shouldKeepBottomPinned = true
         pendingBottomSnapTask = Task { @MainActor in
             for _ in 0..<3 {
                 guard !Task.isCancelled else { return }
@@ -154,6 +170,7 @@ extension ChatView {
 
     func scheduleDeferredBottomSnap() {
         pendingBottomSnapTask?.cancel()
+        shouldKeepBottomPinned = true
         pendingBottomSnapTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 50_000_000)
             for _ in 0..<3 {
@@ -181,11 +198,12 @@ extension ChatView {
         return .bottom
     }
 
-    func updateScrollToBottomVisibility(distanceToBottom: CGFloat) {
+    func updateScrollToBottomVisibility(distanceToBottom: CGFloat, isUserInteracting: Bool) {
         let normalizedDistance = max(distanceToBottom, 0)
         DispatchQueue.main.async {
             scrollDistanceToBottom = normalizedDistance
             guard !viewModel.displayMessages.isEmpty else {
+                shouldKeepBottomPinned = true
                 if showScrollToBottom {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         showScrollToBottom = false
@@ -193,7 +211,13 @@ extension ChatView {
                 }
                 return
             }
-            let shouldShow = normalizedDistance > 48
+            if normalizedDistance < bottomPinnedDistanceThreshold {
+                shouldKeepBottomPinned = true
+            } else if isUserInteracting, !isChatLayoutSettling {
+                shouldKeepBottomPinned = false
+            }
+
+            let shouldShow = normalizedDistance > scrollToBottomButtonRevealDistance && !shouldKeepBottomPinned
             if showScrollToBottom != shouldShow {
                 withAnimation(.easeInOut(duration: 0.18)) {
                     showScrollToBottom = shouldShow
@@ -207,6 +231,12 @@ extension ChatView {
         }
     }
 
+    func handleContinuationExpansionStateChange(_ state: ConversationContinuationExpansionState) {
+        guard state.isExpanded else { return }
+        // 主动展开会改变滚动内容高度，不应继续把当前位置视为“锁定底部”。
+        shouldKeepBottomPinned = false
+    }
+
     func handleChatInputBarHeightChange(_ newHeight: CGFloat) {
         let heightDelta = abs(newHeight - chatInputBarHeight)
         guard heightDelta > 0.5 else {
@@ -214,7 +244,7 @@ extension ChatView {
             return
         }
 
-        let keepBottomPinned = scrollDistanceToBottom < 120
+        let keepBottomPinned = shouldKeepBottomPinned || scrollDistanceToBottom < bottomPinnedDistanceThreshold
         chatInputBarHeight = newHeight
         beginChatLayoutSettling(keepBottomPinned: keepBottomPinned)
     }
@@ -224,6 +254,7 @@ extension ChatView {
         isChatLayoutSettling = true
 
         if keepBottomPinned {
+            shouldKeepBottomPinned = true
             scrollToBottom(animated: false)
         }
 

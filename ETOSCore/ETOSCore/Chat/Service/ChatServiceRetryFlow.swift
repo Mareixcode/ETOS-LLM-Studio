@@ -67,10 +67,20 @@ extension ChatService {
         }
         registerRetryAchievementAttempt(sessionID: currentSession.id, content: messageToSend.content)
         let shouldContinueFromTail = isTailContinuationRetryTarget(message, in: messages)
+        let shouldRetryAsImageGeneration = shouldRetryMessageAsImageGeneration()
 
         // 【重要】必须先取消旧请求，再创建新的会话级请求上下文
         // 否则取消流程会把刚创建的请求上下文提前清理
         await cancelOngoingRequest()
+
+        if shouldRetryAsImageGeneration {
+            await retryImageGenerationMessage(
+                messages: messages,
+                anchorUserIndex: anchorUserIndex,
+                currentSession: currentSession
+            )
+            return
+        }
 
         var updatedMessages = messages
         let retryRequestedAt = Date()
@@ -137,6 +147,10 @@ extension ChatService {
             logger.info("重试时恢复音频附件: \(audioFileName)")
         }
 
+        let imageAttachments = (messageToSend.imageFileNames ?? []).compactMap { fileName in
+            loadImageAttachmentFromStorage(fileName: fileName)
+        }
+
         // 恢复原消息的文件附件（如果有）
         var fileAttachments: [FileAttachment] = []
         if let fileFileNames = messageToSend.fileFileNames {
@@ -169,6 +183,7 @@ extension ChatService {
             periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
             enableResponseSpeedMetrics: enableResponseSpeedMetrics,
             currentAudioAttachment: audioAttachment,
+            currentImageAttachments: imageAttachments,
             currentFileAttachments: fileAttachments
         )
     }
@@ -194,6 +209,7 @@ extension ChatService {
         periodicTimeLandmarkIntervalMinutes: Int,
         enableResponseSpeedMetrics: Bool,
         currentAudioAttachment: AudioAttachment?,
+        currentImageAttachments: [ImageAttachment],
         currentFileAttachments: [FileAttachment]
     ) async {
         emitSessionRequestStatus(.started, sessionID: currentSession.id)
@@ -240,6 +256,7 @@ extension ChatService {
                 periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
                 enableResponseSpeedMetrics: enableResponseSpeedMetrics,
                 currentAudioAttachment: currentAudioAttachment,
+                currentImageAttachments: currentImageAttachments,
                 currentFileAttachments: currentFileAttachments
             )
         }
@@ -259,6 +276,166 @@ extension ChatService {
                 logger.info("请求已被用户取消 (URLError)，将等待后续动作。")
             } else {
                 logger.error("请求执行过程中出现未预期错误: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func shouldRetryMessageAsImageGeneration() -> Bool {
+        guard let runnableModel = selectedModelSubject.value else { return false }
+        return shouldRouteMessageToImageGeneration(using: runnableModel)
+    }
+
+    private func retryImageGenerationMessage(
+        messages: [ChatMessage],
+        anchorUserIndex: Int,
+        currentSession: ChatSession
+    ) async {
+        guard let runnableModel = selectedModelSubject.value else {
+            addErrorMessage(
+                NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
+                sessionID: currentSession.id
+            )
+            emitSessionRequestStatus(.error, sessionID: currentSession.id)
+            return
+        }
+
+        guard shouldRouteMessageToImageGeneration(using: runnableModel) else {
+            let reason = NSLocalizedString("当前模型不可用于独立生图，请在模型设置中将模型类型设为图像。", comment: "模型不是图像类型提示")
+            addErrorMessage(reason, sessionID: currentSession.id)
+            emitSessionRequestStatus(.error, sessionID: currentSession.id)
+            return
+        }
+
+        guard let adapter = adapters[runnableModel.provider.apiFormat] else {
+            let reason = String(
+                format: NSLocalizedString("错误: 找不到适用于 '%@' 格式的 API 适配器。", comment: "Missing API adapter error"),
+                runnableModel.provider.apiFormat
+            )
+            addErrorMessage(reason, sessionID: currentSession.id)
+            emitSessionRequestStatus(.error, sessionID: currentSession.id)
+            return
+        }
+
+        let originalPrompt = messages[anchorUserIndex].content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !originalPrompt.isEmpty else {
+            let reason = NSLocalizedString("错误: 生图提示词不能为空。", comment: "Image generation prompt empty")
+            addErrorMessage(reason, sessionID: currentSession.id)
+            emitSessionRequestStatus(.error, sessionID: currentSession.id)
+            return
+        }
+
+        var updatedMessages = messages
+        let responseAttempt = prepareRetryAttemptMetadata(
+            in: &updatedMessages,
+            anchorUserIndex: anchorUserIndex
+        )
+        let retryRequestedAt = Date()
+        let loadingMessage = ChatMessage(
+            role: .assistant,
+            content: "",
+            requestedAt: retryRequestedAt,
+            responseGroupID: responseAttempt.groupID,
+            responseAttemptID: responseAttempt.attemptID,
+            responseAttemptIndex: responseAttempt.attemptIndex,
+            selectedResponseAttemptID: responseAttempt.attemptID
+        )
+        let insertionIndex = responseRoundEndIndex(in: updatedMessages, anchorUserIndex: anchorUserIndex)
+        updatedMessages.insert(loadingMessage, at: insertionIndex)
+        let messageToSend = updatedMessages[anchorUserIndex]
+        retryTargetMessageID = nil
+        retryTargetOriginalAssistantMessage = nil
+
+        persistAndPublishMessages(updatedMessages, for: currentSession.id)
+
+        let prompt = messageToSend.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let explicitReferenceImages = (messageToSend.imageFileNames ?? []).compactMap { fileName in
+            let attachment = loadImageAttachmentFromStorage(fileName: fileName)
+            if attachment != nil {
+                logger.info("重试生图时恢复参考图: \(fileName)")
+            }
+            return attachment
+        }
+        let referenceImages: [ImageAttachment]
+        if explicitReferenceImages.isEmpty, runnableModel.model.supportsVisionInput {
+            referenceImages = latestAssistantImageReference(
+                in: Array(messages[..<anchorUserIndex])
+            ).map { [$0] } ?? []
+        } else {
+            referenceImages = explicitReferenceImages
+        }
+
+        emitSessionRequestStatus(.started, sessionID: currentSession.id)
+        imageGenerationStatusSubject.send(
+            .started(
+                sessionID: currentSession.id,
+                loadingMessageID: loadingMessage.id,
+                prompt: prompt,
+                startedAt: Date(),
+                referenceCount: referenceImages.count
+            )
+        )
+
+        let requestToken = UUID()
+        setRequestContext(
+            RequestExecutionContext(
+                token: requestToken,
+                task: nil,
+                loadingMessageID: loadingMessage.id,
+                imageGenerationContext: ImageGenerationContext(
+                    sessionID: currentSession.id,
+                    loadingMessageID: loadingMessage.id,
+                    prompt: prompt
+                )
+            ),
+            for: currentSession.id
+        )
+
+        let requestTask = Task<Void, Error> { [weak self] in
+            guard let self else { return }
+            let modelReference = MessageModelReference(
+                providerID: runnableModel.provider.id,
+                providerName: runnableModel.provider.name,
+                modelUUID: runnableModel.model.id,
+                modelName: runnableModel.model.modelName,
+                modelDisplayName: runnableModel.model.displayName
+            )
+            let requestLogContext = RequestLogContext(
+                requestID: UUID(),
+                sessionID: currentSession.id,
+                providerID: runnableModel.provider.id,
+                providerName: runnableModel.provider.name,
+                modelID: runnableModel.model.modelName,
+                requestSource: .imageGeneration,
+                isStreaming: false,
+                requestedAt: Date(),
+                modelReference: modelReference,
+                modelPricing: runnableModel.model.pricing
+            )
+            await self.executeImageGenerationRequest(
+                adapter: adapter,
+                runnableModel: runnableModel,
+                prompt: prompt,
+                referenceImages: referenceImages,
+                loadingMessageID: loadingMessage.id,
+                currentSessionID: currentSession.id,
+                requestLogContext: requestLogContext
+            )
+        }
+        updateRequestTask(requestTask, for: currentSession.id, token: requestToken)
+
+        defer {
+            clearRequestContextIfNeeded(for: currentSession.id, token: requestToken)
+        }
+
+        do {
+            try await requestTask.value
+        } catch is CancellationError {
+            logger.info("生图重试请求已被用户取消。")
+        } catch {
+            if isCancellationError(error) {
+                logger.info("生图重试请求已被用户取消 (URLError)。")
+            } else {
+                logger.error("生图重试请求执行过程中出现未预期错误: \(error.localizedDescription)")
             }
         }
     }

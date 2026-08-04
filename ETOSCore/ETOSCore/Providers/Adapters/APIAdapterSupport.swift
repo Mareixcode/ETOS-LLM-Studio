@@ -71,6 +71,79 @@ func resolvedRequestModelName(for model: RunnableModel, overrides: [String: Any]
     return model.model.modelName
 }
 
+// 让高级自定义 Body 和适配器生成字段共存；数组拼接用于保留双方工具声明。
+func mergedRequestPayload(_ base: [String: Any], with overlay: [String: Any]) -> [String: Any] {
+    var result = base
+    for (key, overlayValue) in overlay {
+        if let baseDictionary = result[key] as? [String: Any],
+           let overlayDictionary = overlayValue as? [String: Any] {
+            result[key] = mergedRequestPayload(baseDictionary, with: overlayDictionary)
+        } else if let baseArray = result[key] as? [Any],
+                  let overlayArray = overlayValue as? [Any] {
+            result[key] = baseArray + overlayArray
+        } else {
+            result[key] = overlayValue
+        }
+    }
+    return result
+}
+
+func stableToolDefinitions(
+    _ tools: [InternalToolDefinition],
+    sanitizedName: (String) -> String
+) -> [InternalToolDefinition] {
+    tools.sorted { lhs, rhs in
+        let lhsFields = stableToolSortFields(for: lhs, sanitizedName: sanitizedName)
+        let rhsFields = stableToolSortFields(for: rhs, sanitizedName: sanitizedName)
+        for index in lhsFields.indices {
+            guard lhsFields[index] != rhsFields[index] else { continue }
+            return lhsFields[index] < rhsFields[index]
+        }
+        return false
+    }
+}
+
+private func stableToolSortFields(
+    for tool: InternalToolDefinition,
+    sanitizedName: (String) -> String
+) -> [String] {
+    let sanitizedToolName = sanitizedName(tool.name)
+    return [
+        sanitizedToolName.lowercased(),
+        sanitizedToolName,
+        tool.name.lowercased(),
+        tool.name,
+        tool.description,
+        tool.parameters.prettyPrintedCompact(),
+        tool.isBlocking ? "1" : "0"
+    ]
+}
+
+func stableJSONSchemaRequiredArray(_ required: [Any]) -> [Any] {
+    let stringValues = required.compactMap { $0 as? String }
+    guard stringValues.count == required.count else { return required }
+    return stringValues.sorted()
+}
+
+func stableJSONSchemaValueForTransport(_ value: Any) -> Any {
+    if let dictionary = value as? [String: Any] {
+        var stable: [String: Any] = [:]
+        stable.reserveCapacity(dictionary.count)
+        for (key, rawValue) in dictionary {
+            if key == "required", let required = rawValue as? [Any] {
+                stable[key] = stableJSONSchemaRequiredArray(required)
+            } else {
+                stable[key] = stableJSONSchemaValueForTransport(rawValue)
+            }
+        }
+        return stable
+    }
+    if let array = value as? [Any] {
+        return array.map { stableJSONSchemaValueForTransport($0) }
+    }
+    return value
+}
+
 func inferredImageMimeType(from data: Data) -> String {
     guard data.count >= 12 else { return "image/png" }
     let bytes = [UInt8](data.prefix(12))
@@ -96,32 +169,57 @@ func logChatRequestSnapshot(
     request: URLRequest,
     payload: [String: Any]
 ) {
-    var detailPayload: [String: String] = [
-        NSLocalizedString("适配器", comment: "App log payload key"): adapterName,
-        NSLocalizedString("方法", comment: "App log payload key"): request.httpMethod ?? "POST",
-        NSLocalizedString("地址", comment: "App log payload key"): AppLogRedactor.sanitizeURLForLog(request.url),
-        NSLocalizedString("请求体字节数", comment: "App log payload key"): "\(request.httpBody?.count ?? 0)"
-    ]
+    guard AppConfigStore.boolValue(for: .requestLogEnabled) else { return }
 
-    if let headers = AppLogRedactor.sanitizeHeadersForLog(request.allHTTPHeaderFields) {
-        detailPayload[NSLocalizedString("请求头", comment: "App log payload key")] = headers
-    }
     let exposesMessageFields = AppConfigStore.boolValue(for: .requestLogPlainMessageEnabled)
-    if let body = AppLogRedactor.sanitizeRequestBodyForLog(payload, exposesMessageFields: exposesMessageFields) {
-        let bodyKey = exposesMessageFields
-            ? NSLocalizedString("请求体(含明文消息)", comment: "App log payload key")
-            : NSLocalizedString("请求体(不含消息字段)", comment: "App log payload key")
-        detailPayload[bodyKey] = body
+    let body = AppLogRedactor.sanitizeRequestBodyForLog(
+        payload,
+        exposesMessageFields: exposesMessageFields
+    ) ?? NSLocalizedString("[无法序列化]", comment: "App log payload value")
+    RequestTransactionLogRegistry.stageRequest(
+        adapter: adapterName,
+        request: request,
+        sanitizedBody: body,
+        sanitizedHeaders: AppLogRedactor.sanitizeHeadersForLog(request.allHTTPHeaderFields)
+    )
+}
+
+func logImageGenerationRequestSnapshot(
+    adapterName: String,
+    request: URLRequest,
+    payload: [String: Any]? = nil,
+    prompt: String? = nil,
+    referenceImageCount: Int = 0
+) {
+    guard AppConfigStore.boolValue(for: .requestLogEnabled) else { return }
+
+    let exposesMessageFields = AppConfigStore.boolValue(for: .requestLogPlainMessageEnabled)
+    let body: String
+    if let payload {
+        body = AppLogRedactor.sanitizeRequestBodyForLog(
+            payload,
+            exposesMessageFields: exposesMessageFields
+        ) ?? NSLocalizedString("[无法序列化]", comment: "App log payload value")
+    } else if let prompt {
+        body = AppLogRedactor.sanitizeRequestBodyForLog(
+            [
+                "prompt": prompt,
+                "reference_image_count": referenceImageCount
+            ],
+            exposesMessageFields: exposesMessageFields
+        ) ?? NSLocalizedString("[无法序列化]", comment: "App log payload value")
     } else {
-        detailPayload[NSLocalizedString("请求体(不含消息字段)", comment: "App log payload key")] = NSLocalizedString("[无法序列化]", comment: "App log payload value")
+        body = AppLogRedactor.sanitizeRequestBodyForLog(
+            ["reference_image_count": referenceImageCount],
+            exposesMessageFields: exposesMessageFields
+        ) ?? NSLocalizedString("[无法序列化]", comment: "App log payload value")
     }
 
-    AppLog.developer(
-        level: .debug,
-        category: NSLocalizedString("请求", comment: "App log category"),
-        action: String(format: NSLocalizedString("构建%@请求", comment: "App log action"), adapterName),
-        message: String(format: NSLocalizedString("%@ 请求体已生成", comment: "App log message"), adapterName),
-        payload: detailPayload
+    RequestTransactionLogRegistry.stageRequest(
+        adapter: adapterName,
+        request: request,
+        sanitizedBody: body,
+        sanitizedHeaders: AppLogRedactor.sanitizeHeadersForLog(request.allHTTPHeaderFields)
     )
 }
 
@@ -132,12 +230,14 @@ public struct ChatMessagePart {
         public var index: Int?
         public var nameFragment: String?
         public var argumentsFragment: String?
+        public var argumentsReplacement: String? = nil
         public var providerSpecificFields: [String: JSONValue]? = nil
     }
 
     public var content: String?
     public var reasoningContent: String?
     public var reasoningProviderSpecificFields: [String: JSONValue]?
+    public var providerResponseMetadata: [String: JSONValue]?
     public var toolCallDeltas: [ToolCallDelta]?
     public var tokenUsage: MessageTokenUsage?
 }

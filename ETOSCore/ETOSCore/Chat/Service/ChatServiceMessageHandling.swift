@@ -132,6 +132,7 @@ extension ChatService {
                                 $0
                             )
                         },
+                        sentSystemPromptSnapshot: loadingMessage.sentSystemPromptSnapshot,
                         responseGroupID: loadingMessage.responseGroupID,
                         responseAttemptID: loadingMessage.responseAttemptID,
                         responseAttemptIndex: loadingMessage.responseAttemptIndex,
@@ -141,31 +142,33 @@ extension ChatService {
 
                 retryTargetMessageID = nil
                 retryTargetOriginalAssistantMessage = nil
-                logger.error("重试失败，已根据输出情况保留或恢复 assistant，并追加错误气泡: \(content)")
+                // 系统日志只记录状态，完整错误正文仅保留在应用内消息中。
+                logger.error("重试失败，已根据输出情况保留或恢复 assistant，并追加错误气泡。")
             } else if shouldPreserveLoadingMessage {
                 messages.insert(makeErrorMessage(loadingMessage.requestedAt, metadata: loadingAttemptMetadata), at: loadingIndex + 1)
-                logger.error("流式内容已保留，并追加错误消息: \(content)")
+                logger.error("流式内容已保留，并追加错误消息。")
             } else {
                 // 正常场景：将 loading message 转为 error
                 messages[loadingIndex] = ChatMessage(
                     id: loadingMessage.id,
-                        role: .error,
-                        content: formattedContent,
-                        requestedAt: loadingMessage.requestedAt,
-                        modelReference: loadingMessage.modelReference,
-                        costEstimate: loadingMessage.costEstimate,
-                        fullErrorContent: fullContent,
-                        responseGroupID: loadingMessage.responseGroupID,
-                        responseAttemptID: loadingMessage.responseAttemptID,
-                        responseAttemptIndex: loadingMessage.responseAttemptIndex,
+                    role: .error,
+                    content: formattedContent,
+                    requestedAt: loadingMessage.requestedAt,
+                    modelReference: loadingMessage.modelReference,
+                    costEstimate: loadingMessage.costEstimate,
+                    fullErrorContent: fullContent,
+                    sentSystemPromptSnapshot: loadingMessage.sentSystemPromptSnapshot,
+                    responseGroupID: loadingMessage.responseGroupID,
+                    responseAttemptID: loadingMessage.responseAttemptID,
+                    responseAttemptIndex: loadingMessage.responseAttemptIndex,
                     selectedResponseAttemptID: loadingMessage.selectedResponseAttemptID ?? loadingMessage.responseAttemptID
                 )
-                logger.error("错误消息已添加: \(content)")
+                logger.error("错误消息已添加。")
             }
         } else {
             // 没有 loading message，直接添加错误
             messages.append(makeErrorMessage(nil))
-            logger.error("错误消息已添加: \(content)")
+            logger.error("错误消息已添加。")
         }
 
         persistAndPublishMessages(messages, for: resolvedSessionID)
@@ -283,7 +286,8 @@ extension ChatService {
         message.modelReference = message.modelReference ?? context.modelReference
         message.costEstimate = ModelCostCalculator.estimateCost(
             usage: message.tokenUsage,
-            pricing: context.modelPricing
+            pricing: context.modelPricing,
+            requestedAt: message.requestedAt ?? context.requestedAt
         )
     }
 
@@ -345,6 +349,15 @@ extension ChatService {
 
     /// 将最终确定的消息更新到消息列表中
     func updateMessage(with newMessage: ChatMessage, for loadingMessageID: UUID, in sessionID: UUID) {
+        let priorMessages = messagesSnapshot(for: sessionID)
+        _ = RoleplayRuntime.processMVU(
+            content: newMessage.content,
+            messageID: loadingMessageID,
+            versionIndex: priorMessages.first(where: { $0.id == loadingMessageID })?.getCurrentVersionIndex() ?? 0,
+            sessionID: sessionID,
+            previousMessages: priorMessages.filter { $0.id != loadingMessageID },
+            store: roleplayStore
+        )
         let messageRegexRules = MessageRegexRuleStore.currentRules()
         let newMessage = messageRegexRules.isEmpty
             ? newMessage
@@ -367,6 +380,9 @@ extension ChatService {
             }
             if let newReasoningFields = newMessage.reasoningProviderSpecificFields {
                 targetMessage.reasoningProviderSpecificFields = newReasoningFields
+            }
+            if let newProviderResponseMetadata = newMessage.providerResponseMetadata {
+                targetMessage.providerResponseMetadata = newProviderResponseMetadata
             }
             targetMessage.audioFileName = newMessage.audioFileName
             targetMessage.imageFileNames = newMessage.imageFileNames
@@ -424,6 +440,7 @@ extension ChatService {
                 requestedAt: messages[index].requestedAt ?? newMessage.requestedAt,
                 reasoningContent: newMessage.reasoningContent,
                 reasoningProviderSpecificFields: newMessage.reasoningProviderSpecificFields ?? messages[index].reasoningProviderSpecificFields,
+                providerResponseMetadata: newMessage.providerResponseMetadata ?? messages[index].providerResponseMetadata,
                 toolCalls: mergedToolCalls, // 确保 toolCalls 保持最新或沿用历史数据
                 toolCallsPlacement: newMessage.toolCallsPlacement ?? messages[index].toolCallsPlacement,
                 tokenUsage: newMessage.tokenUsage ?? messages[index].tokenUsage,
@@ -433,6 +450,7 @@ extension ChatService {
                 imageFileNames: newMessage.imageFileNames ?? messages[index].imageFileNames,
                 fileFileNames: newMessage.fileFileNames ?? messages[index].fileFileNames,
                 fullErrorContent: newMessage.fullErrorContent ?? messages[index].fullErrorContent,
+                sentSystemPromptSnapshot: newMessage.sentSystemPromptSnapshot ?? messages[index].sentSystemPromptSnapshot,
                 responseMetrics: newMessage.responseMetrics ?? messages[index].responseMetrics,
                 responseGroupID: newMessage.responseGroupID ?? messages[index].responseGroupID,
                 responseAttemptID: newMessage.responseAttemptID ?? messages[index].responseAttemptID,

@@ -28,6 +28,7 @@ struct ETOS_LLM_Studio_Watch_AppApp: App {
     
     init() {
         AppLanguageRuntime.applyConfiguredLanguage()
+        SyncTemporaryFileCleaner.cleanupResidualTemporaryDirectoriesInBackground()
         DailyPulseDeliveryCoordinator.shared.activate()
         FontLibrary.preloadRuntimeCacheAsync(forceReload: true)
         Task { @MainActor in
@@ -45,11 +46,16 @@ struct ETOS_LLM_Studio_Watch_AppApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(launchStateMachine)
                 .environmentObject(appConfig)
                 .environmentObject(syncManager)
                 .environmentObject(cloudSyncManager)
                 .onOpenURL { url in
                     Task {
+                        if NewAPIProviderImportURLHandler.canHandle(url) {
+                            _ = try? await NewAPIProviderImportURLHandler.importProvider(from: url)
+                            return
+                        }
                         _ = await ShortcutURLRouter.shared.handleIncomingURL(url)
                     }
                 }
@@ -65,6 +71,7 @@ struct ETOS_LLM_Studio_Watch_AppApp: App {
                 }
                 .task(id: launchStateMachine.phase) {
                     guard launchStateMachine.phase == .ready else { return }
+                    guard !Persistence.hasPendingLaunchRecoveryRequest() else { return }
                     // 启动持久化预热完成后再触发自动同步，避免冷启动阶段覆盖未加载完的会话状态。
                     syncManager.performAutoSyncIfEnabled()
                     cloudSyncManager.performAutoSyncIfEnabled()

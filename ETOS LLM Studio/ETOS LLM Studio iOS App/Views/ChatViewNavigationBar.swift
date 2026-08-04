@@ -27,24 +27,75 @@ extension ChatView {
 
             Spacer(minLength: 12)
 
-            Button {
-                navigationDestination = .settings
-            } label: {
-                navBarIconLabel(systemName: "gearshape", accessibilityLabel: "设置")
-            }
-            .buttonStyle(.plain)
+            navBarQuickActionButton
         }
         .padding(.horizontal, 16)
         .padding(.vertical, navBarVerticalPadding)
+        .opacity(isChatQuickActionFolderPresented ? 0 : 1)
+        .allowsHitTesting(!isChatQuickActionFolderPresented)
+        .accessibilityHidden(isChatQuickActionFolderPresented)
     }
 
+    @ViewBuilder
     var navBarSessionButton: some View {
-        Button {
-            presentSessionPicker()
-        } label: {
-            navBarSessionLabel
+        if isMessageSelectionMode {
+            Menu {
+                Button {
+                    exitMessageSelection()
+                } label: {
+                    Label(NSLocalizedString("退出多选", comment: "Exit message selection mode"), systemImage: "xmark.circle")
+                }
+
+                Button {
+                    invertMessageSelection()
+                } label: {
+                    Label(NSLocalizedString("反选", comment: "Invert message selection"), systemImage: "arrow.left.arrow.right.circle")
+                }
+
+                Button {
+                    isSelectedMessagesExportPresented = true
+                } label: {
+                    Label(NSLocalizedString("导出所选", comment: "Export selected messages"), systemImage: "square.and.arrow.up")
+                }
+                .disabled(selectedMessageIDs.isEmpty)
+
+                Button(role: .destructive) {
+                    showSelectedMessagesDeleteConfirm = true
+                } label: {
+                    Label(NSLocalizedString("删除所选", comment: "Delete selected messages"), systemImage: "trash")
+                }
+                .disabled(selectedMessageIDs.isEmpty)
+            } label: {
+                navBarMessageSelectionLabel
+            }
+            .buttonStyle(.plain)
+        } else {
+            Button {
+                presentSessionPicker()
+            } label: {
+                navBarSessionLabel
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
+    }
+
+    var navBarMessageSelectionLabel: some View {
+        Image(systemName: "ellipsis")
+            .etFont(.system(size: 17, weight: .semibold))
+            .foregroundColor(TelegramColors.navBarText)
+            .frame(width: navBarIconSize, height: navBarIconSize)
+            .background(navBarIconBackground)
+            .overlay(
+                Circle()
+                    .stroke(Color.red.opacity(0.7), lineWidth: 1)
+            )
+            .contentShape(Circle())
+            .accessibilityLabel(
+                String(
+                    format: NSLocalizedString("批量操作，已选择 %d 条消息", comment: "Selected messages batch menu accessibility label"),
+                    selectedMessageIDs.count
+                )
+            )
     }
 
     var navBarSessionLabel: some View {
@@ -76,7 +127,7 @@ extension ChatView {
                     .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
             )
             .contentShape(Circle())
-            .accessibilityLabel(NSLocalizedString(accessibilityLabel, comment: "导航栏图标无障碍标签"))
+            .accessibilityLabel(accessibilityLabel)
     }
 
     var navBarCenterPill: some View {
@@ -123,7 +174,7 @@ extension ChatView {
             if #available(iOS 26.0, *) {
                 Circle()
                     .fill(Color.clear)
-                    .glassEffect(.clear, in: Circle())
+                    .glassEffect(.clear.interactive(), in: Circle())
                     .overlay(
                         Circle()
                             .fill(navBarGlassOverlayColor)
@@ -148,7 +199,7 @@ extension ChatView {
             if #available(iOS 26.0, *) {
                 Capsule()
                     .fill(Color.clear)
-                    .glassEffect(.clear, in: Capsule())
+                    .glassEffect(.clear.interactive(), in: Capsule())
                     .overlay(
                         Capsule()
                             .fill(navBarGlassOverlayColor)
@@ -194,6 +245,8 @@ extension ChatView {
     }
 
     func presentModelPickerSheet() {
+        prepareSelectedModelPickerProvider()
+        modelPickerShowsAllModels = false
         activeChatPickerDetent = .medium
         activeChatPickerSheet = .model
     }
@@ -244,7 +297,21 @@ extension ChatView {
 
     func handleChatPickerSheetDismissed() {
         activeChatPickerDetent = .medium
+        quickModelSettingsTarget = nil
+        isQuickPromptEditorPresented = false
+        isQuickWorldbookBindingPresented = false
+        modelPickerShowsAllModels = false
         resetSessionPickerSearchState()
+        if let pendingSession = pendingContextCompressionSourceSession {
+            pendingContextCompressionSourceSession = nil
+            DispatchQueue.main.async {
+                contextCompressionSourceSession = pendingSession
+            }
+        }
+        if let destination = chatPickerDismissDestination {
+            chatPickerDismissDestination = nil
+            navigationDestination = destination
+        }
     }
 
     func handleChatLayoutChange(isLandscape: Bool) {

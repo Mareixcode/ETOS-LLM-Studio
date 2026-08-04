@@ -9,7 +9,6 @@
 import SwiftUI
 import Foundation
 import ETOSCore
-import UIKit
 
 struct MessageActionSheet: View {
     let payload: MessageActionSheetPayload
@@ -26,26 +25,39 @@ struct MessageActionSheet: View {
     let onRetry: (ChatMessage) -> Void
     let onShowFullError: (String) -> Void
     let onBranch: (ChatMessage) -> Void
-    let onExport: (ChatTranscriptExportFormat, Bool, ChatMessage?) -> Void
+    let onExport: (ChatTranscriptExportFormat, Bool, Bool, ChatMessage?) -> Void
     let onSpeak: (ChatMessage) -> Void
     let onSwitchVersion: (Int, ChatMessage) -> Void
     let onDeleteVersion: (ChatMessage, Int) -> Void
     let onDelete: (ChatMessage) -> Void
     let onDownloadImages: ([String]) -> Void
-    let onCopy: (ChatMessage) -> Void
+    let onRetryVideoAnalysis: (ChatMessage, String) async throws -> VideoAnalysisResult
+    let onAskAI: (String, ChatMessage) -> Void
+    let onRewriteSelection: (MessageRewriteSelectionTarget, ChatMessage) -> Void
+    let onSelectMultiple: (ChatMessage) -> Void
     let onJumpToMessage: (Int) -> Bool
 
     @Environment(\.dismiss) private var dismiss
     @State private var includeReasoning = true
+    @State private var includeSystemPrompt = true
     @State private var jumpInput: String = ""
     @State private var jumpError: String?
+    @State private var videoAnalysisOverrides: [String: VideoAnalysisResult] = [:]
+    @State private var retryingVideoFileNames: Set<String> = []
+    @State private var videoAnalysisErrorMessage: String?
 
     private var message: ChatMessage {
         payload.message
     }
 
     private var hasAttachments: Bool {
-        message.audioFileName != nil || (message.imageFileNames?.isEmpty == false)
+        message.audioFileName != nil
+            || (message.imageFileNames?.isEmpty == false)
+            || (message.fileFileNames?.isEmpty == false)
+    }
+
+    private var videoFileNames: [String] {
+        (message.fileFileNames ?? []).filter { VideoAttachmentSupport.isVideo(fileName: $0) }
     }
 
     private var messageIndex: Int? {
@@ -77,12 +89,6 @@ struct MessageActionSheet: View {
         NavigationStack {
             List {
                 Section {
-                    Button {
-                        onCopy(message)
-                    } label: {
-                        Label(NSLocalizedString("复制内容", comment: ""), systemImage: "doc.on.doc")
-                    }
-
                     if let imageFileNames = message.imageFileNames, !imageFileNames.isEmpty {
                         Button {
                             onDownloadImages(imageFileNames)
@@ -139,6 +145,28 @@ struct MessageActionSheet: View {
                             )
                         }
                     }
+
+                    NavigationLink {
+                        MessageTextSelectionView(
+                            message: message,
+                            onRewriteSelection: canRewrite ? { target in
+                                onRewriteSelection(target, message)
+                            } : nil
+                        ) { selectedText in
+                            onAskAI(selectedText, message)
+                        }
+                    } label: {
+                        Label(
+                            NSLocalizedString("选定文字", comment: "Open message text selection"),
+                            systemImage: "character.cursor.ibeam"
+                        )
+                    }
+
+                    Button {
+                        onSelectMultiple(message)
+                    } label: {
+                        Label(NSLocalizedString("多选", comment: "Enter message selection mode"), systemImage: "checkmark.circle")
+                    }
                 }
 
                 Section {
@@ -174,10 +202,13 @@ struct MessageActionSheet: View {
                     }
                 }
 
+                videoAnalysisSections
                 messageSupplementarySections
                 exportSection
                 messageInfoSection
             }
+            .scrollContentBackground(.hidden)
+            .background(Color.clear)
             .navigationTitle(NSLocalizedString("消息操作", comment: ""))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -188,18 +219,87 @@ struct MessageActionSheet: View {
                 }
             }
         }
+        .alert(NSLocalizedString("视频解析失败", comment: "Video analysis failure alert title"), isPresented: Binding(
+            get: { videoAnalysisErrorMessage != nil },
+            set: { if !$0 { videoAnalysisErrorMessage = nil } }
+        )) {
+            Button(NSLocalizedString("确定", comment: ""), role: .cancel) {
+                videoAnalysisErrorMessage = nil
+            }
+        } message: {
+            Text(videoAnalysisErrorMessage ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private var videoAnalysisSections: some View {
+        ForEach(videoFileNames, id: \.self) { fileName in
+            Section {
+                if let result = resolvedVideoAnalysis(for: fileName) {
+                    NavigationLink {
+                        VideoAnalysisDetailView(result: result)
+                    } label: {
+                        Label(NSLocalizedString("查看视频解析", comment: "View video analysis action"), systemImage: "doc.text.magnifyingglass")
+                    }
+                } else {
+                    Label(NSLocalizedString("暂无视频解析结果", comment: "No video analysis result"), systemImage: "doc.text")
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    retryVideoAnalysis(fileName: fileName)
+                } label: {
+                    if retryingVideoFileNames.contains(fileName) {
+                        HStack {
+                            ProgressView()
+                            Text(NSLocalizedString("正在重新解析视频…", comment: "Retrying video analysis progress"))
+                        }
+                    } else {
+                        Label(NSLocalizedString("重新解析视频", comment: "Retry video analysis action"), systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(retryingVideoFileNames.contains(fileName))
+            } header: {
+                Text(fileName)
+            } footer: {
+                Text(NSLocalizedString("重新解析会替换已保存的结果，之后发送和压缩上下文都会使用新内容。", comment: "Video analysis retry footer"))
+            }
+        }
+    }
+
+    private func resolvedVideoAnalysis(for fileName: String) -> VideoAnalysisResult? {
+        videoAnalysisOverrides[fileName] ?? message.videoAnalysisResult(for: fileName)
+    }
+
+    private func retryVideoAnalysis(fileName: String) {
+        retryingVideoFileNames.insert(fileName)
+        Task { @MainActor in
+            defer { retryingVideoFileNames.remove(fileName) }
+            do {
+                videoAnalysisOverrides[fileName] = try await onRetryVideoAnalysis(message, fileName)
+            } catch is CancellationError {
+            } catch {
+                videoAnalysisErrorMessage = error.localizedDescription
+            }
+        }
     }
 
     @ViewBuilder
     private var exportSection: some View {
-        Section(NSLocalizedString("导出", comment: "")) {
+        Section {
             Toggle(NSLocalizedString("包含思考", comment: ""), isOn: $includeReasoning)
+            Toggle(NSLocalizedString("包含系统提示词", comment: ""), isOn: $includeSystemPrompt)
 
             ForEach(MessageActionExportScope.allCases) { scope in
                 Menu {
                     ForEach(ChatTranscriptExportFormat.allCases, id: \.self) { format in
                         Button {
-                            onExport(format, includeReasoning, scope == .upToMessage ? message : nil)
+                            onExport(
+                                format,
+                                includeReasoning,
+                                includeSystemPrompt,
+                                scope == .upToMessage ? message : nil
+                            )
                         } label: {
                             Label(format.displayName, systemImage: iconName(for: format))
                         }
@@ -211,6 +311,10 @@ struct MessageActionSheet: View {
                     )
                 }
             }
+        } header: {
+            Text(NSLocalizedString("导出", comment: ""))
+        } footer: {
+            Text(NSLocalizedString("PNG 仅导出聊天界面可见内容，不会包含系统提示词。", comment: "Chat image export system prompt privacy note"))
         }
     }
 
@@ -230,6 +334,21 @@ struct MessageActionSheet: View {
                             totalMessageCount
                         )
                     )
+                }
+            }
+
+            if let modelReference = message.modelReference {
+                LabeledContent(NSLocalizedString("提供商", comment: "")) {
+                    Text(modelReference.providerName)
+                        .textSelection(.enabled)
+                }
+                LabeledContent(NSLocalizedString("模型名称", comment: "")) {
+                    Text(modelReference.modelDisplayName)
+                        .textSelection(.enabled)
+                }
+                LabeledContent(NSLocalizedString("模型ID", comment: "")) {
+                    Text(modelReference.modelName)
+                        .textSelection(.enabled)
                 }
             }
 
@@ -449,7 +568,32 @@ struct MessageActionSheet: View {
             return "number.square"
         case .text:
             return "doc.plaintext"
+        case .png:
+            return "photo"
         }
+    }
+}
+
+struct VideoAnalysisDetailView: View {
+    let result: VideoAnalysisResult
+
+    var body: some View {
+        List {
+            Section(NSLocalizedString("视频", comment: "Video analysis detail video section")) {
+                LabeledContent(NSLocalizedString("文件名", comment: ""), value: result.fileName)
+                LabeledContent(NSLocalizedString("解析模型", comment: "Video analysis model detail"), value: result.modelDisplayName)
+                LabeledContent(NSLocalizedString("解析时间", comment: "Video analysis date detail")) {
+                    Text(result.generatedAt.formatted(date: .abbreviated, time: .shortened))
+                }
+            }
+
+            Section(NSLocalizedString("解析文字", comment: "Video analysis text section")) {
+                Text(result.content)
+                    .textSelection(.enabled)
+            }
+        }
+        .navigationTitle(NSLocalizedString("视频解析", comment: "Video analysis detail title"))
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -540,11 +684,12 @@ struct SessionPickerRow: View {
     let onSelect: () -> Void
     let onRename: () -> Void
     let onBranch: (Bool) -> Void
+    let onCompress: () -> Void
     let onDeleteLastMessage: () -> Void
     let onDelete: () -> Void
     let onCancelRename: () -> Void
     let onInfo: () -> Void
-    let onExport: (ChatTranscriptExportFormat, Bool) -> Void
+    let onExport: (ChatTranscriptExportFormat, Bool, Bool) -> Void
 
     @FocusState private var focused: Bool
 
@@ -625,6 +770,13 @@ struct SessionPickerRow: View {
         }
 
         Button {
+            onCompress()
+        } label: {
+            Label(NSLocalizedString("压缩为续聊", comment: "Context compression session action"), systemImage: "rectangle.compress.vertical")
+        }
+        .disabled(session.isTemporary)
+
+        Button {
             onDeleteLastMessage()
         } label: {
             Label(NSLocalizedString("删除最后一条消息", comment: ""), systemImage: "delete.backward")
@@ -637,40 +789,8 @@ struct SessionPickerRow: View {
         }
 
         Menu {
-            Menu(NSLocalizedString("包含思考", comment: "")) {
-                Button {
-                    onExport(.pdf, true)
-                } label: {
-                    Label(NSLocalizedString("PDF", comment: "Export format"), systemImage: "doc.richtext")
-                }
-                Button {
-                    onExport(.markdown, true)
-                } label: {
-                    Label(NSLocalizedString("Markdown", comment: "Export format"), systemImage: "number.square")
-                }
-                Button {
-                    onExport(.text, true)
-                } label: {
-                    Label(NSLocalizedString("TXT", comment: "Export format"), systemImage: "doc.plaintext")
-                }
-            }
-            Menu(NSLocalizedString("不包含思考", comment: "")) {
-                Button {
-                    onExport(.pdf, false)
-                } label: {
-                    Label(NSLocalizedString("PDF", comment: "Export format"), systemImage: "doc.richtext")
-                }
-                Button {
-                    onExport(.markdown, false)
-                } label: {
-                    Label(NSLocalizedString("Markdown", comment: "Export format"), systemImage: "number.square")
-                }
-                Button {
-                    onExport(.text, false)
-                } label: {
-                    Label(NSLocalizedString("TXT", comment: "Export format"), systemImage: "doc.plaintext")
-                }
-            }
+            sessionExportReasoningMenu(includeReasoning: true)
+            sessionExportReasoningMenu(includeReasoning: false)
         } label: {
             Label(NSLocalizedString("导出会话", comment: ""), systemImage: "square.and.arrow.up")
         }
@@ -679,6 +799,49 @@ struct SessionPickerRow: View {
             onDelete()
         } label: {
             Label(NSLocalizedString("删除会话", comment: ""), systemImage: "trash")
+        }
+    }
+
+    @ViewBuilder
+    private func sessionExportReasoningMenu(includeReasoning: Bool) -> some View {
+        Menu(includeReasoning
+            ? NSLocalizedString("包含思考", comment: "")
+            : NSLocalizedString("不包含思考", comment: "")) {
+            Menu(NSLocalizedString("包含系统提示词", comment: "")) {
+                sessionTextExportButtons(includeReasoning: includeReasoning, includeSystemPrompt: true)
+            }
+            Menu(NSLocalizedString("不包含系统提示词", comment: "")) {
+                sessionTextExportButtons(includeReasoning: includeReasoning, includeSystemPrompt: false)
+            }
+            Button {
+                onExport(.png, includeReasoning, false)
+            } label: {
+                Label(NSLocalizedString("PNG", comment: "Export format"), systemImage: "photo")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sessionTextExportButtons(includeReasoning: Bool, includeSystemPrompt: Bool) -> some View {
+        ForEach([ChatTranscriptExportFormat.pdf, .markdown, .text], id: \.self) { format in
+            Button {
+                onExport(format, includeReasoning, includeSystemPrompt)
+            } label: {
+                Label(format.displayName, systemImage: sessionExportIconName(for: format))
+            }
+        }
+    }
+
+    private func sessionExportIconName(for format: ChatTranscriptExportFormat) -> String {
+        switch format {
+        case .pdf:
+            return "doc.richtext"
+        case .markdown:
+            return "number.square"
+        case .text:
+            return "doc.plaintext"
+        case .png:
+            return "photo"
         }
     }
 

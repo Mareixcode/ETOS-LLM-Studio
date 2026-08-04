@@ -6,14 +6,18 @@
 
 import SwiftUI
 import Foundation
+import Combine
 import ETOSCore
 
 struct ContentView: View {
     @Environment(\.scenePhase) var scenePhase
 
     @Environment(\.colorScheme) var colorScheme
+    @Environment(\.accessibilityReduceMotion) var accessibilityReduceMotion
+    @EnvironmentObject var launchStateMachine: AppLaunchStateMachine
     @StateObject var viewModel = ChatViewModel()
     @StateObject var announcementManager = AnnouncementManager.shared
+    @StateObject var surveyManager = SurveyManager.shared
     @StateObject var legacyJSONMigrationManager = LegacyJSONMigrationManager.shared
     @ObservedObject var notificationCenter = AppLocalNotificationCenter.shared
     @ObservedObject var appConfig = AppConfigStore.shared
@@ -27,6 +31,11 @@ struct ContentView: View {
     @State var isSessionListPresented = false
     @State var messageActionsTarget: WatchMessageActionsNavigationTarget?
     @State var messageRewriteTarget: WatchMessageRewriteNavigationTarget?
+    @State var isMessageSelectionMode = false
+    @State var selectedMessageIDs: Set<UUID> = []
+    @State var selectedMessagesExportTarget: WatchSelectedMessagesExportNavigationTarget?
+    @State var showMessageSelectionActions = false
+    @State var showSelectedMessagesDeleteConfirm = false
     @State var dailyPulsePreparationTask: Task<Void, Never>?
     @State var shouldForceScrollToBottom = false
     @State var shouldKeepBottomPinned = true
@@ -40,12 +49,26 @@ struct ContentView: View {
     @State var shouldRestorePendingJumpOnAppear = false
     @State var pendingJumpRequest: MessageJumpRequest?
     @State var launchRecoveryNoticeMessage: String?
+    @State var launchRecoveryRequest: Persistence.LaunchRecoveryRequest?
+    @State var launchRecoveryErrorMessage: String?
     @State var rootBodyFont: Font = .body
     @State var legacyMigrationErrorMessage: String?
+    @State var didEnterBackgroundSinceLastActivation = false
     @State var isRequestControlsPresented = false
     @State var isAttachmentImportPresented = false
     @State var attachmentSourceText: String = ""
     @State var importSourceHistory: [String] = []
+    @State var presentedAskUserInputRequest: AppToolAskUserInputRequest?
+    @State var continuationContext: ConversationContinuationContext?
+    @State var outgoingContinuationContextsByMessageID: [UUID: [ConversationContinuationContext]] = [:]
+    @State var unanchoredOutgoingContinuationContexts: [ConversationContinuationContext] = []
+    @State var continuationSessionNamesByID: [UUID: String] = [:]
+    @State var isContextCompressionPresented = false
+    @State var watchInputQuickActionDestination: WatchInputQuickAction?
+    @State var contextCompressionReminderSourceSession: ChatSession?
+    @State var contextCompressionReminderNotificationKeys: Set<WatchContextCompressionReminderNotificationKey> = []
+    @State var chatTransientNotice: WatchChatTransientNotice?
+    @State var chatTransientNoticeDismissTask: Task<Void, Never>?
 
     var effectiveFontScale: CGFloat {
         CGFloat(FontLibrary.effectiveFontScale(appConfig.fontCustomScale, isCustomFontEnabled: appConfig.fontUseCustomFonts))
@@ -58,6 +81,8 @@ struct ContentView: View {
     let inputBubbleVerticalPadding: CGFloat = 8
     let emptyStateSpacerHeight: CGFloat = 120
     let bottomAnchorID = "inputBubble"
+    let watchBottomPinnedDistanceThreshold: CGFloat = 24
+    let watchScrollToBottomButtonRevealDistance: CGFloat = 48
 
     var isLiquidGlassEnabled: Bool {
         if #available(watchOS 26.0, *) {
@@ -83,6 +108,9 @@ struct ContentView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .requestOpenChatSession)) { _ in
                 openChatSessionFromNotification()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .requestContextCompression)) { _ in
+                openContextCompressionFromNotification()
             }
             .onReceive(NotificationCenter.default.publisher(for: .requestOpenAchievementJournal)) { _ in
                 openAchievementJournalFromNotification()
@@ -112,6 +140,18 @@ struct ContentView: View {
                 .zIndex(20)
             }
 
+            if let notice = chatTransientNotice {
+                VStack {
+                    Spacer()
+                    chatTransientNoticeBanner(notice)
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, inputControlHeight + 16)
+                }
+                .allowsHitTesting(false)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(24)
+            }
+
             VStack {
                 Spacer()
                 TTSFloatingController()
@@ -121,6 +161,13 @@ struct ContentView: View {
                 AppLockOverlayView()
                     .zIndex(1_000)
             }
+
+            if launchStateMachine.phase == .waitingForDatabaseUnlock {
+                DatabaseUnlockOverlayView {
+                    handleDatabaseUnlocked()
+                }
+                .zIndex(2_000)
+            }
         }
         .environment(\.font, rootBodyFont)
         .environment(\.locale, AppLanguagePreference.preferredLocale(rawValue: appConfig.appLanguage))
@@ -129,12 +176,18 @@ struct ContentView: View {
             refreshRootBodyFont()
             refreshAttachmentSourceHistory()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .syncFontsUpdated)) { _ in
+        .onReceive(
+            NotificationCenter.default.publisher(for: .syncFontsUpdated)
+                .receive(on: DispatchQueue.main)
+        ) { _ in
             refreshRootBodyFont()
         }
         .onChange(of: appConfig.fontUseCustomFonts) { _, isEnabled in
             _ = isEnabled
             FontLibrary.preloadRuntimeCacheAsync(forceReload: true)
+            refreshRootBodyFont()
+        }
+        .onChange(of: appConfig.fontFallbackScope) { _, _ in
             refreshRootBodyFont()
         }
         .onChange(of: appConfig.fontCustomScale) { _, newValue in
@@ -153,6 +206,22 @@ struct ContentView: View {
         .onChange(of: appConfig.watchAttachmentLastSource) { _, _ in
             refreshAttachmentSourceHistory()
         }
+        .task(id: conversationContinuationRelationshipRefreshKey) {
+            await reloadConversationContinuationRelationships()
+        }
+        .task(id: contextCompressionReminderRefreshKey) {
+            await refreshContextCompressionReminderEstimate()
+        }
+        .onChange(of: viewModel.chatSessions) { _, _ in
+            Task { @MainActor in
+                await reloadConversationContinuationRelationships()
+            }
+            if notificationCenter.pendingContextCompressionSessionID != nil {
+                Task { @MainActor in
+                    openContextCompressionFromNotification()
+                }
+            }
+        }
         .onDisappear {
             pendingHistoryResetWorkItem?.cancel()
             pendingHistoryResetWorkItem = nil
@@ -162,12 +231,15 @@ struct ContentView: View {
             watchInputLayoutSettleTask = nil
             bottomAnchorVisibilityWorkItem?.cancel()
             bottomAnchorVisibilityWorkItem = nil
+            chatTransientNoticeDismissTask?.cancel()
+            chatTransientNoticeDismissTask = nil
         }
         .sheet(isPresented: $legacyJSONMigrationManager.isMigrationPromptPresented) {
             NavigationStack {
                 legacyJSONMigrationPromptSheet
             }
             .interactiveDismissDisabled(true)
+            .appLockOverlayLayer()
         }
         .sheet(isPresented: Binding(
             get: { legacyJSONMigrationManager.isMigrating },
@@ -177,6 +249,7 @@ struct ContentView: View {
                 legacyJSONMigrationProgressSheet
             }
             .interactiveDismissDisabled(true)
+            .appLockOverlayLayer()
         }
         .alert(NSLocalizedString("是否清理旧版 JSON 文件？", comment: ""),
             isPresented: $legacyJSONMigrationManager.isCleanupPromptPresented
@@ -205,12 +278,23 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .legacyJSONMigrationDidFinish)) { _ in
             viewModel.reloadPersistedDataAfterLegacyJSONMigration()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .databaseEncryptionDidUnlock)) { _ in
+            handleDatabaseUnlocked()
+        }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
             case .active:
+                TTSManager.shared.setApplicationIsInBackground(false)
                 appLockManager.handleSceneDidBecomeActive()
+                if didEnterBackgroundSinceLastActivation {
+                    ChatService.shared.openNewSessionIfRestoreWindowExpired()
+                    didEnterBackgroundSinceLastActivation = false
+                }
             case .background:
+                TTSManager.shared.setApplicationIsInBackground(true)
                 appLockManager.handleSceneDidEnterBackground()
+                ChatService.recordAppDidEnterBackground()
+                didEnterBackgroundSinceLastActivation = true
                 Task {
                     await AppConfigStore.shared.flushPendingWrites()
                 }
@@ -223,5 +307,13 @@ struct ContentView: View {
             appLockManager.refreshState()
         }
         .animation(.easeInOut(duration: 0.2), value: viewModel.memoryRetryStoppedNoticeMessage)
+        .animation(.easeInOut(duration: 0.18), value: chatTransientNotice?.message)
+    }
+
+    private func handleDatabaseUnlocked() {
+        guard launchStateMachine.phase == .waitingForDatabaseUnlock else { return }
+        appConfig.reloadFromPersistentStore()
+        viewModel.reloadPersistedDataAfterLegacyJSONMigration()
+        launchStateMachine.continueAfterDatabaseUnlock()
     }
 }

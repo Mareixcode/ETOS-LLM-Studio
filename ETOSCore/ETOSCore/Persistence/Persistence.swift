@@ -39,8 +39,11 @@ public enum Persistence {
         "shortcut_tools_v1",
         "feedback_tickets",
         "feedback_tickets_v1",
+        "survey_client_state_v1",
         "mcp_servers_records",
-        "mcp_servers_records_v1"
+        "mcp_servers_records_v1",
+        "roleplay_library_v1",
+        "roleplay_variables_v1"
     ]
     static let auxiliaryMemoryBlobKeys: Set<String> = [
         "memory_raw_memories",
@@ -58,6 +61,8 @@ public enum Persistence {
     static var hasPreparedLaunchDatabases = false
     static var launchPreparationResult = LaunchPreparationResult()
     static var pendingLaunchRecoveryNotice: String?
+    static var pendingLaunchRecoveryRequest: LaunchRecoveryRequest?
+    static var pendingLaunchRecoveryKinds: [LaunchDatabaseKind] = []
     static var hasCreatedLaunchBackupPoint = false
     static var hasScheduledLaunchBackupPoint = false
 
@@ -70,12 +75,29 @@ public enum Persistence {
     }
 
     struct LaunchPreparationResult {
+        var recoverableKinds: [LaunchDatabaseKind] = []
         var restoredKinds: [LaunchDatabaseKind] = []
         var failedKinds: [LaunchDatabaseKind] = []
         var missingBackupKinds: [LaunchDatabaseKind] = []
 
         var needsChatFTSRebuild: Bool {
             restoredKinds.contains(.chat)
+        }
+
+        var hasPendingRecoveryRequest: Bool {
+            !recoverableKinds.isEmpty
+        }
+    }
+
+    public struct LaunchRecoveryRequest: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let message: String
+        public let databaseNames: [String]
+
+        init(kinds: [LaunchDatabaseKind], message: String) {
+            self.id = kinds.map(\.requestIdentifier).joined(separator: ".")
+            self.message = message
+            self.databaseNames = kinds.map(\.localizedDisplayName)
         }
     }
 
@@ -134,19 +156,39 @@ public enum Persistence {
         public var errorDescription: String? {
             switch self {
             case .grdbUnavailable:
-                return "当前无法访问 SQLite 数据库，暂时不能执行 JSON 迁移。"
+                return NSLocalizedString(
+                    "当前无法访问 SQLite 数据库，暂时不能执行 JSON 迁移。",
+                    comment: "Legacy JSON migration database unavailable"
+                )
             case .importFailed(let reason):
-                return "迁移失败：\(reason)"
+                return String(
+                    format: NSLocalizedString("迁移失败：%@", comment: "Legacy JSON migration failure"),
+                    reason
+                )
             case .cleanupFailed(let reason):
-                return "清理失败：\(reason)"
+                return String(
+                    format: NSLocalizedString("清理失败：%@", comment: "Legacy JSON cleanup failure"),
+                    reason
+                )
             }
         }
     }
 
-    enum LaunchDatabaseKind: CaseIterable {
+    enum LaunchDatabaseKind: CaseIterable, Sendable {
         case chat
         case config
         case memory
+
+        var requestIdentifier: String {
+            switch self {
+            case .chat:
+                return "chat"
+            case .config:
+                return "config"
+            case .memory:
+                return "memory"
+            }
+        }
 
         var displayName: String {
             switch self {
@@ -157,6 +199,10 @@ public enum Persistence {
             case .memory:
                 return "记忆数据库"
             }
+        }
+
+        var localizedDisplayName: String {
+            NSLocalizedString(displayName, comment: "Launch recovery database name")
         }
     }
 
@@ -175,7 +221,7 @@ public enum Persistence {
     }
 
     static var documentsDirectory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        StorageUtility.documentsDirectory
     }
 
     static let sessionIndexFileName = "index.json"

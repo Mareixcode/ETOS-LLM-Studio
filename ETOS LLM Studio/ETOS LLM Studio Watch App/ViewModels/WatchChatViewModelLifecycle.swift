@@ -69,6 +69,8 @@ extension ChatViewModel {
 
     func refreshAfterAppConfigPersistentStoreLoad() {
         applyAppConfigSnapshotToLocalState()
+        WatchBackgroundGenerationKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
+        BackgroundGenerationAudioKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
         chatService.reloadLocalModelsAndAppConfigBackedModelState()
         MessageRegexRuleStore.shared.reload()
         refreshVisualMessagesAfterRegexRulesChange()
@@ -162,6 +164,22 @@ extension ChatViewModel {
             }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(for: RoleplayDisplayedMessageBridge.didChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      notification.userInfo?[RoleplayBridgeNotification.sessionIDKey] as? UUID == self.currentSession?.id else { return }
+                self.refreshVisualMessagesAfterRegexRulesChange()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: RoleplayBridgeNotification.requestedAction)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.handleRoleplayBridgeAction(notification)
+            }
+            .store(in: &cancellables)
+
         chatService.chatSessionsSubject
             .receive(on: DispatchQueue.main)
             .sink { [weak self] sessions in
@@ -205,7 +223,7 @@ extension ChatViewModel {
             .sink { [weak self] providers in
                 guard let self = self else { return }
                 self.providers = providers
-                self.configuredModels = self.chatService.configuredRunnableModels
+                self.applyConfiguredModels(self.chatService.configuredRunnableModels)
                 self.applyActivatedModels(self.chatService.activatedRunnableModels)
                 self.applyActivatedConversationModels(self.chatService.activatedConversationModels)
                 self.applyActivatedChatModels(self.chatService.activatedChatModels)
@@ -219,6 +237,15 @@ extension ChatViewModel {
                 self.syncConversationSummaryModelSelection()
                 self.syncReasoningSummaryModelSelection()
                 self.syncOCRModelSelection()
+            }
+            .store(in: &cancellables)
+
+        AppConfigStore.shared.$modelPickerFolderPathsByProvider
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.applyConfiguredModels(self.configuredModels)
             }
             .store(in: &cancellables)
 
@@ -241,6 +268,8 @@ extension ChatViewModel {
                 } else {
                     startExtendedSession()
                 }
+                WatchBackgroundGenerationKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
+                BackgroundGenerationAudioKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
                 updateAutoReasoningPreviewState(with: allMessagesForSession)
             }
             .store(in: &cancellables)
@@ -374,6 +403,27 @@ extension ChatViewModel {
         reloadConversationMemoryState()
     }
 
+    private func handleRoleplayBridgeAction(_ notification: Notification) {
+        guard let sessionID = notification.userInfo?[RoleplayBridgeNotification.sessionIDKey] as? UUID,
+              sessionID == currentSession?.id,
+              let action = notification.userInfo?[RoleplayBridgeNotification.actionKey] as? String else { return }
+        let text = notification.userInfo?[RoleplayBridgeNotification.textKey] as? String ?? ""
+        switch action {
+        case "set_input":
+            userInput = text
+        case "send_message":
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            userInput = text
+            sendMessage()
+        case "generate":
+            if let latestAssistant = allMessagesForSession.last(where: { $0.role == .assistant }) {
+                retryMessage(latestAssistant)
+            }
+        default:
+            return
+        }
+    }
+
     func applyChatSessions(_ sessions: [ChatSession]) {
         guard chatSessions != sessions else { return }
         chatSessions = sessions
@@ -402,8 +452,33 @@ extension ChatViewModel {
         }
     }
 
+    func applyConfiguredModels(_ models: [RunnableModel]) {
+        configuredModels = models
+        let groups = RunnableModelGrouping.groups(models: models, providerOrder: providers)
+        configuredModelsByProviderID = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.models) })
+        configuredModelsByID = Dictionary(uniqueKeysWithValues: models.map { ($0.id, $0) })
+        configuredModelOrganizationsByProviderID = Dictionary(
+            uniqueKeysWithValues: groups.map {
+                (
+                    $0.id,
+                    RunnableModelPickerOrganization(
+                        models: $0.models,
+                        groupPaths: AppConfigStore.shared.modelPickerFolderPaths(for: $0.id),
+                        itemOrderIDs: AppConfigStore.shared.modelPickerItemOrderIDs(for: $0.id)
+                    )
+                )
+            }
+        )
+    }
+
     func applyActivatedConversationModels(_ models: [RunnableModel]) {
         activatedConversationModels = models
+        let groups = RunnableModelGrouping.groups(models: models, providerOrder: providers)
+        activatedConversationModelGroups = groups
+        activatedConversationModelsByProviderID = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.models) })
+        activatedConversationModelLayoutsByProviderID = Dictionary(
+            uniqueKeysWithValues: groups.map { ($0.id, $0.pickerLayout) }
+        )
     }
 
     func applyActivatedChatModels(_ models: [RunnableModel]) {

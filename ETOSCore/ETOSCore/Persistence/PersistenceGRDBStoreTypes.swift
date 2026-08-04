@@ -18,34 +18,6 @@ struct LegacySessionSnapshot {
     let conversationSummaryUpdatedAt: Date?
 }
 
-struct LegacySnapshot {
-    let sessions: [LegacySessionSnapshot]
-    let folders: [SessionFolder]
-    let requestLogs: [RequestLogEntry]
-    let dailyPulseRuns: [DailyPulseRun]
-    let dailyPulseFeedbackHistory: [DailyPulseFeedbackEvent]
-    let dailyPulsePendingCuration: DailyPulseCurationNote?
-    let dailyPulseExternalSignals: [DailyPulseExternalSignal]
-    let dailyPulseTasks: [DailyPulseTask]
-
-    var messageCount: Int {
-        sessions.reduce(into: 0) { partialResult, item in
-            partialResult += item.messages.count
-        }
-    }
-
-    var hasAnyData: Bool {
-        !sessions.isEmpty ||
-        !folders.isEmpty ||
-        !requestLogs.isEmpty ||
-        !dailyPulseRuns.isEmpty ||
-        !dailyPulseFeedbackHistory.isEmpty ||
-        dailyPulsePendingCuration != nil ||
-        !dailyPulseExternalSignals.isEmpty ||
-        !dailyPulseTasks.isEmpty
-    }
-}
-
 struct LegacySessionImportPlan {
     let id: UUID
     let fallbackSession: ChatSession
@@ -74,9 +46,17 @@ enum LegacyIncrementalImportError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .malformedSessionRecord(let sessionID, let path):
-            return "会话 \(sessionID.uuidString) 的旧版会话文件无法解析：\(path)"
+            return String(
+                format: NSLocalizedString("会话 %@ 的旧版会话文件无法解析：%@", comment: "Legacy session index parse failure"),
+                sessionID.uuidString,
+                path
+            )
         case .malformedMessagesFile(let sessionID, let path):
-            return "会话 \(sessionID.uuidString) 的旧版消息文件无法解析：\(path)"
+            return String(
+                format: NSLocalizedString("会话 %@ 的旧版消息文件无法解析：%@", comment: "Legacy message payload parse failure"),
+                sessionID.uuidString,
+                path
+            )
         }
     }
 }
@@ -98,7 +78,9 @@ struct PersistedMessageRecord: Equatable {
     let audioFileName: String?
     let imageFileNamesJSON: Data?
     let fileFileNamesJSON: Data?
+    let videoAnalysisResultsJSON: Data?
     let fullErrorContent: String?
+    let sentSystemPromptSnapshot: String?
     let responseMetricsJSON: Data?
     let responseGroupID: String?
     let responseAttemptID: String?

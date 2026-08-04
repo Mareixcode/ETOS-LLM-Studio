@@ -18,12 +18,24 @@ private let logger = Logger(subsystem: "com.ETOS.LLM.Studio", category: "Storage
 // MARK: - 存储工具类
 
 public enum StorageUtility {
+    private static let resolvedDocumentsDirectory: URL = {
+        let fileManager = FileManager.default
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil else {
+            return fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        }
+
+        // 测试不能读写模拟器长期保留的 Documents，否则不同测试运行会相互污染。
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("ETOSCoreTests-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }()
     
     // MARK: - 目录访问
     
     /// 获取 Documents 目录
     public static var documentsDirectory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        resolvedDocumentsDirectory
     }
     
     /// 获取指定类别的目录 URL
@@ -38,6 +50,15 @@ public enum StorageUtility {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    /// 格式化传输进度中的文件大小，固定保留小数位以避免数值变化时文字宽度跳动。
+    public static func formatTransferSize(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
+        formatter.zeroPadsFractionDigits = true
         return formatter.string(fromByteCount: bytes)
     }
     
@@ -263,8 +284,16 @@ public enum StorageUtility {
     /// 查找孤立的图片文件（无消息引用的图片文件）
     public static func findOrphanedImageFiles() -> [FileItem] {
         let referencedFiles = Persistence.allReferencedImageFileNames()
+        let characters = RoleplayStore.shared.loadCharacters()
+        let roleplayAvatarFileNames = Set(
+            characters.compactMap(\.avatarFileName) +
+            characters.flatMap { $0.assets ?? [] }.compactMap(\.localFileName) +
+            RoleplayStore.shared.loadPersonas().compactMap(\.avatarFileName)
+        )
         let allImageFiles = listFiles(for: .images)
-        return allImageFiles.filter { !referencedFiles.contains($0.name) }
+        return allImageFiles.filter {
+            !$0.isDirectory && !referencedFiles.contains($0.name) && !roleplayAvatarFileNames.contains($0.name)
+        }
     }
     
     // MARK: - 幽灵会话检测（彩蛋功能）
@@ -431,18 +460,40 @@ public enum StorageUtility {
         public var description: String {
             var parts: [String] = []
             if ghostSessionsCleaned > 0 {
-                parts.append("\(ghostSessionsCleaned) 个幽灵会话")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个幽灵会话", comment: "Cleaned ghost session count"),
+                        ghostSessionsCleaned
+                    )
+                )
             }
             if orphanedAudioFilesCleaned > 0 {
-                parts.append("\(orphanedAudioFilesCleaned) 个孤立音频")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个孤立音频", comment: "Cleaned orphaned audio count"),
+                        orphanedAudioFilesCleaned
+                    )
+                )
             }
             if orphanedImageFilesCleaned > 0 {
-                parts.append("\(orphanedImageFilesCleaned) 个孤立图片")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个孤立图片", comment: "Cleaned orphaned image count"),
+                        orphanedImageFilesCleaned
+                    )
+                )
             }
             if orphanedAudioReferencesCleaned > 0 {
-                parts.append("\(orphanedAudioReferencesCleaned) 个无效音频引用")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个无效音频引用", comment: "Cleaned invalid audio reference count"),
+                        orphanedAudioReferencesCleaned
+                    )
+                )
             }
-            return parts.isEmpty ? "没有需要清理的内容" : parts.joined(separator: "、")
+            return parts.isEmpty
+                ? NSLocalizedString("没有需要清理的内容", comment: "No orphaned data needed cleanup")
+                : parts.joined(separator: NSLocalizedString("、", comment: "Localized list separator"))
         }
     }
     
@@ -484,18 +535,40 @@ public enum StorageUtility {
         public var description: String {
             var parts: [String] = []
             if ghostSessions > 0 {
-                parts.append("\(ghostSessions) 个幽灵会话")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个幽灵会话", comment: "Ghost session count"),
+                        ghostSessions
+                    )
+                )
             }
             if orphanedAudioFiles > 0 {
-                parts.append("\(orphanedAudioFiles) 个孤立音频")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个孤立音频", comment: "Orphaned audio count"),
+                        orphanedAudioFiles
+                    )
+                )
             }
             if orphanedImageFiles > 0 {
-                parts.append("\(orphanedImageFiles) 个孤立图片")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个孤立图片", comment: "Orphaned image count"),
+                        orphanedImageFiles
+                    )
+                )
             }
             if orphanedAudioReferences > 0 {
-                parts.append("\(orphanedAudioReferences) 个无效音频引用")
+                parts.append(
+                    String(
+                        format: NSLocalizedString("%d 个无效音频引用", comment: "Invalid audio reference count"),
+                        orphanedAudioReferences
+                    )
+                )
             }
-            return parts.isEmpty ? "无孤立数据" : parts.joined(separator: "、")
+            return parts.isEmpty
+                ? NSLocalizedString("无孤立数据", comment: "No orphaned data")
+                : parts.joined(separator: NSLocalizedString("、", comment: "Localized list separator"))
         }
     }
     

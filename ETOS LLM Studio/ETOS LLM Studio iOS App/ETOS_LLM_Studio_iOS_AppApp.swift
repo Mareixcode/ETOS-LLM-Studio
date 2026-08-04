@@ -12,6 +12,7 @@
 
 import SwiftUI
 import BackgroundTasks
+import Combine
 import ETOSCore
 #if canImport(UIKit)
 import UIKit
@@ -59,14 +60,27 @@ struct ETOS_LLM_Studio_iOS_AppApp: App {
     @StateObject private var feedbackService = FeedbackService.shared
     @StateObject private var viewModel = ChatViewModel()
     @StateObject private var appConfig = AppConfigStore.shared
+    @StateObject private var appLockWindowPresenter = AppLockWindowPresenter()
     @State private var hasTriggeredFeedbackRefreshOnLaunch = false
 
     init() {
         AppLanguageRuntime.applyConfiguredLanguage()
+        SyncTemporaryFileCleaner.cleanupResidualTemporaryDirectoriesInBackground()
         DailyPulseDeliveryCoordinator.shared.activate()
         FontLibrary.preloadRuntimeCacheAsync(forceReload: true)
+        let performanceTelemetryEnabled = PerformanceTelemetryCenter.resolveLaunchEnabled(
+            requiresManualUnlock: DatabaseEncryptionManager.shared.requiresManualUnlock
+        ) {
+            AppConfigStore.boolValue(for: .performanceTelemetryEnabled)
+        }
+        PerformanceTelemetryCenter.shared.prepareLaunchMeasurement(
+            enabled: performanceTelemetryEnabled
+        )
         Task { @MainActor in
             ChatAppearanceProfileManager.shared.activate()
+            await PerformanceTelemetryCenter.shared.configure(
+                enabled: performanceTelemetryEnabled
+            )
         }
     }
 
@@ -77,8 +91,20 @@ struct ETOS_LLM_Studio_iOS_AppApp: App {
                 .environmentObject(appConfig)
                 .environmentObject(syncManager)
                 .environmentObject(cloudSyncManager)
+                .overlay {
+                    if launchStateMachine.phase == .waitingForDatabaseUnlock {
+                        DatabaseUnlockOverlayView {
+                            handleDatabaseUnlocked()
+                        }
+                        .zIndex(2_000)
+                    }
+                }
                 .onOpenURL { url in
                     Task { @MainActor in
+                        if NewAPIProviderImportURLHandler.canHandle(url) {
+                            await handleNewAPIProviderImport(url)
+                            return
+                        }
                         let handledByShortcutRouter = await ShortcutURLRouter.shared.handleIncomingURL(url)
                         if !handledByShortcutRouter {
                             if IncomingSnapshotRestoreSupport.isSnapshotURL(url) {
@@ -90,6 +116,8 @@ struct ETOS_LLM_Studio_iOS_AppApp: App {
                     }
                 }
                 .onAppear {
+                    PerformanceTelemetryCenter.shared.markFirstInterfaceReady()
+                    appLockWindowPresenter.install()
                     // 启动时自动重连已加入聊天路由的 MCP 服务器
                     mcpManager.connectSelectedServersIfNeeded()
                     dailyPulseDeliveryCoordinator.activate()
@@ -97,16 +125,26 @@ struct ETOS_LLM_Studio_iOS_AppApp: App {
                     updateTimelineManager.activateOnLaunchIfNeeded()
                     triggerFeedbackRefreshOnLaunchIfNeeded()
                 }
+                .onChange(of: appConfig.performanceTelemetryEnabled) { _, enabled in
+                    Task {
+                        await PerformanceTelemetryCenter.shared.configure(enabled: enabled)
+                    }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: AppConfigStore.persistentStoreDidLoadNotification)) { _ in
+                    guard !DatabaseEncryptionManager.shared.requiresManualUnlock else { return }
+                    Task {
+                        await PerformanceTelemetryCenter.shared.configure(
+                            enabled: appConfig.performanceTelemetryEnabled
+                        )
+                    }
+                }
                 .onChange(of: dailyPulseDeliveryCoordinator.reminderEnabled) { _, _ in
                     DailyPulseBackgroundDeliveryScheduler.shared.refreshScheduleIfNeeded()
                 }
-                .onChange(of: dailyPulseDeliveryCoordinator.reminderHour) { _, _ in
+                .onChange(of: dailyPulseManager.isDailyPulseEnabled) { _, _ in
                     DailyPulseBackgroundDeliveryScheduler.shared.refreshScheduleIfNeeded()
                 }
-                .onChange(of: dailyPulseDeliveryCoordinator.reminderMinute) { _, _ in
-                    DailyPulseBackgroundDeliveryScheduler.shared.refreshScheduleIfNeeded()
-                }
-                .onChange(of: dailyPulseManager.todayRun?.dayKey) { _, _ in
+                .onChange(of: dailyPulseManager.tomorrowRun?.dayKey) { _, _ in
                     DailyPulseBackgroundDeliveryScheduler.shared.refreshScheduleIfNeeded()
                 }
                 .task {
@@ -114,6 +152,7 @@ struct ETOS_LLM_Studio_iOS_AppApp: App {
                 }
                 .task(id: launchStateMachine.phase) {
                     guard launchStateMachine.phase == .ready else { return }
+                    guard !Persistence.hasPendingLaunchRecoveryRequest() else { return }
                     // 启动持久化预热完成后再触发自动同步，避免冷启动阶段覆盖未加载完的会话状态。
                     syncManager.performAutoSyncIfEnabled()
                     cloudSyncManager.performAutoSyncIfEnabled()
@@ -121,6 +160,29 @@ struct ETOS_LLM_Studio_iOS_AppApp: App {
         }
         .backgroundTask(.appRefresh(DailyPulseBackgroundDeliveryScheduler.taskIdentifier)) {
             await DailyPulseBackgroundDeliveryScheduler.shared.handleAppRefresh()
+        }
+    }
+
+    @MainActor
+    private func handleDatabaseUnlocked() {
+        guard launchStateMachine.phase == .waitingForDatabaseUnlock else { return }
+        appConfig.reloadFromPersistentStore()
+        viewModel.reloadPersistedDataAfterLegacyJSONMigration()
+        launchStateMachine.continueAfterDatabaseUnlock()
+    }
+
+    @MainActor
+    private func handleNewAPIProviderImport(_ url: URL) async {
+        do {
+            let result = try await NewAPIProviderImportURLHandler.importProvider(from: url)
+            let message = String(
+                format: NSLocalizedString("已导入 New API 连接信息。新增提供商 %d，跳过 %d。", comment: "New API deeplink import success message"),
+                result.summary.importedProviders,
+                result.summary.skippedProviders
+            )
+            NotificationCenter.default.post(name: .newAPIProviderImportDidFinish, object: message)
+        } catch {
+            NotificationCenter.default.post(name: .newAPIProviderImportDidFail, object: error.localizedDescription)
         }
     }
 

@@ -53,6 +53,194 @@ extension ChatServiceTests {
         #expect(logs[0].tokenUsage?.thinkingTokens == 5)
     }
 
+    @Test("关闭 API 请求日志后聊天请求不写独立请求日志")
+    func testChatRequestLogSwitchDisablesIndependentRequestLog() async {
+        await cleanup()
+        Persistence.clearUsageAnalyticsData()
+        AppConfigStore.persistSynchronously(.bool(false), for: .requestLogEnabled)
+        defer {
+            AppConfigStore.persistSynchronously(.bool(true), for: .requestLogEnabled)
+            Persistence.clearUsageAnalyticsData()
+        }
+
+        setupMockResponsesForChatAndTitle()
+        mockAdapter.responseToReturn = ChatMessage(
+            role: .assistant,
+            content: "关闭日志后的回复",
+            tokenUsage: MessageTokenUsage(promptTokens: 3, completionTokens: 5, totalTokens: 8)
+        )
+
+        await chatService.sendAndProcessMessage(
+            content: "这次不要写请求日志",
+            aiTemperature: 0.2,
+            aiTopP: 1,
+            systemPrompt: "",
+            maxChatHistory: 5,
+            enableStreaming: false,
+            enhancedPrompt: nil,
+            enableMemory: false,
+            enableMemoryWrite: false,
+            includeSystemTime: false
+        )
+
+        #expect(Persistence.loadRequestLogs(query: .init(limit: 1)).isEmpty)
+        let usageRequestCount = Persistence.loadUsageDailyTotals().reduce(0) { $0 + $1.requestCount }
+        #expect(usageRequestCount > 0)
+    }
+
+    @Test("响应体日志会保留完整内容并受总开关控制")
+    func testResponseBodySnapshotPayloadKeepsFullBodyAndHonorsSwitch() async throws {
+        await cleanup()
+        let request = URLRequest(url: URL(string: "https://fake.url/chat?api_key=secret")!)
+        let requestID = UUID()
+        let context = ChatService.RequestLogContext(
+            requestID: requestID,
+            sessionID: nil,
+            providerID: dummyModel.provider.id,
+            providerName: dummyModel.provider.name,
+            modelID: dummyModel.model.modelName,
+            requestSource: .chat,
+            isStreaming: false,
+            requestedAt: Date()
+        )
+        let longBody = String(repeating: "完整响应", count: 2_000)
+
+        AppConfigStore.persistSynchronously(.bool(true), for: .requestLogEnabled)
+        AppConfigStore.persistSynchronously(.bool(true), for: .requestLogPlainMessageEnabled)
+        defer {
+            Persistence.deleteAppConfig(key: AppConfigKey.requestLogPlainMessageEnabled.rawValue)
+        }
+        let payload = try #require(chatService.makeResponseBodySnapshotPayload(
+            context: context,
+            request: request,
+            body: longBody,
+            byteCount: longBody.data(using: .utf8)?.count ?? 0,
+            httpStatusCode: 200
+        ))
+
+        #expect(payload.values.contains(longBody))
+        #expect(payload.values.contains(requestID.uuidString))
+        #expect(payload.values.contains("200"))
+        #expect(payload.values.contains { $0.contains("fake.url") && !$0.contains("secret") })
+
+        let streamingContext = ChatService.RequestLogContext(
+            requestID: requestID,
+            sessionID: nil,
+            providerID: dummyModel.provider.id,
+            providerName: dummyModel.provider.name,
+            modelID: dummyModel.model.modelName,
+            requestSource: .chat,
+            isStreaming: true,
+            requestedAt: Date()
+        )
+        let streamingPayload = try #require(chatService.makeResponseBodySnapshotPayload(
+            context: streamingContext,
+            request: request,
+            body: "data: {}",
+            byteCount: 8,
+            isPartial: true
+        ))
+        #expect(streamingPayload.values.contains("data: {}"))
+
+        AppConfigStore.persistSynchronously(.bool(false), for: .requestLogPlainMessageEnabled)
+        let redactedPayload = try #require(chatService.makeResponseBodySnapshotPayload(
+            context: context,
+            request: request,
+            body: #"{"choices":[{"message":{"content":"不应落盘"}}]}"#,
+            byteCount: 53,
+            httpStatusCode: 200
+        ))
+        #expect(redactedPayload.values.contains { $0.contains("不应落盘") } == false)
+
+        let uncapturedStreamingPayload = try #require(chatService.makeResponseBodySnapshotPayload(
+            context: streamingContext,
+            request: request,
+            body: #"data: {"choices":[{"delta":{"content":"不得缓存的流式原文"}}]}"#,
+            byteCount: 72
+        ))
+        #expect(uncapturedStreamingPayload.values.contains { $0.contains("不得缓存的流式原文") } == false)
+        #expect(
+            uncapturedStreamingPayload.values.contains(
+                AppLogRedactor.streamingResponseNotRecordedToken
+            )
+        )
+
+        AppConfigStore.persistSynchronously(.bool(false), for: .requestLogEnabled)
+        defer {
+            AppConfigStore.persistSynchronously(.bool(true), for: .requestLogEnabled)
+        }
+
+        let disabledPayload = chatService.makeResponseBodySnapshotPayload(
+            context: context,
+            request: request,
+            body: longBody,
+            byteCount: longBody.count
+        )
+        #expect(disabledPayload == nil)
+    }
+
+    @Test("Responses 生图结果会保存为助手图片附件")
+    func testResponsesImageGenerationResultSavesImageAttachment() async throws {
+        await cleanup()
+
+        let pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        let payload = """
+        {
+          "id": "resp_image",
+          "output": [
+            {
+              "type": "image_generation_call",
+              "id": "ig_1",
+              "result": "\(pngBase64)"
+            }
+          ]
+        }
+        """
+
+        let imageFileNames = chatService.extractGeneratedImagesFromAPIResponseBody(Data(payload.utf8))
+
+        #expect(imageFileNames.count == 1)
+        let fileName = try #require(imageFileNames.first)
+        #expect(Persistence.loadImage(fileName: fileName)?.isEmpty == false)
+    }
+
+    @Test("Responses 生图结果落盘后只保留调用 ID")
+    func testResponsesImageGenerationMetadataIsCompactedAfterSaving() async throws {
+        await cleanup()
+
+        let pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        var message = ChatMessage(
+            role: .assistant,
+            content: "",
+            providerResponseMetadata: [
+                OpenAIAdapter.responsesOutputItemsKey: .array([
+                    .dictionary([
+                        "type": .string("image_generation_call"),
+                        "id": .string("ig_compact_1"),
+                        "status": .string("completed"),
+                        "result": .string(pngBase64)
+                    ])
+                ])
+            ]
+        )
+
+        chatService.finalizeResponsesGeneratedImages(in: &message)
+
+        let fileName = try #require(message.imageFileNames?.first)
+        #expect(Persistence.loadImage(fileName: fileName)?.isEmpty == false)
+        let rawItems = try #require(
+            message.providerResponseMetadata?[OpenAIAdapter.responsesOutputItemsKey]
+        )
+        guard case let .array(items) = rawItems,
+              case let .dictionary(item)? = items.first else {
+            Issue.record("Responses 图片调用元数据格式不正确。")
+            return
+        }
+        #expect(item["type"] == .string("image_generation_call"))
+        #expect(item["id"] == .string("ig_compact_1"))
+        #expect(item["result"] == nil)
+    }
+
     @Test("发送消息后会在会话 JSON 中保存请求时间")
     func testSendMessagePersistsRequestedAtInSessionJSON() async {
         await cleanup()
@@ -128,16 +316,128 @@ extension ChatServiceTests {
         )
 
         let sentMessages = try #require(mockAdapter.receivedMessages)
-        let userMessage = try #require(sentMessages.last(where: { $0.role == .user }))
-        #expect(userMessage.content.contains("请处理这个附件"))
-        #expect(userMessage.content.components(separatedBy: "<file_attachments>").count - 1 == 1)
-        #expect(userMessage.content.contains("<file name=\"notes.txt\">"))
-        #expect(userMessage.content.contains("<file name=\"todo.txt\">"))
-        #expect(userMessage.content.contains("附件原文"))
-        #expect(userMessage.content.contains("第二份附件"))
-        #expect(userMessage.content.contains("</file_attachments>"))
-        #expect(!userMessage.content.contains("以下内容来自文件附件文本提取："))
-        #expect(!userMessage.content.contains("文件："))
+        let userMessages = sentMessages.filter { $0.role == .user }
+        let combinedContent = userMessages.map(\.content).joined(separator: "\n")
+        #expect(userMessages.count == 3)
+        #expect(userMessages.first?.content == "请处理这个附件")
+        #expect(combinedContent.components(separatedBy: "<file_attachments>").count - 1 == 2)
+        #expect(combinedContent.contains("<file name=\"notes.txt\">"))
+        #expect(combinedContent.contains("<file name=\"todo.txt\">"))
+        #expect(combinedContent.contains("附件原文"))
+        #expect(combinedContent.contains("第二份附件"))
+        #expect(combinedContent.contains("</file_attachments>"))
+        #expect(!combinedContent.contains("以下内容来自文件附件文本提取："))
+        #expect(!combinedContent.contains("文件："))
+        #expect(mockAdapter.receivedFileAttachments?.isEmpty == true)
+    }
+
+    @Test("视频与问题保存在同一消息并保留原文件供模型切换")
+    func testVideoAndPromptShareMessageAndKeepOriginalAttachment() async throws {
+        await cleanup()
+        let videoAdapter = MockAPIAdapter()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        let service = ChatService(
+            adapters: ["gemini": videoAdapter],
+            memoryManager: memoryManager,
+            urlSession: URLSession(configuration: configuration)
+        )
+        let session = service.createSavedSession(name: "原生视频历史测试")
+        service.setCurrentSession(session)
+        defer { service.deleteSessions([session]) }
+
+        let provider = Provider(
+            name: "Gemini Video Test",
+            baseURL: "https://generativelanguage.googleapis.com/v1beta",
+            apiKeys: ["video-key"],
+            apiFormat: "gemini"
+        )
+        let model = Model(
+            modelName: "gemini-video",
+            isActivated: true,
+            inputModalities: [.text, .video]
+        )
+        service.setSelectedModel(RunnableModel(provider: provider, model: model))
+        setupMockResponsesForChatAndTitle()
+        videoAdapter.responseToReturn = ChatMessage(role: .assistant, content: "视频已收到")
+
+        let fileName = "history-\(UUID().uuidString).mp4"
+        let attachment = FileAttachment(
+            data: Data([0x01, 0x02, 0x03]),
+            mimeType: "video/mp4",
+            fileName: fileName
+        )
+        await service.sendAndProcessMessage(
+            content: "概括这段视频",
+            aiTemperature: 0.2,
+            aiTopP: 1,
+            systemPrompt: "",
+            maxChatHistory: 5,
+            enableStreaming: false,
+            enhancedPrompt: nil,
+            enableMemory: false,
+            enableMemoryWrite: false,
+            includeSystemTime: false,
+            fileAttachments: [attachment]
+        )
+
+        let storedUserMessages = Persistence.loadMessages(for: session.id)
+            .filter { $0.role == .user }
+        let storedMessage = try #require(storedUserMessages.first)
+        let sentMessage = try #require(videoAdapter.receivedMessages?.first {
+            $0.id == storedMessage.id
+        })
+
+        #expect(storedUserMessages.count == 1)
+        #expect(storedMessage.content == "概括这段视频")
+        #expect(storedMessage.fileFileNames == [fileName])
+        #expect(videoAdapter.receivedFileAttachments?[sentMessage.id]?.first?.data == attachment.data)
+    }
+
+    @Test("历史消息选区附件会沿文件注入链路保留来源元数据")
+    func testMessageExcerptAttachmentKeepsMetadataDuringInjection() async throws {
+        await cleanup()
+        let session = createPermanentTestSession(name: "历史消息选区附件测试")
+        defer { chatService.deleteSessions([session]) }
+
+        setupMockResponsesForChatAndTitle()
+        mockAdapter.responseToReturn = ChatMessage(role: .assistant, content: "已结合引用回答")
+
+        let sourceMessage = ChatMessage(
+            id: UUID(uuidString: "C2B84C35-52D4-4BF3-938D-EA7C478D52A7")!,
+            role: .assistant,
+            content: "历史回复全文"
+        )
+        let attachment = try #require(
+            MessageExcerptAttachmentSupport.makeAttachment(
+                selectedText: "历史回复中的选区",
+                sourceMessage: sourceMessage
+            )
+        )
+
+        await chatService.sendAndProcessMessage(
+            content: "请解释这段内容",
+            aiTemperature: 0.2,
+            aiTopP: 1,
+            systemPrompt: "",
+            maxChatHistory: 5,
+            enableStreaming: false,
+            enhancedPrompt: nil,
+            enableMemory: false,
+            enableMemoryWrite: false,
+            includeSystemTime: false,
+            fileAttachments: [attachment]
+        )
+
+        let sentMessages = try #require(mockAdapter.receivedMessages)
+        let attachmentMessage = try #require(sentMessages.first(where: {
+            $0.role == .user && $0.content.contains("excerpt_from_previous_assistant_message.txt")
+        }))
+
+        #expect(attachmentMessage.content.contains("source_role: assistant"))
+        #expect(attachmentMessage.content.contains("source_message_id: C2B84C35-52D4-4BF3-938D-EA7C478D52A7"))
+        #expect(attachmentMessage.content.contains("content_type: quoted_reference"))
+        #expect(attachmentMessage.content.contains("历史回复中的选区"))
         #expect(mockAdapter.receivedFileAttachments?.isEmpty == true)
     }
 
@@ -162,6 +462,7 @@ extension ChatServiceTests {
             models: [ocrModel]
         )
         ConfigLoader.saveProvider(ocrProvider)
+        chatService.reloadProviders()
         defer {
             Persistence.deleteAppConfig(key: AppConfigKey.ocrModelIdentifier.rawValue)
             ConfigLoader.deleteProvider(ocrProvider)
@@ -198,15 +499,17 @@ extension ChatServiceTests {
         )
 
         let sentMessages = try #require(mockAdapter.receivedMessages)
-        let userMessage = try #require(sentMessages.last(where: { $0.role == .user }))
-        #expect(userMessage.content.contains("请读取图片文字"))
-        #expect(userMessage.content.components(separatedBy: "<image_ocr_attachments>").count - 1 == 1)
-        #expect(userMessage.content.contains("<image name=\"receipt.png\">"))
-        #expect(userMessage.content.contains("<image name=\"menu.png\">"))
-        #expect(userMessage.content.contains("图片识别文字"))
-        #expect(userMessage.content.contains("</image_ocr_attachments>"))
-        #expect(!userMessage.content.contains("以下内容来自图片 OCR 提取："))
-        #expect(!userMessage.content.contains("图片 1（"))
+        let userMessages = sentMessages.filter { $0.role == .user }
+        let combinedContent = userMessages.map(\.content).joined(separator: "\n")
+        #expect(userMessages.count == 3)
+        #expect(userMessages.first?.content == "请读取图片文字")
+        #expect(combinedContent.components(separatedBy: "<image_ocr_attachments>").count - 1 == 2)
+        #expect(combinedContent.contains("<image name=\"receipt.png\">"))
+        #expect(combinedContent.contains("<image name=\"menu.png\">"))
+        #expect(combinedContent.contains("图片识别文字"))
+        #expect(combinedContent.contains("</image_ocr_attachments>"))
+        #expect(!combinedContent.contains("以下内容来自图片 OCR 提取："))
+        #expect(!combinedContent.contains("图片 1（"))
         #expect(mockAdapter.receivedImageAttachments?.isEmpty == true)
     }
 
@@ -273,6 +576,21 @@ extension ChatServiceTests {
 
         setupMockResponsesForChatAndTitle()
         mockAdapter.responseToReturn = ChatMessage(role: .assistant, content: "已收到")
+
+        let visionModel = Model(
+            modelName: "vision-chat-model",
+            isActivated: true,
+            kind: .chat,
+            inputModalities: [.text, .image]
+        )
+        let visionProvider = Provider(
+            name: "Vision Chat Test Provider",
+            baseURL: "https://fake.url",
+            apiKeys: ["key-vision"],
+            apiFormat: "openai-compatible",
+            models: [visionModel]
+        )
+        chatService.setSelectedModel(RunnableModel(provider: visionProvider, model: visionModel))
 
         let audioAttachment = AudioAttachment(
             data: Data([0x00, 0x01, 0x02]),
@@ -582,8 +900,7 @@ extension ChatServiceTests {
         let storedMessage = chatService.messagesForSessionSubject.value.first { $0.id == loadingMessage.id }
         let reasoningSummaryUserPrompt = mockAdapter.receivedReasoningSummaryMessages?.last(where: { $0.role == .user })?.content ?? ""
         #expect(mockAdapter.receivedReasoningSummaryModel?.id == dedicatedSummaryModel.id)
-        #expect(mockAdapter.receivedReasoningSummaryMessages?.first?.content.contains("中文输出 6~18 字") == true)
-        #expect(mockAdapter.receivedReasoningSummaryMessages?.first?.content.contains(ModelPromptLanguage.current.outputInstruction) == true)
+        #expect(mockAdapter.receivedReasoningSummaryMessages?.first?.content.contains("输出一个短标签") == true)
         #expect(reasoningSummaryUserPrompt.contains("```\n\(reasoningContent)"))
         #expect(reasoningSummaryUserPrompt.hasSuffix("```"))
         #expect(storedMessage?.responseMetrics?.reasoningSummary == "比较成本后选稳妥方案")
@@ -595,7 +912,8 @@ extension ChatServiceTests {
     func testConversationSummary_UsesTwoThousandCharacterLimit() async throws {
         await cleanup()
 
-        let sessionID = try #require(chatService.currentSessionSubject.value?.id)
+        let session = createPermanentTestSession(name: "会话摘要长度测试")
+        let sessionID = session.id
         let longUserContent = String(repeating: "甲", count: 2_500)
         let loadingMessage = ChatMessage(role: .assistant, content: "", requestedAt: Date())
         let messages = [
@@ -635,8 +953,7 @@ extension ChatServiceTests {
 
         let summarySystemPrompt = mockAdapter.receivedConversationSummaryMessages?.first(where: { $0.role == .system })?.content ?? ""
         let summaryUserPrompt = mockAdapter.receivedConversationSummaryMessages?.last(where: { $0.role == .user })?.content ?? ""
-        #expect(summarySystemPrompt.contains("长期记忆"))
-        #expect(summarySystemPrompt.contains("敏感隐私"))
+        #expect(summarySystemPrompt == BuiltInPromptStore.render(.conversationSummarySystem))
         #expect(summaryUserPrompt.contains(String(repeating: "甲", count: 2_000)))
         #expect(!summaryUserPrompt.contains(String(repeating: "甲", count: 2_001)))
 
@@ -647,7 +964,8 @@ extension ChatServiceTests {
     func testConversationProfile_DoesNotTruncateGeneratedProfile() async throws {
         await cleanup()
 
-        let sessionID = try #require(chatService.currentSessionSubject.value?.id)
+        let session = createPermanentTestSession(name: "用户画像长度测试")
+        let sessionID = session.id
         let loadingMessage = ChatMessage(role: .assistant, content: "", requestedAt: Date())
         let messages = [
             ChatMessage(role: .user, content: "第一轮问题", requestedAt: Date()),
@@ -687,7 +1005,7 @@ extension ChatServiceTests {
         try await Task.sleep(for: .milliseconds(500))
 
         let profileSystemPrompt = mockAdapter.receivedConversationProfileMessages?.first(where: { $0.role == .system })?.content ?? ""
-        #expect(profileSystemPrompt.contains("不设固定长度上限"))
+        #expect(profileSystemPrompt == BuiltInPromptStore.render(.conversationProfileUpdateSystem))
         #expect(ConversationMemoryManager.loadUserProfile()?.content == longProfile)
 
         await cleanup()

@@ -25,56 +25,7 @@ public struct AppLockOverlayView: View {
                 .fill(.ultraThinMaterial)
                 .ignoresSafeArea()
 
-            VStack(spacing: 18) {
-                Image(systemName: "lock.fill")
-                    .font(.system(size: 42, weight: .semibold))
-                    .foregroundStyle(.primary)
-
-                VStack(spacing: 6) {
-                    Text(NSLocalizedString("ETOS LLM Studio 已锁定", comment: ""))
-                        .font(.headline)
-                    Text(NSLocalizedString("输入应用锁密码继续。", comment: ""))
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-
-                SecureField(NSLocalizedString("密码", comment: ""), text: $password)
-                    .textContentType(.password)
-                    .submitLabel(.go)
-                    .onSubmit(unlock)
-
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                }
-
-                #if !os(watchOS)
-                    if lockManager.isBiometricEnabled {
-                        Button {
-                            startBiometricUnlock()
-                        } label: {
-                            Label(NSLocalizedString("使用生物识别", comment: ""), systemImage: "faceid")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(isBiometricUnlocking)
-                    }
-                #endif
-
-                Button {
-                    unlock()
-                } label: {
-                    Label(NSLocalizedString("解锁", comment: ""), systemImage: "lock.open")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(password.isEmpty)
-            }
-            .padding()
-            .frame(maxWidth: 360)
+            lockContent
         }
         .onAppear {
             password = ""
@@ -82,6 +33,255 @@ public struct AppLockOverlayView: View {
             #if !os(watchOS)
             startBiometricUnlockIfNeeded()
             #endif
+        }
+    }
+
+    private var lockContent: some View {
+        VStack(spacing: lockContentSpacing) {
+            lockHeader
+
+            if lockManager.usesNumericPassword {
+                numericPasswordDisplay
+                errorText
+                numericKeyboard
+            } else {
+                passwordField
+                errorText
+                biometricButton
+                unlockButton
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, lockContentVerticalPadding)
+        .frame(maxWidth: lockContentMaxWidth)
+    }
+
+    private var lockHeader: some View {
+        VStack(spacing: lockHeaderSpacing) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: lockIconSize, weight: .semibold))
+                .foregroundStyle(.primary)
+
+            VStack(spacing: 4) {
+                Text(NSLocalizedString("ETOS LLM Studio 已锁定", comment: ""))
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+                Text(NSLocalizedString("输入应用锁密码继续。", comment: ""))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    private var passwordField: some View {
+        SecureField(NSLocalizedString("密码", comment: ""), text: $password)
+            .textContentType(.password)
+            .submitLabel(.go)
+            .onSubmit(unlock)
+    }
+
+    @ViewBuilder
+    private var errorText: some View {
+        if let errorMessage {
+            Text(errorMessage)
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    @ViewBuilder
+    private var biometricButton: some View {
+        #if !os(watchOS)
+            if lockManager.isBiometricEnabled {
+                Button {
+                    startBiometricUnlock()
+                } label: {
+                    Label(NSLocalizedString("使用生物识别", comment: ""), systemImage: "faceid")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isBiometricUnlocking)
+            }
+        #else
+            EmptyView()
+        #endif
+    }
+
+    private var unlockButton: some View {
+        Button {
+            unlock()
+        } label: {
+            Label(NSLocalizedString("解锁", comment: ""), systemImage: "lock.open")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(password.isEmpty)
+    }
+
+    private var numericPasswordDisplay: some View {
+        Text(maskedNumericPassword)
+            .font(.title3.monospaced())
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+            .frame(maxWidth: .infinity, minHeight: numericPasswordDisplayHeight)
+            .padding(.horizontal, 10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(.secondary.opacity(0.28), lineWidth: 1)
+            }
+    }
+
+    private var numericKeyboard: some View {
+        VStack(spacing: numericKeyboardSpacing) {
+            ForEach(AppLockNumericKey.rows, id: \.self) { row in
+                HStack(spacing: numericKeyboardSpacing) {
+                    ForEach(row, id: \.self) { key in
+                        numericKeyButton(for: key)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func numericKeyButton(for key: AppLockNumericKey) -> some View {
+        if key == .unlock {
+            Button {
+                handleNumericKey(key)
+            } label: {
+                numericKeyLabel(for: key)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(password.isEmpty)
+        } else {
+            Button {
+                handleNumericKey(key)
+            } label: {
+                numericKeyLabel(for: key)
+            }
+            .buttonStyle(.bordered)
+            .disabled(key.requiresPassword && password.isEmpty)
+        }
+    }
+
+    @ViewBuilder
+    private func numericKeyLabel(for key: AppLockNumericKey) -> some View {
+        switch key {
+        case .digit(let digit):
+            Text(digit)
+                .font(numericKeyFont)
+                .frame(maxWidth: .infinity, minHeight: numericKeyHeight)
+        case .delete:
+            Image(systemName: "delete.left")
+                .font(numericActionFont)
+                .frame(maxWidth: .infinity, minHeight: numericKeyHeight)
+                .accessibilityLabel(NSLocalizedString("删除", comment: ""))
+        case .unlock:
+            Image(systemName: "lock.open")
+                .font(numericActionFont)
+                .frame(maxWidth: .infinity, minHeight: numericKeyHeight)
+                .accessibilityLabel(NSLocalizedString("解锁", comment: ""))
+        }
+    }
+
+    private var maskedNumericPassword: String {
+        guard !password.isEmpty else { return " " }
+        return String(repeating: "•", count: min(password.count, 24))
+    }
+
+    private var lockContentSpacing: CGFloat {
+        #if os(watchOS)
+        lockManager.usesNumericPassword ? 8 : 14
+        #else
+        18
+        #endif
+    }
+
+    private var lockHeaderSpacing: CGFloat {
+        #if os(watchOS)
+        lockManager.usesNumericPassword ? 4 : 8
+        #else
+        12
+        #endif
+    }
+
+    private var lockIconSize: CGFloat {
+        #if os(watchOS)
+        lockManager.usesNumericPassword ? 20 : 36
+        #else
+        42
+        #endif
+    }
+
+    private var lockContentVerticalPadding: CGFloat {
+        #if os(watchOS)
+        lockManager.usesNumericPassword ? 8 : 14
+        #else
+        16
+        #endif
+    }
+
+    private var lockContentMaxWidth: CGFloat {
+        #if os(watchOS)
+        240
+        #else
+        lockManager.usesNumericPassword ? 320 : 360
+        #endif
+    }
+
+    private var numericPasswordDisplayHeight: CGFloat {
+        #if os(watchOS)
+        28
+        #else
+        42
+        #endif
+    }
+
+    private var numericKeyboardSpacing: CGFloat {
+        #if os(watchOS)
+        5
+        #else
+        8
+        #endif
+    }
+
+    private var numericKeyHeight: CGFloat {
+        #if os(watchOS)
+        26
+        #else
+        44
+        #endif
+    }
+
+    private var numericKeyFont: Font {
+        #if os(watchOS)
+        .headline
+        #else
+        .title3.weight(.semibold)
+        #endif
+    }
+
+    private var numericActionFont: Font {
+        #if os(watchOS)
+        .subheadline.weight(.semibold)
+        #else
+        .headline.weight(.semibold)
+        #endif
+    }
+
+    private func handleNumericKey(_ key: AppLockNumericKey) {
+        errorMessage = nil
+        switch key {
+        case .digit(let digit):
+            password.append(digit)
+        case .delete:
+            guard !password.isEmpty else { return }
+            password.removeLast()
+        case .unlock:
+            unlock()
         }
     }
 
@@ -118,12 +318,55 @@ public struct AppLockOverlayView: View {
     #endif
 }
 
+private enum AppLockNumericKey: Hashable {
+    case digit(String)
+    case delete
+    case unlock
+
+    static let rows: [[AppLockNumericKey]] = [
+        [.digit("1"), .digit("2"), .digit("3")],
+        [.digit("4"), .digit("5"), .digit("6")],
+        [.digit("7"), .digit("8"), .digit("9")],
+        [.delete, .digit("0"), .unlock]
+    ]
+
+    var requiresPassword: Bool {
+        switch self {
+        case .delete, .unlock:
+            return true
+        case .digit:
+            return false
+        }
+    }
+}
+
+private struct AppLockOverlayLayerModifier: ViewModifier {
+    @ObservedObject private var lockManager = AppLockManager.shared
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                if lockManager.state == .locked {
+                    AppLockOverlayView()
+                        .zIndex(1_000)
+                }
+            }
+    }
+}
+
+public extension View {
+    func appLockOverlayLayer() -> some View {
+        modifier(AppLockOverlayLayerModifier())
+    }
+}
+
 public struct AppLockSettingsView: View {
     @ObservedObject private var lockManager = AppLockManager.shared
     @ObservedObject private var appConfig = AppConfigStore.shared
     @State private var requestedDestination: AppLockSettingsDestination?
     @State private var successMessage: String?
     @State private var isShowingIntroDetails = false
+    @State private var databaseEncryptionStateVersion = 0
 
     public init() {}
 
@@ -140,6 +383,7 @@ public struct AppLockSettingsView: View {
 
             Section {
                 Toggle(NSLocalizedString("应用锁", comment: ""), isOn: appLockEnabledBinding)
+                    .disabled(isManualDatabaseUnlockMode)
 
                 if lockManager.isEnabled {
                     NavigationLink {
@@ -159,7 +403,7 @@ public struct AppLockSettingsView: View {
             } header: {
                 Text(NSLocalizedString("应用锁", comment: ""))
             } footer: {
-                Text(NSLocalizedString("只影响这台设备，不随同步发送。", comment: ""))
+                Text(appLockFooterText)
             }
 
             if lockManager.isEnabled {
@@ -191,9 +435,12 @@ public struct AppLockSettingsView: View {
                 Toggle(NSLocalizedString("数据库物理加密", comment: ""), isOn: databaseEncryptionEnabledBinding)
 
                 if isDatabaseEncryptionEnabled {
+                    Toggle(NSLocalizedString("在 Keychain 中记住数据库主密码", comment: ""), isOn: databaseEncryptionKeychainStorageBinding)
+
                     NavigationLink {
                         DatabaseEncryptionUpdatePassphraseView {
                             successMessage = NSLocalizedString("数据库主密码已更新。", comment: "")
+                            databaseEncryptionStateVersion += 1
                         }
                     } label: {
                         Label(NSLocalizedString("更新数据库主密码", comment: ""), systemImage: "key")
@@ -202,7 +449,7 @@ public struct AppLockSettingsView: View {
             } header: {
                 Text(NSLocalizedString("数据库物理加密", comment: ""))
             } footer: {
-                Text(NSLocalizedString("用于保护被离线提取的数据库文件。", comment: ""))
+                Text(databaseEncryptionFooterText)
             }
 
             if let successMessage {
@@ -230,14 +477,33 @@ public struct AppLockSettingsView: View {
             case .enableDatabaseEncryption:
                 DatabaseEncryptionEnableView {
                     appConfig.databaseEncryptionEnabled = true
+                    databaseEncryptionStateVersion += 1
                     successMessage = NSLocalizedString("数据库物理加密已启用。", comment: "")
                 }
             case .disableDatabaseEncryption:
                 DatabaseEncryptionDisableView {
                     appConfig.databaseEncryptionEnabled = false
+                    databaseEncryptionStateVersion += 1
                     successMessage = NSLocalizedString("数据库物理加密已关闭。", comment: "")
                 }
+            case .enableDatabaseKeychainStorage:
+                DatabaseEncryptionKeychainStorageView(storesPassphraseInKeychain: true) {
+                    appConfig.reloadFromPersistentStore()
+                    databaseEncryptionStateVersion += 1
+                    successMessage = NSLocalizedString("数据库主密码将保存到 Keychain。", comment: "")
+                }
+            case .disableDatabaseKeychainStorage:
+                DatabaseEncryptionKeychainStorageView(storesPassphraseInKeychain: false) {
+                    appConfig.reloadFromPersistentStore()
+                    databaseEncryptionStateVersion += 1
+                    lockManager.refreshState()
+                    successMessage = NSLocalizedString("数据库主密码已改为仅保存在内存中。", comment: "")
+                }
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .databaseEncryptionLockStateDidChange)) { _ in
+            databaseEncryptionStateVersion += 1
+            lockManager.refreshState()
         }
     }
 
@@ -263,8 +529,42 @@ public struct AppLockSettingsView: View {
         )
     }
 
+    private var databaseEncryptionKeychainStorageBinding: Binding<Bool> {
+        Binding(
+            get: {
+                _ = databaseEncryptionStateVersion
+                return DatabaseEncryptionManager.shared.storesPassphraseInKeychain
+            },
+            set: { shouldStore in
+                guard shouldStore != DatabaseEncryptionManager.shared.storesPassphraseInKeychain else { return }
+                successMessage = nil
+                requestedDestination = shouldStore ? .enableDatabaseKeychainStorage : .disableDatabaseKeychainStorage
+            }
+        )
+    }
+
     private var isDatabaseEncryptionEnabled: Bool {
-        appConfig.databaseEncryptionEnabled || DatabaseEncryptionManager.shared.hasStoredPassphrase
+        _ = databaseEncryptionStateVersion
+        return appConfig.databaseEncryptionEnabled || DatabaseEncryptionManager.shared.isDatabaseEncryptionEnabled
+    }
+
+    private var isManualDatabaseUnlockMode: Bool {
+        _ = databaseEncryptionStateVersion
+        return DatabaseEncryptionManager.shared.isManualUnlockModeEnabled
+    }
+
+    private var appLockFooterText: String {
+        if isManualDatabaseUnlockMode {
+            return NSLocalizedString("数据库主密码未保存到 Keychain 时，数据库解锁会接管本机界面保护，普通应用锁会暂时停用。", comment: "")
+        }
+        return NSLocalizedString("只影响这台设备，不随同步发送。", comment: "")
+    }
+
+    private var databaseEncryptionFooterText: String {
+        if isManualDatabaseUnlockMode {
+            return NSLocalizedString("当前不会把数据库主密码保存到 Keychain；冷启动时需要先输入主密码，验证成功后只暂存在内存中。", comment: "")
+        }
+        return NSLocalizedString("用于保护被离线提取的数据库文件。默认会把主密码保存在本机 Keychain 中，以便启动时自动解锁。", comment: "")
     }
 
     private var appLockIntroDetails: String {
@@ -272,6 +572,7 @@ public struct AppLockSettingsView: View {
             NSLocalizedString("应用锁用于保护已经解锁设备上的 App 界面。开启后，回到前台或手动锁定时，需要输入应用锁密码；iOS 上可额外开启 Face ID / Touch ID，失败后仍能回退到密码。", comment: ""),
             NSLocalizedString("自动锁定只在应用进入后台后计时。选择“立即”会在每次离开后重新验证；选择更长时间则适合频繁切换应用的场景。", comment: ""),
             NSLocalizedString("数据库物理加密是另一层保护：它会把聊天、配置和记忆三处分库迁移为 SQLCipher 加密文件，主密码保存在本机 Keychain 中，用于启动时透明解锁。", comment: ""),
+            NSLocalizedString("如果关闭 Keychain 保存，应用会在冷启动时要求输入数据库主密码；主密码验证通过后只暂存在当前进程内存里，数据库未解锁前不会启动聊天、同步或每日脉冲等数据访问任务。", comment: ""),
             NSLocalizedString("两者保护的对象不同：应用锁防止别人直接打开界面，数据库物理加密防止数据库文件被离线提取后读取。快照导出仍使用单独的导出密码，不会复用数据库主密码。", comment: ""),
             NSLocalizedString("应用锁和数据库主密码都只保存在本机，不会随 CloudKit、WatchConnectivity 或备份同步到其他设备。换设备使用时，需要在新设备上重新设置。", comment: "")
         ].joined(separator: "\n\n")
@@ -352,6 +653,8 @@ private enum AppLockSettingsDestination: Hashable, Identifiable {
     case disableAppLock
     case enableDatabaseEncryption
     case disableDatabaseEncryption
+    case enableDatabaseKeychainStorage
+    case disableDatabaseKeychainStorage
 
     var id: String {
         switch self {
@@ -363,152 +666,10 @@ private enum AppLockSettingsDestination: Hashable, Identifiable {
             return "enableDatabaseEncryption"
         case .disableDatabaseEncryption:
             return "disableDatabaseEncryption"
-        }
-    }
-}
-
-private struct AppLockEnableView: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var lockManager = AppLockManager.shared
-    @State private var password = ""
-    @State private var confirmation = ""
-    @State private var errorMessage: String?
-    let onCompletion: () -> Void
-
-    var body: some View {
-        List {
-            Section {
-                SecureField(NSLocalizedString("密码", comment: ""), text: $password)
-                    .textContentType(.newPassword)
-                SecureField(NSLocalizedString("确认密码", comment: ""), text: $confirmation)
-                    .textContentType(.newPassword)
-
-                Button(NSLocalizedString("启用应用锁", comment: "")) {
-                    enable()
-                }
-                .disabled(!canConfirm)
-
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
-            } header: {
-                Text(NSLocalizedString("密码", comment: ""))
-            }
-        }
-        .navigationTitle(NSLocalizedString("启用应用锁", comment: ""))
-    }
-
-    private var canConfirm: Bool {
-        !password.isEmpty && password == confirmation
-    }
-
-    private func enable() {
-        do {
-            try lockManager.enable(password: password, confirmation: confirmation)
-            onCompletion()
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-}
-
-private struct AppLockDisableView: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var lockManager = AppLockManager.shared
-    @State private var password = ""
-    @State private var errorMessage: String?
-    let onCompletion: () -> Void
-
-    var body: some View {
-        List {
-            Section {
-                SecureField(NSLocalizedString("当前密码", comment: ""), text: $password)
-                    .textContentType(.password)
-
-                Button(NSLocalizedString("关闭应用锁", comment: ""), role: .destructive) {
-                    disable()
-                }
-                .disabled(password.isEmpty)
-
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
-            } header: {
-                Text(NSLocalizedString("密码", comment: ""))
-            }
-        }
-        .navigationTitle(NSLocalizedString("关闭应用锁", comment: ""))
-    }
-
-    private func disable() {
-        do {
-            try lockManager.disable(password: password)
-            onCompletion()
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-}
-
-private struct AppLockUpdatePasswordView: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var lockManager = AppLockManager.shared
-    @State private var currentPassword = ""
-    @State private var newPassword = ""
-    @State private var confirmation = ""
-    @State private var errorMessage: String?
-    let onCompletion: () -> Void
-
-    var body: some View {
-        List {
-            Section {
-                SecureField(NSLocalizedString("当前密码", comment: ""), text: $currentPassword)
-                    .textContentType(.password)
-                SecureField(NSLocalizedString("新密码", comment: ""), text: $newPassword)
-                    .textContentType(.newPassword)
-                SecureField(NSLocalizedString("确认新密码", comment: ""), text: $confirmation)
-                    .textContentType(.newPassword)
-
-                Button(NSLocalizedString("更新密码", comment: "")) {
-                    updatePassword()
-                }
-                .disabled(!canConfirm)
-
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
-            } header: {
-                Text(NSLocalizedString("密码", comment: ""))
-            } footer: {
-                Text(NSLocalizedString("更新或关闭应用锁前需要输入当前密码。", comment: ""))
-            }
-        }
-        .navigationTitle(NSLocalizedString("更新密码", comment: ""))
-    }
-
-    private var canConfirm: Bool {
-        !currentPassword.isEmpty && !newPassword.isEmpty && newPassword == confirmation
-    }
-
-    private func updatePassword() {
-        do {
-            try lockManager.setPassword(
-                currentPassword: currentPassword,
-                newPassword: newPassword,
-                confirmation: confirmation
-            )
-            onCompletion()
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
+        case .enableDatabaseKeychainStorage:
+            return "enableDatabaseKeychainStorage"
+        case .disableDatabaseKeychainStorage:
+            return "disableDatabaseKeychainStorage"
         }
     }
 }

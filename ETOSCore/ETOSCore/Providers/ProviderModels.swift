@@ -94,9 +94,13 @@ public struct NetworkProxyConfiguration: Codable, Hashable, Sendable {
 
 /// 代表一个用户自定义的 API 服务提供商
 public struct Provider: Codable, Identifiable, Hashable {
+    public static let defaultChatEndpointPath = "/chat/completions"
+
     public var id: UUID
     public var name: String
     public var baseURL: String
+    /// OpenAI 兼容聊天补全端点后缀。
+    public var chatEndpointPath: String
     /// 提供商 API Key，会随 Provider 一起持久化到 JSON（明文）。
     public var apiKeys: [String]
     public var apiFormat: String // 例如: "openai-compatible"
@@ -109,6 +113,7 @@ public struct Provider: Codable, Identifiable, Hashable {
         id: UUID = UUID(),
         name: String,
         baseURL: String,
+        chatEndpointPath: String = Provider.defaultChatEndpointPath,
         apiKeys: [String],
         apiFormat: String,
         models: [Model] = [],
@@ -118,6 +123,7 @@ public struct Provider: Codable, Identifiable, Hashable {
         self.id = id
         self.name = name
         self.baseURL = baseURL
+        self.chatEndpointPath = Self.normalizedChatEndpointPath(chatEndpointPath)
         self.apiKeys = apiKeys
         self.apiFormat = apiFormat
         self.models = models
@@ -126,7 +132,7 @@ public struct Provider: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, baseURL, apiKeys, apiFormat, models, headerOverrides, proxyConfiguration
+        case id, name, baseURL, chatEndpointPath, chatCompletionsPath, apiKeys, apiFormat, models, headerOverrides, proxyConfiguration
     }
 
     public init(from decoder: Decoder) throws {
@@ -134,6 +140,10 @@ public struct Provider: Codable, Identifiable, Hashable {
         self.id = try container.decode(UUID.self, forKey: .id)
         self.name = try container.decode(String.self, forKey: .name)
         self.baseURL = try container.decode(String.self, forKey: .baseURL)
+        let decodedChatEndpointPath = try container.decodeIfPresent(String.self, forKey: .chatEndpointPath)
+            ?? container.decodeIfPresent(String.self, forKey: .chatCompletionsPath)
+            ?? Self.defaultChatEndpointPath
+        self.chatEndpointPath = Self.normalizedChatEndpointPath(decodedChatEndpointPath)
         self.apiKeys = try container.decodeIfPresent([String].self, forKey: .apiKeys) ?? []
         self.apiFormat = try container.decode(String.self, forKey: .apiFormat)
         self.models = try container.decodeIfPresent([Model].self, forKey: .models) ?? []
@@ -146,6 +156,10 @@ public struct Provider: Codable, Identifiable, Hashable {
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
         try container.encode(baseURL, forKey: .baseURL)
+        let normalizedEndpoint = self.normalizedChatEndpointPath
+        if normalizedEndpoint != Self.defaultChatEndpointPath {
+            try container.encode(normalizedEndpoint, forKey: .chatEndpointPath)
+        }
         if !apiKeys.isEmpty {
             try container.encode(apiKeys, forKey: .apiKeys)
         }
@@ -158,6 +172,36 @@ public struct Provider: Codable, Identifiable, Hashable {
             try container.encode(proxyConfiguration, forKey: .proxyConfiguration)
         }
     }
+
+    public var normalizedChatEndpointPath: String {
+        Self.normalizedChatEndpointPath(chatEndpointPath)
+    }
+
+    public static func normalizedChatEndpointPath(_ value: String) -> String {
+        normalizedEndpointPath(value, defaultPath: defaultChatEndpointPath)
+    }
+
+    public static func normalizedEndpointPath(_ value: String, defaultPath: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPath = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !trimmedPath.isEmpty else {
+            return defaultPath
+        }
+        return "/" + trimmedPath
+    }
+
+    public static func appendingEndpointPath(
+        _ endpointPath: String,
+        to baseURL: URL,
+        defaultPath: String
+    ) -> URL {
+        let normalizedPath = normalizedEndpointPath(endpointPath, defaultPath: defaultPath)
+        return normalizedPath
+            .split(separator: "/")
+            .reduce(baseURL) { url, component in
+                url.appendingPathComponent(String(component))
+            }
+    }
 }
 
 /// 代表一个在提供商下的具体模型
@@ -165,9 +209,16 @@ public enum ModelKind: String, Codable, Hashable, CaseIterable, Sendable {
     case chat
     case image
     case embedding
+    // 旧版本曾把专用服务路由暴露为模型类型；保留原始值只为兼容已有配置。
     case rerank
-    case speechToText
     case textToSpeech
+
+    /// 普通模型配置只呈现用户能够直接使用的三种用途。
+    public static let allCases: [ModelKind] = [
+        .chat,
+        .image,
+        .embedding
+    ]
 
     public var localizedName: String {
         switch self {
@@ -179,8 +230,6 @@ public enum ModelKind: String, Codable, Hashable, CaseIterable, Sendable {
             return NSLocalizedString("嵌入", comment: "模型主用途：嵌入")
         case .rerank:
             return NSLocalizedString("重排", comment: "模型主用途：重排")
-        case .speechToText:
-            return NSLocalizedString("语音转文字", comment: "模型主用途：语音转文字")
         case .textToSpeech:
             return NSLocalizedString("文字转语音", comment: "模型主用途：文字转语音")
         }
@@ -191,6 +240,7 @@ public enum ModelModality: String, Codable, Hashable, CaseIterable, Sendable {
     case text
     case image
     case audio
+    case video
     case file
 
     public static let outputCases: [ModelModality] = [.text, .image, .audio]
@@ -203,6 +253,8 @@ public enum ModelModality: String, Codable, Hashable, CaseIterable, Sendable {
             return NSLocalizedString("图像", comment: "模型模态：图像")
         case .audio:
             return NSLocalizedString("音频", comment: "模型模态：音频")
+        case .video:
+            return NSLocalizedString("视频", comment: "模型模态：视频")
         case .file:
             return NSLocalizedString("文件", comment: "模型模态：文件")
         }
@@ -215,12 +267,11 @@ public enum ModelCapability: String, Codable, Hashable, CaseIterable, Sendable {
     case streaming
     case jsonMode
     case embedding
-    case speechToText
     case textToSpeech
 
     public static let editableCases: [ModelCapability] = [
         .toolCalling,
-        .embedding
+        .reasoning
     ]
 
     public var localizedName: String {
@@ -235,8 +286,6 @@ public enum ModelCapability: String, Codable, Hashable, CaseIterable, Sendable {
             return NSLocalizedString("JSON 模式", comment: "模型协议能力：JSON 模式")
         case .embedding:
             return NSLocalizedString("嵌入", comment: "模型兼容能力：嵌入")
-        case .speechToText:
-            return NSLocalizedString("语音转文字", comment: "模型兼容能力：语音转文字")
         case .textToSpeech:
             return NSLocalizedString("文字转语音", comment: "模型兼容能力：文字转语音")
         }
@@ -248,7 +297,6 @@ public struct Model: Codable, Identifiable, Hashable {
     public enum Capability: String, Codable, Hashable, Sendable {
         case chat
         case toolCalling
-        case speechToText
         case textToSpeech
         case embedding
         case imageGeneration
@@ -265,6 +313,7 @@ public struct Model: Codable, Identifiable, Hashable {
     public var id: UUID
     public var modelName: String // 模型ID，例如: "deepseek-chat"
     public var displayName: String
+    public var pickerGroupName: String?
     public var isActivated: Bool
     public var overrideParameters: [String: JSONValue]
     public var kind: ModelKind
@@ -280,6 +329,7 @@ public struct Model: Codable, Identifiable, Hashable {
         id: UUID = UUID(),
         modelName: String,
         displayName: String? = nil,
+        pickerGroupName: String? = nil,
         isActivated: Bool = false,
         overrideParameters: [String: JSONValue] = [:],
         kind: ModelKind? = .chat,
@@ -302,6 +352,7 @@ public struct Model: Codable, Identifiable, Hashable {
         self.id = id
         self.modelName = modelName
         self.displayName = displayName ?? modelName
+        self.pickerGroupName = Self.normalizedPickerGroupName(pickerGroupName)
         self.isActivated = isActivated
         self.overrideParameters = overrideParameters
         self.kind = normalized.kind
@@ -319,6 +370,7 @@ public struct Model: Codable, Identifiable, Hashable {
         id: UUID = UUID(),
         modelName: String,
         displayName: String? = nil,
+        pickerGroupName: String? = nil,
         isActivated: Bool = false,
         overrideParameters: [String: JSONValue] = [:],
         capabilities legacyCapabilities: [Capability],
@@ -331,6 +383,7 @@ public struct Model: Codable, Identifiable, Hashable {
             id: id,
             modelName: modelName,
             displayName: displayName,
+            pickerGroupName: pickerGroupName,
             isActivated: isActivated,
             overrideParameters: overrideParameters,
             kind: nil,
@@ -343,7 +396,7 @@ public struct Model: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, modelName, displayName, isActivated, overrideParameters
+        case id, modelName, displayName, pickerGroupName, isActivated, overrideParameters
         case kind, inputModalities, outputModalities, capabilities
         case requestBodyOverrideMode
         case rawRequestBodyJSON
@@ -356,9 +409,13 @@ public struct Model: Codable, Identifiable, Hashable {
         self.id = try container.decode(UUID.self, forKey: .id)
         self.modelName = try container.decode(String.self, forKey: .modelName)
         self.displayName = try container.decodeIfPresent(String.self, forKey: .displayName) ?? modelName
+        self.pickerGroupName = Self.normalizedPickerGroupName(
+            try container.decodeIfPresent(String.self, forKey: .pickerGroupName)
+        )
         self.isActivated = try container.decodeIfPresent(Bool.self, forKey: .isActivated) ?? false
         self.overrideParameters = try container.decodeIfPresent([String: JSONValue].self, forKey: .overrideParameters) ?? [:]
-        let decodedKind = try container.decodeIfPresent(ModelKind.self, forKey: .kind)
+        let decodedKind = try container.decodeIfPresent(String.self, forKey: .kind)
+            .flatMap(ModelKind.init(rawValue:))
         let decodedInputModalities = try container.decodeIfPresent([String].self, forKey: .inputModalities)
             .map { Self.orderedModalities($0.compactMap(ModelModality.init(rawValue:))) }
         let decodedOutputModalities = try container.decodeIfPresent([String].self, forKey: .outputModalities)
@@ -391,6 +448,9 @@ public struct Model: Codable, Identifiable, Hashable {
         if displayName != modelName {
             try container.encode(displayName, forKey: .displayName)
         }
+        if let pickerGroupName = Self.normalizedPickerGroupName(pickerGroupName) {
+            try container.encode(pickerGroupName, forKey: .pickerGroupName)
+        }
         try container.encode(isActivated, forKey: .isActivated)
         if !overrideParameters.isEmpty {
             try container.encode(overrideParameters, forKey: .overrideParameters)
@@ -419,5 +479,13 @@ public struct Model: Codable, Identifiable, Hashable {
         if let pricing = pricing?.normalized, !pricing.isEffectivelyEmpty {
             try container.encode(pricing, forKey: .pricing)
         }
+    }
+
+    public static func normalizedPickerGroupName(_ groupName: String?) -> String? {
+        guard let trimmed = groupName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 }

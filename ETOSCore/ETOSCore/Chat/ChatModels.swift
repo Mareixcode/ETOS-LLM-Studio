@@ -137,6 +137,31 @@ public struct MessageResponseMetrics: Codable, Hashable, Sendable {
     }
 }
 
+/// 视频理解模型生成并持久化的附件语义。
+public struct VideoAnalysisResult: Identifiable, Codable, Hashable, Sendable {
+    public let fileName: String
+    public let content: String
+    public let modelIdentifier: String
+    public let modelDisplayName: String
+    public let generatedAt: Date
+
+    public var id: String { fileName }
+
+    public init(
+        fileName: String,
+        content: String,
+        modelIdentifier: String,
+        modelDisplayName: String,
+        generatedAt: Date = Date()
+    ) {
+        self.fileName = fileName
+        self.content = content
+        self.modelIdentifier = modelIdentifier
+        self.modelDisplayName = modelDisplayName
+        self.generatedAt = generatedAt
+    }
+}
+
 /// 聊天消息数据结构 (App的"官方语言")
 /// 这是一个纯粹的数据模型，不包含任何UI状态
 /// 支持多版本历史记录功能 - 重试时保留旧版本，用户可在版本间切换
@@ -186,6 +211,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 
     public var reasoningContent: String? // 用于存放推理过程等附加信息
     public var reasoningProviderSpecificFields: [String: JSONValue]? // 推理延续所需的协议元数据
+    public var providerResponseMetadata: [String: JSONValue]? // 响应级协议元数据，例如 Responses 的 ID 与 output items
     public var toolCalls: [InternalToolCall]? // AI发出的工具调用指令
     public var toolCallsPlacement: ToolCallsPlacement? // 工具调用在正文前/后显示
     public var tokenUsage: MessageTokenUsage? // 最近一次调用消耗的 Token 统计
@@ -194,7 +220,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     public var audioFileName: String? // 关联的音频文件名，存储在 AudioFiles 目录下
     public var imageFileNames: [String]? // 关联的图片文件名列表，存储在 ImageFiles 目录下
     public var fileFileNames: [String]? // 关联的文件名列表，存储在 FileAttachments 目录下
+    public var videoAnalysisResults: [VideoAnalysisResult]? // 视频附件的持久化语义解析结果
     public var fullErrorContent: String? // 错误消息的完整原始内容（当内容被截断时使用）
+    public var sentSystemPromptSnapshot: String? // 该回复请求实际发送的 system 角色消息快照；nil 表示旧消息未记录
     public var responseMetrics: MessageResponseMetrics? // 单次请求的响应测速信息
     public var responseGroupID: UUID? // 回复组 ID，通常指向锚点 user 消息
     public var responseAttemptID: UUID? // 当前消息所属的一次回复尝试
@@ -208,6 +236,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         requestedAt: Date? = nil,
         reasoningContent: String? = nil,
         reasoningProviderSpecificFields: [String: JSONValue]? = nil,
+        providerResponseMetadata: [String: JSONValue]? = nil,
         toolCalls: [InternalToolCall]? = nil,
         toolCallsPlacement: ToolCallsPlacement? = nil,
         tokenUsage: MessageTokenUsage? = nil,
@@ -216,7 +245,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         audioFileName: String? = nil,
         imageFileNames: [String]? = nil,
         fileFileNames: [String]? = nil,
+        videoAnalysisResults: [VideoAnalysisResult]? = nil,
         fullErrorContent: String? = nil,
+        sentSystemPromptSnapshot: String? = nil,
         responseMetrics: MessageResponseMetrics? = nil,
         responseGroupID: UUID? = nil,
         responseAttemptID: UUID? = nil,
@@ -230,6 +261,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         self.currentVersionIndex = 0
         self.reasoningContent = reasoningContent
         self.reasoningProviderSpecificFields = reasoningProviderSpecificFields
+        self.providerResponseMetadata = providerResponseMetadata
         self.toolCalls = toolCalls
         self.toolCallsPlacement = toolCallsPlacement
         self.tokenUsage = tokenUsage
@@ -238,7 +270,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         self.audioFileName = audioFileName
         self.imageFileNames = imageFileNames
         self.fileFileNames = fileFileNames
+        self.videoAnalysisResults = videoAnalysisResults
         self.fullErrorContent = fullErrorContent
+        self.sentSystemPromptSnapshot = sentSystemPromptSnapshot
         self.responseMetrics = responseMetrics
         self.responseGroupID = responseGroupID
         self.responseAttemptID = responseAttemptID
@@ -287,9 +321,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, role, requestedAt, content, currentVersionIndex
-        case reasoningContent, reasoningProviderSpecificFields, toolCalls, toolCallsPlacement, tokenUsage
+        case reasoningContent, reasoningProviderSpecificFields, providerResponseMetadata, toolCalls, toolCallsPlacement, tokenUsage
         case modelReference, costEstimate
-        case audioFileName, imageFileNames, fileFileNames, fullErrorContent, responseMetrics
+        case audioFileName, imageFileNames, fileFileNames, videoAnalysisResults, fullErrorContent, sentSystemPromptSnapshot, responseMetrics
         case responseGroupID, responseAttemptID, responseAttemptIndex, selectedResponseAttemptID
     }
 
@@ -318,6 +352,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 
         self.reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
         self.reasoningProviderSpecificFields = try container.decodeIfPresent([String: JSONValue].self, forKey: .reasoningProviderSpecificFields)
+        self.providerResponseMetadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .providerResponseMetadata)
         self.toolCalls = try container.decodeIfPresent([InternalToolCall].self, forKey: .toolCalls)
         self.toolCallsPlacement = try container.decodeIfPresent(ToolCallsPlacement.self, forKey: .toolCallsPlacement)
         self.tokenUsage = try container.decodeIfPresent(MessageTokenUsage.self, forKey: .tokenUsage)
@@ -326,7 +361,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         self.audioFileName = try container.decodeIfPresent(String.self, forKey: .audioFileName)
         self.imageFileNames = try container.decodeIfPresent([String].self, forKey: .imageFileNames)
         self.fileFileNames = try container.decodeIfPresent([String].self, forKey: .fileFileNames)
+        self.videoAnalysisResults = try container.decodeIfPresent([VideoAnalysisResult].self, forKey: .videoAnalysisResults)
         self.fullErrorContent = try container.decodeIfPresent(String.self, forKey: .fullErrorContent)
+        self.sentSystemPromptSnapshot = try container.decodeIfPresent(String.self, forKey: .sentSystemPromptSnapshot)
         self.responseMetrics = try container.decodeIfPresent(MessageResponseMetrics.self, forKey: .responseMetrics)
         self.responseGroupID = try container.decodeIfPresent(UUID.self, forKey: .responseGroupID)
         self.responseAttemptID = try container.decodeIfPresent(UUID.self, forKey: .responseAttemptID)
@@ -350,6 +387,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 
         try container.encodeIfPresent(reasoningContent, forKey: .reasoningContent)
         try container.encodeIfPresent(reasoningProviderSpecificFields, forKey: .reasoningProviderSpecificFields)
+        try container.encodeIfPresent(providerResponseMetadata, forKey: .providerResponseMetadata)
         try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
         try container.encodeIfPresent(toolCallsPlacement, forKey: .toolCallsPlacement)
         try container.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
@@ -358,7 +396,9 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(audioFileName, forKey: .audioFileName)
         try container.encodeIfPresent(imageFileNames, forKey: .imageFileNames)
         try container.encodeIfPresent(fileFileNames, forKey: .fileFileNames)
+        try container.encodeIfPresent(videoAnalysisResults, forKey: .videoAnalysisResults)
         try container.encodeIfPresent(fullErrorContent, forKey: .fullErrorContent)
+        try container.encodeIfPresent(sentSystemPromptSnapshot, forKey: .sentSystemPromptSnapshot)
         try container.encodeIfPresent(responseMetrics, forKey: .responseMetrics)
         try container.encodeIfPresent(responseGroupID, forKey: .responseGroupID)
         try container.encodeIfPresent(responseAttemptID, forKey: .responseAttemptID)

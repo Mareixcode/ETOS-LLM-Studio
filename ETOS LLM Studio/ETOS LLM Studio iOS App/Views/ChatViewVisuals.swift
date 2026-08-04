@@ -10,7 +10,70 @@ import SwiftUI
 import UIKit
 import AVFoundation
 
+/// 聊天页短暂显示的轻量状态通知，由调用方决定内容与强调色。
+struct ChatTransientNotice {
+    let message: String
+    let systemImage: String
+    let tint: Color
+}
+
 extension ChatView {
+    func showChatTransientNotice(
+        _ notice: ChatTransientNotice,
+        duration: Duration = .seconds(2)
+    ) {
+        chatTransientNoticeDismissTask?.cancel()
+
+        if accessibilityReduceMotion {
+            chatTransientNotice = notice
+        } else {
+            withAnimation(.easeOut(duration: 0.18)) {
+                chatTransientNotice = notice
+            }
+        }
+
+        chatTransientNoticeDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: duration)
+            guard !Task.isCancelled else { return }
+
+            if accessibilityReduceMotion {
+                chatTransientNotice = nil
+            } else {
+                withAnimation(.easeIn(duration: 0.18)) {
+                    chatTransientNotice = nil
+                }
+            }
+            chatTransientNoticeDismissTask = nil
+        }
+    }
+
+    func chatTransientNoticeBanner(_ notice: ChatTransientNotice) -> some View {
+        let shape = Capsule()
+
+        return HStack(spacing: 8) {
+            Image(systemName: notice.systemImage)
+                .foregroundStyle(notice.tint)
+                .symbolRenderingMode(.hierarchical)
+
+            Text(notice.message)
+                .foregroundStyle(.primary)
+        }
+        .etFont(.footnote.weight(.semibold))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background {
+            if #available(iOS 26.0, *), isLiquidGlassEnabled {
+                shape
+                    .fill(Color.primary.opacity(0.04))
+                    .glassEffect(.clear, in: shape)
+            } else {
+                shape.fill(.ultraThinMaterial)
+            }
+        }
+        .overlay(shape.stroke(notice.tint.opacity(0.25), lineWidth: 0.5))
+        .shadow(color: Color.black.opacity(0.1), radius: 8, x: 0, y: 3)
+    }
+
     func memoryRetryStoppedNoticeBanner(text: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -120,7 +183,7 @@ extension ChatView {
                 )
                 .frame(maxWidth: .infinity)
                 .frame(height: navBarHeight + adaptiveHeight)
-                .ignoresSafeArea(.container, edges: .top)
+                .ignoresSafeArea(.container, edges: [.top, .horizontal])
                 .allowsHitTesting(false)
         }
     }
@@ -132,12 +195,16 @@ extension ChatView {
             if isLiquidGlassEnabled {
                 if #available(iOS 26.0, *) {
                     scrollToBottomButtonIcon
-                        .glassEffect(.regular.tint(scrollToBottomButtonGlassTintColor).interactive(), in: Circle())
+                        .background(
+                            Circle()
+                                .fill(scrollToBottomButtonMaterialOverlayColor)
+                        )
+                        .glassEffect(.clear.interactive(), in: Circle())
                         .overlay(
                             Circle()
-                                .stroke(scrollToBottomButtonGlassStrokeColor, lineWidth: 0.8)
+                                .stroke(scrollToBottomButtonMaterialStrokeColor, lineWidth: 0.5)
                         )
-                        .shadow(color: scrollToBottomButtonShadowColor, radius: 8, x: 0, y: 3)
+                        .shadow(color: scrollToBottomButtonMaterialShadowColor, radius: 6, x: 0, y: 2)
                 } else {
                     scrollToBottomButtonIcon
                         .background(scrollToBottomButtonBackground)
@@ -155,18 +222,22 @@ extension ChatView {
         Image(systemName: "chevron.down")
             .etFont(.system(size: 16, weight: .semibold))
             .foregroundColor(scrollToBottomButtonIconColor)
-            .frame(width: 40, height: 40)
+            .frame(width: scrollToBottomButtonSize, height: scrollToBottomButtonSize)
             .contentShape(Circle())
     }
 
     var scrollToBottomButtonBackground: some View {
         Circle()
-            .fill(scrollToBottomButtonFillColor)
+            .fill(.ultraThinMaterial)
             .overlay(
                 Circle()
-                    .stroke(scrollToBottomButtonBorderColor, lineWidth: 0.8)
+                    .fill(scrollToBottomButtonMaterialOverlayColor)
             )
-            .shadow(color: scrollToBottomButtonShadowColor, radius: 6, x: 0, y: 2)
+            .overlay(
+                Circle()
+                    .stroke(scrollToBottomButtonMaterialStrokeColor, lineWidth: 0.5)
+            )
+            .shadow(color: scrollToBottomButtonMaterialShadowColor, radius: 6, x: 0, y: 2)
     }
 
     /// Telegram 风格历史加载提示

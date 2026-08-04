@@ -99,6 +99,12 @@ public struct FileAttachmentTextExtractor {
     public init() {}
 
     public func extractText(from attachment: FileAttachment) throws -> String {
+        let extractedText = try extractTextPreservingLayout(from: attachment)
+        return normalizeWhitespace(in: extractedText)
+    }
+
+    /// 为无截断上下文压缩保留原始换行和空白，不执行展示用途的空白归一化。
+    public func extractTextPreservingLayout(from attachment: FileAttachment) throws -> String {
         let fileName = (attachment.fileName as NSString).lastPathComponent
         let fileExtension = (fileName as NSString).pathExtension.lowercased()
         let extractedText: String
@@ -121,11 +127,10 @@ public struct FileAttachmentTextExtractor {
             }
         }
 
-        let normalized = normalizeWhitespace(in: extractedText)
-        guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !extractedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw FileAttachmentTextExtractionError.emptyText(fileName: fileName)
         }
-        return normalized
+        return extractedText
     }
 
     private func extractDOCXText(from data: Data, fileName: String) throws -> String {
@@ -217,15 +222,20 @@ public struct FileAttachmentTextExtractor {
     }
 
     private func decodePlainText(from data: Data) -> String? {
-        let encodings: [String.Encoding] = [
-            .utf8,
-            .utf16,
-            .utf16LittleEndian,
-            .utf16BigEndian,
-            .isoLatin1,
-            .windowsCP1252
-        ]
-        for encoding in encodings {
+        if let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+
+        if data.starts(with: [0xFF, 0xFE]),
+           let text = String(data: data, encoding: .utf16LittleEndian) {
+            return text
+        }
+        if data.starts(with: [0xFE, 0xFF]),
+           let text = String(data: data, encoding: .utf16BigEndian) {
+            return text
+        }
+
+        for encoding in [String.Encoding.windowsCP1252, .isoLatin1] {
             if let text = String(data: data, encoding: encoding) {
                 return text
             }
@@ -306,13 +316,43 @@ public struct FileAttachmentTextExtractor {
     }
 }
 
+public enum FileAttachmentPreviewLimits {
+    public static let textCharacterLimit = AppLogTextPaginator.defaultPageSize
+}
+
 public struct FileAttachmentPreviewPayload: Identifiable {
     public let id = UUID()
     public let fileName: String
     public let fileSize: Int64
     public let text: String?
+    public let fullText: String?
     public let errorMessage: String?
     public let lineCount: Int
+    public let isTextTruncated: Bool
+    public let originalCharacterCount: Int
+    public let previewCharacterLimit: Int
+
+    public init(
+        fileName: String,
+        fileSize: Int64,
+        text: String?,
+        fullText: String? = nil,
+        errorMessage: String?,
+        lineCount: Int,
+        isTextTruncated: Bool = false,
+        originalCharacterCount: Int? = nil,
+        previewCharacterLimit: Int = FileAttachmentPreviewLimits.textCharacterLimit
+    ) {
+        self.fileName = fileName
+        self.fileSize = fileSize
+        self.text = text
+        self.fullText = fullText ?? text
+        self.errorMessage = errorMessage
+        self.lineCount = lineCount
+        self.isTextTruncated = isTextTruncated
+        self.originalCharacterCount = originalCharacterCount ?? text?.count ?? 0
+        self.previewCharacterLimit = previewCharacterLimit
+    }
 
     public var canPreview: Bool {
         text != nil
@@ -362,12 +402,17 @@ public enum FileAttachmentPreviewLoader {
 
         do {
             let text = try extractor.extractText(from: attachment)
+            let preview = previewText(from: text)
             return FileAttachmentPreviewPayload(
                 fileName: fileName,
                 fileSize: Int64(data.count),
-                text: text,
+                text: preview.text,
+                fullText: text,
                 errorMessage: nil,
-                lineCount: lineCount(in: text)
+                lineCount: lineCount(in: text),
+                isTextTruncated: preview.isTruncated,
+                originalCharacterCount: preview.originalCharacterCount,
+                previewCharacterLimit: FileAttachmentPreviewLimits.textCharacterLimit
             )
         } catch {
             return FileAttachmentPreviewPayload(
@@ -378,6 +423,18 @@ public enum FileAttachmentPreviewLoader {
                 lineCount: 0
             )
         }
+    }
+
+    private static func previewText(from text: String) -> (text: String, isTruncated: Bool, originalCharacterCount: Int) {
+        let characterCount = text.count
+        guard characterCount > FileAttachmentPreviewLimits.textCharacterLimit else {
+            return (text, false, characterCount)
+        }
+        return (
+            String(text.prefix(FileAttachmentPreviewLimits.textCharacterLimit)),
+            true,
+            characterCount
+        )
     }
 
     private static func lineCount(in text: String) -> Int {
@@ -404,6 +461,7 @@ public enum FileAttachmentPreviewLoader {
 private final class XMLTextCollector: NSObject, XMLParserDelegate {
     private let acceptedTags: Set<String>
     private var isCollecting = false
+    private var currentParts: [String] = []
     private var parts: [String] = []
 
     var text: String {
@@ -421,12 +479,15 @@ private final class XMLTextCollector: NSObject, XMLParserDelegate {
         qualifiedName qName: String?,
         attributes attributeDict: [String: String] = [:]
     ) {
-        isCollecting = acceptedTags.contains(Self.localName(from: elementName))
+        if acceptedTags.contains(Self.localName(from: elementName)) {
+            currentParts = []
+            isCollecting = true
+        }
     }
 
     func parser(_ parser: XMLParser, foundCharacters string: String) {
         guard isCollecting else { return }
-        parts.append(string)
+        currentParts.append(string)
     }
 
     func parser(
@@ -436,6 +497,8 @@ private final class XMLTextCollector: NSObject, XMLParserDelegate {
         qualifiedName qName: String?
     ) {
         if acceptedTags.contains(Self.localName(from: elementName)) {
+            parts.append(currentParts.joined())
+            currentParts = []
             isCollecting = false
         }
     }

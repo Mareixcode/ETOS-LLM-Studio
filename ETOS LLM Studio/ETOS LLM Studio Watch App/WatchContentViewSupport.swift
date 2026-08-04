@@ -12,11 +12,23 @@ import ETOSCore
 import AVKit
 import AVFoundation
 
+struct WatchChatTransientNotice {
+    let message: String
+    let systemImage: String
+    let tint: Color
+}
+
 extension ContentView {
     var legacyChatRootView: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottom) {
                 chatList(proxy: proxy)
+
+                WatchRoleplaySessionScriptHost(
+                    sessionID: viewModel.currentSession?.id,
+                    messageID: viewModel.displayMessages.last?.message.id,
+                    versionIndex: viewModel.displayMessages.last?.message.getCurrentVersionIndex() ?? 0
+                )
 
                 if showScrollToBottomButton {
                     scrollToBottomButton(proxy: proxy)
@@ -26,22 +38,71 @@ extension ContentView {
         .navigationTitle(viewModel.currentSession?.name ?? NSLocalizedString("新对话", comment: ""))
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(viewModel: viewModel, requestedDestination: $settingsDestination)
+                .appLockOverlayLayer()
         }
         .sheet(isPresented: $isSessionListPresented) {
             NavigationStack {
                 sessionListView
             }
+            .appLockOverlayLayer()
+        }
+        .sheet(isPresented: $isContextCompressionPresented) {
+            if let session = viewModel.currentSession {
+                NavigationStack {
+                    WatchContextCompressionOptionsView(
+                        session: session,
+                        models: viewModel.activatedChatModels,
+                        selectedModelID: viewModel.selectedModel?.id,
+                        onCompress: { options, progress in
+                            try await viewModel.createCompressedContinuation(
+                                from: session.id,
+                                options: options,
+                                progress: progress
+                            )
+                        }
+                    )
+                }
+                .appLockOverlayLayer()
+            }
+        }
+        .sheet(item: $watchInputQuickActionDestination) { action in
+            NavigationStack {
+                watchInputQuickActionDestinationView(for: action)
+            }
+            .appLockOverlayLayer()
+        }
+        .sheet(item: $contextCompressionReminderSourceSession) { session in
+            NavigationStack {
+                WatchContextCompressionOneTapView(
+                    session: session,
+                    onCompress: { progress in
+                        try await viewModel.createCompressedContinuation(
+                            from: session.id,
+                            options: ContextCompressionOptions(
+                                compressionModelIdentifier: viewModel.selectedModel?.id
+                            ),
+                            progress: progress
+                        )
+                    }
+                )
+            }
+            .appLockOverlayLayer()
         }
         .sheet(item: $viewModel.activeSheet) { item in
             sheetView(for: item)
+                .appLockOverlayLayer()
         }
         .sheet(item: Binding(
             get: { fullErrorContent.map { FullErrorContentWrapper(content: $0) } },
             set: { _ in fullErrorContent = nil }
         )) { wrapper in
             FullErrorContentView(content: wrapper.content)
+                .appLockOverlayLayer()
         }
-        .sheet(item: $viewModel.activeAskUserInputRequest) { request in
+        .sheet(item: $presentedAskUserInputRequest, onDismiss: {
+            presentedAskUserInputRequest = nil
+            refreshWatchPresentationPriorities()
+        }) { request in
             WatchAskUserInputView(
                 request: request,
                 onSubmit: { answers in
@@ -51,22 +112,63 @@ extension ContentView {
                     viewModel.cancelAskUserInputRequest(using: request)
                 }
             )
+            .appLockOverlayLayer()
+        }
+        .sheet(item: watchGlobalToolPermissionRequestBinding) { request in
+            WatchGlobalToolPermissionView(request: request) { decision in
+                toolPermissionCenter.resolveActiveRequest(with: decision)
+            }
+            .interactiveDismissDisabled(true)
+            .appLockOverlayLayer()
         }
         .navigationDestination(item: $messageActionsTarget) { target in
             messageActionsView(for: target.id)
         }
+        .navigationDestination(item: $selectedMessagesExportTarget) { target in
+            ChatExportFormatsView(
+                session: viewModel.currentSession,
+                messages: viewModel.allMessagesForSession,
+                upToMessageID: nil,
+                selectedMessageIDs: target.messageIDs
+            )
+        }
         .sheet(item: $messageRewriteTarget) { target in
             NavigationStack {
-                rewriteMessageView(for: target.id)
+                rewriteMessageView(for: target)
             }
+            .appLockOverlayLayer()
         }
-        .alert(NSLocalizedString("数据库已自动恢复", comment: ""), isPresented: Binding(
+        .alert(NSLocalizedString("数据库已恢复", comment: ""), isPresented: Binding(
             get: { launchRecoveryNoticeMessage != nil },
             set: { if !$0 { launchRecoveryNoticeMessage = nil } }
         )) {
             Button(NSLocalizedString("好的", comment: ""), role: .cancel) { }
         } message: {
             Text(launchRecoveryNoticeMessage ?? "")
+        }
+        .alert(NSLocalizedString("检测到数据库损坏", comment: ""), isPresented: Binding(
+            get: { launchRecoveryRequest != nil },
+            set: { if !$0 { launchRecoveryRequest = nil } }
+        )) {
+            Button(NSLocalizedString("稍后再说", comment: ""), role: .cancel) {
+                Persistence.dismissPendingLaunchRecoveryRequest()
+                launchRecoveryRequest = nil
+            }
+            Button(NSLocalizedString("从启动备份恢复", comment: "")) {
+                restoreLaunchBackupFromPrompt()
+            }
+        } message: {
+            Text(launchRecoveryRequest?.message ?? "")
+        }
+        .alert(NSLocalizedString("启动备份恢复失败", comment: ""), isPresented: Binding(
+            get: { launchRecoveryErrorMessage != nil },
+            set: { if !$0 { launchRecoveryErrorMessage = nil } }
+        )) {
+            Button(NSLocalizedString("好的", comment: ""), role: .cancel) {
+                launchRecoveryErrorMessage = nil
+            }
+        } message: {
+            Text(launchRecoveryErrorMessage ?? "")
         }
         .alert(NSLocalizedString("重写失败", comment: "Message rewrite failure alert title"), isPresented: Binding(
             get: { viewModel.messageRewriteErrorMessage != nil },
@@ -78,6 +180,19 @@ extension ContentView {
         } message: {
             Text(viewModel.messageRewriteErrorMessage ?? "")
         }
+        .alert(NSLocalizedString("确认删除所选消息", comment: "Selected messages delete confirmation title"), isPresented: $showSelectedMessagesDeleteConfirm) {
+            Button(NSLocalizedString("删除", comment: ""), role: .destructive) {
+                deleteSelectedMessages()
+            }
+            Button(NSLocalizedString("取消", comment: ""), role: .cancel) { }
+        } message: {
+            Text(
+                String(
+                    format: NSLocalizedString("将删除选中的 %d 个气泡。此操作无法撤销。", comment: "Selected messages delete confirmation message"),
+                    selectedMessageIDs.count
+                )
+            )
+        }
         .sheet(isPresented: $announcementManager.shouldShowAlert) {
             if let announcement = announcementManager.currentAnnouncement {
                 NavigationStack {
@@ -88,11 +203,20 @@ extension ContentView {
                         }
                     )
                 }
+                .appLockOverlayLayer()
+            }
+        }
+        .sheet(isPresented: watchSurveyPresentationBinding) {
+            if let survey = surveyManager.currentSurvey {
+                WatchSurveyResponseView(survey: survey, manager: surveyManager)
+                    .appLockOverlayLayer()
             }
         }
         .task {
+            launchRecoveryRequest = Persistence.currentLaunchRecoveryRequest()
             launchRecoveryNoticeMessage = Persistence.consumeLaunchRecoveryNotice()
             await announcementManager.checkAnnouncement()
+            await surveyManager.checkSurveys(canPresent: !announcementManager.shouldShowAlert)
             scheduleDailyPulsePreparation(after: 1_500_000_000)
             if applyDailyPulseContinuationIfNeeded() {
                 return
@@ -105,12 +229,41 @@ extension ContentView {
                     openFeedbackFromNotification()
                 case .chatSession:
                     openChatSessionFromNotification()
+                case .contextCompression:
+                    openContextCompressionFromNotification()
                 case .achievementJournal:
                     openAchievementJournalFromNotification()
                 case .updateTimeline:
                     openUpdateTimelineFromNotification()
                 }
             }
+        }
+        .onAppear {
+            refreshWatchPresentationPriorities()
+        }
+        .onDisappear {
+            setWatchToolPermissionAutoPresentationBlocked(false)
+        }
+        .onChange(of: watchToolPermissionAutoPresentationBlocked) { _, _ in
+            refreshWatchPresentationPriorities()
+        }
+        .onChange(of: watchModalBlocksAskUserInputPresentation) { _, _ in
+            presentPendingAskUserInputIfPossible()
+        }
+        .onChange(of: announcementManager.shouldShowAlert) { _, isPresented in
+            guard !isPresented else { return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !announcementManager.shouldShowAlert else { return }
+                surveyManager.presentPendingSurveyIfPossible()
+            }
+        }
+        .onChange(of: viewModel.activeAskUserInputRequest?.requestID) { _, _ in
+            syncPresentedAskUserInputRequest()
+            refreshWatchPresentationPriorities()
+        }
+        .onChange(of: presentedAskUserInputRequest?.requestID) { _, _ in
+            refreshWatchPresentationPriorities()
         }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
@@ -121,6 +274,101 @@ extension ContentView {
                 cancelDailyPulsePreparation()
             }
         }
+    }
+
+    var watchModalBlocksAskUserInputPresentation: Bool {
+        isSettingsPresented
+            || isSessionListPresented
+            || isContextCompressionPresented
+            || watchInputQuickActionDestination != nil
+            || contextCompressionReminderSourceSession != nil
+            || viewModel.activeSheet != nil
+            || fullErrorContent != nil
+            || messageActionsTarget != nil
+            || messageRewriteTarget != nil
+            || selectedMessagesExportTarget != nil
+            || isMessageSelectionMode
+            || announcementManager.shouldShowAlert
+            || surveyManager.shouldShowSurvey
+            || launchRecoveryNoticeMessage != nil
+            || launchRecoveryRequest != nil
+            || launchRecoveryErrorMessage != nil
+            || viewModel.messageRewriteErrorMessage != nil
+            || legacyJSONMigrationManager.isMigrationPromptPresented
+            || legacyJSONMigrationManager.isMigrating
+            || legacyJSONMigrationManager.isCleanupPromptPresented
+            || legacyMigrationErrorMessage != nil
+            || isRequestControlsPresented
+            || isAttachmentImportPresented
+            || viewModel.showSpeechErrorAlert
+            || viewModel.showAttachmentImportErrorAlert
+            || viewModel.showDimensionMismatchAlert
+            || viewModel.showMemoryEmbeddingErrorAlert
+            || appLockManager.state == .locked
+            || toolPermissionCenter.hasAutoPresentationBlockers(excluding: ["watch.root.presentation"])
+    }
+
+    var watchToolPermissionAutoPresentationBlocked: Bool {
+        watchModalBlocksAskUserInputPresentation
+            || presentedAskUserInputRequest != nil
+    }
+
+    var watchSurveyPresentationBinding: Binding<Bool> {
+        Binding(
+            get: { surveyManager.shouldShowSurvey },
+            set: { isPresented in
+                if !isPresented {
+                    surveyManager.dismissCurrentSurvey()
+                }
+            }
+        )
+    }
+
+    var watchGlobalToolPermissionRequestBinding: Binding<ToolPermissionRequest?> {
+        Binding(
+            get: { watchGlobalToolPermissionRequest },
+            set: { _ in }
+        )
+    }
+
+    var watchGlobalToolPermissionRequest: ToolPermissionRequest? {
+        guard toolPermissionCenter.canAutoPresentRequestDetails,
+              let request = toolPermissionCenter.activeRequest,
+              let sourceSessionID = request.sourceSessionID,
+              sourceSessionID != viewModel.currentSession?.id else {
+            return nil
+        }
+        return request
+    }
+
+    func setWatchToolPermissionAutoPresentationBlocked(_ blocked: Bool) {
+        toolPermissionCenter.setAutoPresentationBlocked(blocked, reason: "watch.root.presentation")
+    }
+
+    func refreshWatchPresentationPriorities() {
+        setWatchToolPermissionAutoPresentationBlocked(watchToolPermissionAutoPresentationBlocked)
+        presentPendingAskUserInputIfPossible()
+    }
+
+    func syncPresentedAskUserInputRequest() {
+        guard let activeRequest = viewModel.activeAskUserInputRequest else {
+            presentedAskUserInputRequest = nil
+            return
+        }
+        if let presentedAskUserInputRequest,
+           presentedAskUserInputRequest.requestID == activeRequest.requestID {
+            return
+        }
+        presentPendingAskUserInputIfPossible()
+    }
+
+    func presentPendingAskUserInputIfPossible() {
+        guard presentedAskUserInputRequest == nil,
+              !watchModalBlocksAskUserInputPresentation,
+              let request = viewModel.activeAskUserInputRequest else {
+            return
+        }
+        presentedAskUserInputRequest = request
     }
 
     @ViewBuilder
@@ -202,6 +450,62 @@ extension ContentView {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(Color.orange.opacity(0.35), lineWidth: 1)
         )
+    }
+
+    func showChatTransientNotice(
+        _ notice: WatchChatTransientNotice,
+        duration: Duration = .seconds(2)
+    ) {
+        chatTransientNoticeDismissTask?.cancel()
+
+        if accessibilityReduceMotion {
+            chatTransientNotice = notice
+        } else {
+            withAnimation(.easeOut(duration: 0.18)) {
+                chatTransientNotice = notice
+            }
+        }
+
+        chatTransientNoticeDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: duration)
+            guard !Task.isCancelled else { return }
+
+            if accessibilityReduceMotion {
+                chatTransientNotice = nil
+            } else {
+                withAnimation(.easeIn(duration: 0.18)) {
+                    chatTransientNotice = nil
+                }
+            }
+            chatTransientNoticeDismissTask = nil
+        }
+    }
+
+    func chatTransientNoticeBanner(_ notice: WatchChatTransientNotice) -> some View {
+        let shape = Capsule()
+
+        return HStack(spacing: 6) {
+            Image(systemName: notice.systemImage)
+                .foregroundStyle(notice.tint)
+                .symbolRenderingMode(.hierarchical)
+
+            Text(notice.message)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+        }
+        .etFont(.footnote.weight(.semibold))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background {
+            if #available(watchOS 26.0, *), isLiquidGlassEnabled {
+                shape
+                    .fill(Color.primary.opacity(0.04))
+                    .glassEffect(.clear, in: shape)
+            } else {
+                shape.fill(.ultraThinMaterial)
+            }
+        }
+        .overlay(shape.stroke(notice.tint.opacity(0.25), lineWidth: 0.5))
     }
 
     @ViewBuilder
@@ -349,9 +653,9 @@ extension ContentView {
                 message: message,
                 canRetry: viewModel.canRetry(message: message),
                 canRewrite: viewModel.canRewrite(message: message),
-                onCopy: {
+                onInsertText: { text in
                     viewModel.applyToolInputDraftRequest(
-                        AppToolInputDraftRequest(text: message.content, mode: .append)
+                        AppToolInputDraftRequest(text: text, mode: .append)
                     )
                 },
                 onEdit: {
@@ -361,14 +665,26 @@ extension ContentView {
                 onRewrite: {
                     messageRewriteTarget = WatchMessageRewriteNavigationTarget(id: message.id)
                 },
+                onRewriteSelection: { target in
+                    messageRewriteTarget = WatchMessageRewriteNavigationTarget(
+                        id: message.id,
+                        selectionTarget: target
+                    )
+                },
                 onRetry: { message in
                     viewModel.retryMessage(message)
+                },
+                onRetryVideoAnalysis: { message, fileName in
+                    try await viewModel.retryVideoAnalysis(message, fileName: fileName)
                 },
                 onSpeak: { message in
                     viewModel.speakMessage(message)
                 },
                 onStopSpeaking: {
                     viewModel.stopSpeakingMessage()
+                },
+                onSelectMultiple: {
+                    beginMessageSelection(with: message)
                 },
                 onDelete: {
                     viewModel.deleteAllVersions(of: message)
@@ -390,6 +706,7 @@ extension ContentView {
                 onToggleMathRendering: {
                     viewModel.toggleMathRendering(for: message.id)
                 },
+                mathRenderContent: viewModel.preparedMarkdownByMessageID[message.id]?.mathRenderText ?? message.content,
                 onJumpToMessageIndex: { displayIndex in
                     jumpToMessage(displayIndex: displayIndex)
                 },
@@ -405,10 +722,11 @@ extension ContentView {
     }
 
     @ViewBuilder
-    func rewriteMessageView(for messageID: UUID) -> some View {
-        if let message = viewModel.allMessagesForSession.first(where: { $0.id == messageID }) {
+    func rewriteMessageView(for target: WatchMessageRewriteNavigationTarget) -> some View {
+        if let message = viewModel.allMessagesForSession.first(where: { $0.id == target.id }) {
             RewriteMessageView(
                 message: message,
+                selectionTarget: target.selectionTarget,
                 referenceVersions: MessageRewriteReferenceSupport.referenceVersions(
                     for: message,
                     in: viewModel.allMessagesForSession
@@ -417,11 +735,29 @@ extension ContentView {
                 viewModel.rewriteMessage(
                     message,
                     instruction: instruction,
-                    referenceVersions: referenceVersions
+                    referenceVersions: referenceVersions,
+                    selectionTarget: target.selectionTarget
                 )
             }
         } else {
             EmptyView()
+        }
+    }
+
+    func restoreLaunchBackupFromPrompt() {
+        launchRecoveryRequest = nil
+        Task {
+            do {
+                let message = try await Task.detached(priority: .userInitiated) {
+                    try Persistence.restorePendingLaunchBackupRequest()
+                }.value
+                viewModel.reloadAfterSnapshotRestore()
+                _ = Persistence.consumeLaunchRecoveryNotice()
+                launchRecoveryNoticeMessage = message
+            } catch {
+                _ = Persistence.consumeLaunchRecoveryNotice()
+                launchRecoveryErrorMessage = error.localizedDescription
+            }
         }
     }
 

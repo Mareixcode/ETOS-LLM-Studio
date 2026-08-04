@@ -20,10 +20,12 @@ public final class TTSManager: NSObject, ObservableObject {
     var selectedModel: RunnableModel?
     var queue: [QueueItem] = []
     var workerTask: Task<Void, Never>?
+    var workerGeneration = 0
     var prefetchTasks: [UUID: Task<AudioClip, Error>] = [:]
     let prefetchWindowSize: Int = 1
     var isPausedByUser = false
     var activeBackend: ActiveBackend = .none
+    private var isApplicationInBackground = false
 
 #if canImport(AVFoundation)
     var audioPlayer: AVAudioPlayer?
@@ -38,14 +40,17 @@ public final class TTSManager: NSObject, ObservableObject {
         return synthesizer
     }()
     var speechContinuation: CheckedContinuation<Void, Error>?
+    var activeSpeechUtterance: AVSpeechUtterance?
     var speechMonitorTask: Task<Void, Never>?
     var speechDidStart = false
+    var ownsPlaybackAudioSession = false
 #endif
 
     struct QueueItem: Identifiable {
         let id = UUID()
         let messageID: UUID?
         let text: String
+        let playbackModeOverride: TTSPlaybackMode?
     }
 
     /// 用于在朗读结束后执行“重试朗读”
@@ -77,7 +82,20 @@ public final class TTSManager: NSObject, ObservableObject {
         selectedModel = model
     }
 
-    public func speak(_ text: String, messageID: UUID? = nil, flush: Bool = true) {
+    public func speak(
+        _ text: String,
+        messageID: UUID? = nil,
+        flush: Bool = true,
+        playbackModeOverride: TTSPlaybackMode? = nil
+    ) {
+        guard TTSBackgroundPlaybackPolicy.allowsPlayback(
+            isApplicationInBackground: isApplicationInBackground,
+            continuePlaybackInBackground: AppConfigStore.shared.continueTTSPlaybackInBackground
+        ) else {
+            logger.info("应用位于后台且未允许后台继续朗读，忽略朗读请求。")
+            return
+        }
+
         logger.info("TTS 收到朗读请求：原始长度=\(text.count, privacy: .public)")
 #if DEBUG
         print("[TTS] 收到朗读请求，原始长度=\(text.count)")
@@ -103,6 +121,7 @@ public final class TTSManager: NSObject, ObservableObject {
         lastReplayRequest = ReplayRequest(messageID: messageID, text: text)
 
         if flush {
+            workerGeneration &+= 1
             workerTask?.cancel()
             workerTask = nil
             stopCurrentPlayback(clearQueueOnly: true)
@@ -115,12 +134,20 @@ public final class TTSManager: NSObject, ObservableObject {
             playbackState.status = .idle
         }
 
-        let newItems = chunks.map { QueueItem(messageID: messageID, text: $0) }
+        let newItems = chunks.map {
+            QueueItem(
+                messageID: messageID,
+                text: $0,
+                playbackModeOverride: playbackModeOverride
+            )
+        }
         queue.append(contentsOf: newItems)
 
         if workerTask == nil || workerTask?.isCancelled == true {
+            workerGeneration &+= 1
+            let generation = workerGeneration
             workerTask = Task { [weak self] in
-                await self?.processQueue()
+                await self?.processQueue(generation: generation)
             }
         }
     }
@@ -175,14 +202,26 @@ public final class TTSManager: NSObject, ObservableObject {
     }
 
     public func stop() {
-        stopCurrentPlayback(clearQueueOnly: false)
-        clearPrefetchState()
-        queue = []
+        workerGeneration &+= 1
         workerTask?.cancel()
         workerTask = nil
+        stopCurrentPlayback(clearQueueOnly: false)
+        deactivateTTSAudioSessionIfNeeded()
+        clearPrefetchState()
+        queue = []
         isSpeaking = false
         currentSpeakingMessageID = nil
         playbackState = .init(speed: settingsStore.playbackSpeed)
+    }
+
+    /// 根视图在场景进入或离开后台时调用，确保朗读行为与用户设置一致。
+    public func setApplicationIsInBackground(_ isInBackground: Bool) {
+        isApplicationInBackground = isInBackground
+        guard !TTSBackgroundPlaybackPolicy.allowsPlayback(
+            isApplicationInBackground: isInBackground,
+            continuePlaybackInBackground: AppConfigStore.shared.continueTTSPlaybackInBackground
+        ) else { return }
+        stop()
     }
 
     public func seekBy(seconds: TimeInterval) {

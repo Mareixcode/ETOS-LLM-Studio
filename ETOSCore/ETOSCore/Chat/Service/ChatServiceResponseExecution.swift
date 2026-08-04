@@ -80,6 +80,7 @@ extension ChatService {
             loadingMessageID: loadingMessageID,
             sessionID: sessionID
         )
+        storeRuntimeMessagesSnapshot(merged, for: sessionID)
         publishMessagesIfCurrentSession(merged, for: sessionID, keepingSpeedSamplesFor: loadingMessageID)
         return merged
     }
@@ -96,6 +97,7 @@ extension ChatService {
             loadingMessageID: loadingMessageID,
             sessionID: sessionID
         )
+        storeRuntimeMessagesSnapshot(merged, for: sessionID)
         if coalescer.shouldPublish(force: force) {
             publishMessagesIfCurrentSession(merged, for: sessionID, keepingSpeedSamplesFor: loadingMessageID)
         }
@@ -113,6 +115,7 @@ extension ChatService {
             loadingMessageID: loadingMessageID,
             sessionID: sessionID
         )
+        storeRuntimeMessagesSnapshot(merged, for: sessionID)
         if coalescer.shouldFlushPending() {
             publishMessagesIfCurrentSession(merged, for: sessionID, keepingSpeedSamplesFor: loadingMessageID)
         }
@@ -129,11 +132,14 @@ extension ChatService {
             loadingMessageID: loadingMessageID,
             sessionID: sessionID
         )
+        storeRuntimeMessagesSnapshot(merged, for: sessionID)
         persistAndPublishMessages(merged, for: sessionID, keepingSpeedSamplesFor: loadingMessageID)
         return merged
     }
 
     func persistMessages(_ messages: [ChatMessage], for sessionID: UUID) {
+        storeRuntimeMessagesSnapshot(messages, for: sessionID)
+        guard !isTemporaryChatEnabled(for: sessionID) else { return }
         let persisted = normalizedMessagesForPersistence(messages)
         Persistence.saveMessages(persisted, for: sessionID)
     }
@@ -160,15 +166,34 @@ extension ChatService {
         periodicTimeLandmarkIntervalMinutes: Int,
         enableResponseSpeedMetrics: Bool,
         requestStartedAt: Date,
-        requestLogContext: RequestLogContext
+        requestLogContext: RequestLogContext,
+        messagesBeforeResponse: [ChatMessage] = [],
+        responsesFullInputFallbackRequest: URLRequest? = nil
     ) async {
         do {
             let data = try await fetchData(for: request, provider: provider)
             let rawResponse = String(data: data, encoding: .utf8) ?? NSLocalizedString("<二进制数据，无法以 UTF-8 解码>", comment: "Fallback for non-UTF8 response body")
-            logger.log("[Log] 收到 AI 原始响应体:\n---\n\(rawResponse)\n---")
+            logger.log("[Log] 收到 AI 响应体，共 \(data.count) 字节。")
+            logResponseBodySnapshot(
+                context: requestLogContext,
+                request: request,
+                bodyData: data
+            )
 
             do {
                 var parsedMessage = try adapter.parseResponse(data: data)
+                let embeddedImageFileNames = extractGeneratedImagesFromAPIResponseBody(data)
+                if !embeddedImageFileNames.isEmpty {
+                    parsedMessage.imageFileNames = (parsedMessage.imageFileNames ?? []) + embeddedImageFileNames
+                }
+                parsedMessage.providerResponseMetadata = compactResponsesImageGenerationMetadata(
+                    parsedMessage.providerResponseMetadata
+                )
+                attachOpenAIResponsesRequestMetadata(
+                    to: &parsedMessage,
+                    request: request,
+                    messagesBeforeResponse: messagesBeforeResponse
+                )
                 let responseCompletedAt = Date()
                 let totalDuration = max(0, responseCompletedAt.timeIntervalSince(requestStartedAt))
                 if enableResponseSpeedMetrics {
@@ -208,6 +233,7 @@ extension ChatService {
                     aiTopP: aiTopP,
                     systemPrompt: systemPrompt,
                     maxChatHistory: maxChatHistory,
+                    enableStreaming: false,
                     enableMemory: enableMemory,
                     enableMemoryWrite: enableMemoryWrite,
                     enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
@@ -250,6 +276,43 @@ extension ChatService {
                 errorKind: "cancelled"
             )
         } catch NetworkError.badStatusCode(let code, let bodyData) {
+            logResponseBodySnapshot(
+                context: requestLogContext,
+                request: request,
+                bodyData: bodyData,
+                httpStatusCode: code
+            )
+            if let fallbackRequest = responsesFullInputFallbackRequest,
+               isOpenAIResponsesPreviousResponseMissing(statusCode: code, bodyData: bodyData) {
+                logger.info("Responses previous_response_id 已失效，正在改用完整 input 重试。")
+                await handleStandardResponse(
+                    request: fallbackRequest,
+                    provider: provider,
+                    adapter: adapter,
+                    loadingMessageID: loadingMessageID,
+                    currentSessionID: currentSessionID,
+                    userMessage: userMessage,
+                    wasTemporarySession: wasTemporarySession,
+                    availableTools: availableTools,
+                    aiTemperature: aiTemperature,
+                    aiTopP: aiTopP,
+                    systemPrompt: systemPrompt,
+                    maxChatHistory: maxChatHistory,
+                    enableMemory: enableMemory,
+                    enableMemoryWrite: enableMemoryWrite,
+                    enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
+                    includeSystemTime: includeSystemTime,
+                    systemTimeInjectionPosition: systemTimeInjectionPosition,
+                    enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
+                    periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
+                    enableResponseSpeedMetrics: enableResponseSpeedMetrics,
+                    requestStartedAt: requestStartedAt,
+                    requestLogContext: requestLogContext,
+                    messagesBeforeResponse: messagesBeforeResponse,
+                    responsesFullInputFallbackRequest: nil
+                )
+                return
+            }
             let bodyString: String
             if let bodyData, let utf8Text = String(data: bodyData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !utf8Text.isEmpty {
                 bodyString = utf8Text

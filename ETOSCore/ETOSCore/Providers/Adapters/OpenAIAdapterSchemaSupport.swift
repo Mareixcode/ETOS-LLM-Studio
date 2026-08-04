@@ -57,6 +57,9 @@ extension OpenAIAdapter {
         if let properties = normalized["properties"] as? [String: Any] {
             normalized["properties"] = normalizedOpenAISchemaPropertiesMap(properties)
         }
+        if let required = normalized["required"] as? [Any] {
+            normalized["required"] = stableJSONSchemaRequiredArray(required)
+        }
         if normalized["default"] is NSNull {
             normalized.removeValue(forKey: "default")
         }
@@ -338,14 +341,6 @@ extension OpenAIAdapter {
         overrides.filter { !Self.openAIControlOverrideKeys.contains($0.key) }
     }
 
-    func removeOpenAIToolFields(from payload: inout [String: Any]) {
-        payload.removeValue(forKey: "tools")
-        payload.removeValue(forKey: "tool_choice")
-        payload.removeValue(forKey: "functions")
-        payload.removeValue(forKey: "function_call")
-        payload.removeValue(forKey: "parallel_tool_calls")
-    }
-
     func normalizedOpenAIConversationAPIValue(_ rawValue: String) -> OpenAIConversationAPI? {
         let normalized = rawValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -426,33 +421,4 @@ extension OpenAIAdapter {
         return value
     }
 
-    func sanitizedPayloadForDebug(_ value: Any) -> Any {
-        if let dictionary = value as? [String: Any] {
-            var sanitized: [String: Any] = [:]
-            sanitized.reserveCapacity(dictionary.count)
-            for (key, rawValue) in dictionary {
-                let loweredKey = key.lowercased()
-                if loweredKey == "data" || loweredKey == "file_data" {
-                    if let text = rawValue as? String {
-                        sanitized[key] = "[base64 omitted: \(text.count) chars]"
-                    } else {
-                        sanitized[key] = "[binary omitted]"
-                    }
-                    continue
-                }
-                if (loweredKey == "url" || loweredKey == "image_url"),
-                   let text = rawValue as? String,
-                   text.hasPrefix("data:") {
-                    sanitized[key] = "[base64 image omitted: \(text.count) chars]"
-                    continue
-                }
-                sanitized[key] = sanitizedPayloadForDebug(rawValue)
-            }
-            return sanitized
-        }
-        if let array = value as? [Any] {
-            return array.map { sanitizedPayloadForDebug($0) }
-        }
-        return value
-    }
 }

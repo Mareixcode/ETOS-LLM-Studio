@@ -20,9 +20,12 @@ struct WatchAppLogsView: View {
     var body: some View {
         List {
             Section {
+                Toggle(NSLocalizedString("启用 API 请求日志", comment: ""), isOn: $appConfig.requestLogEnabled)
+                    .buttonStyle(.plain)
                 Toggle(NSLocalizedString("记录请求明文消息", comment: ""), isOn: $appConfig.requestLogPlainMessageEnabled)
                     .buttonStyle(.plain)
-                Text(NSLocalizedString("图片、音频和文件的 Base64 仍会隐藏。", comment: ""))
+                    .disabled(!appConfig.requestLogEnabled)
+                Text(NSLocalizedString("关闭后不会保存聊天请求日志或请求体快照；开启后可选择是否记录明文消息，图片、音频和文件的 Base64 仍会隐藏。", comment: ""))
                     .etFont(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -152,7 +155,7 @@ private struct WatchAppRunLogDetailView: View {
                         .etFont(.caption2)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(displayedEvents) { entry in
+                    ForEach(displayedEvents, id: \.presentedID) { entry in
                         NavigationLink {
                             WatchAppLogEventDetailView(entry: entry)
                         } label: {
@@ -165,9 +168,13 @@ private struct WatchAppRunLogDetailView: View {
         .navigationTitle(NSLocalizedString("运行日志", comment: ""))
         .task(id: runFile.id) {
             let loaded = await logCenter.loadEvents(for: runFile)
-            events = loaded.sorted { lhs, rhs in
-                lhs.timestamp > rhs.timestamp
-            }
+            events = loaded
+                .flatMap { event in
+                    [event.presented(in: .user), event.presented(in: .developer)].compactMap { $0 }
+                }
+                .sorted { lhs, rhs in
+                    lhs.timestamp > rhs.timestamp
+                }
         }
     }
 

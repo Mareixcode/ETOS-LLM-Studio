@@ -65,7 +65,9 @@ enum AppConfigLegacyUserDefaultsMigration {
         "tts.onlyReadQuotedContent",
         "tts.watchUseLightweightPreprocess",
         "networkProxy.global.isEnabled",
+        "dailyPulse.enabled",
         "dailyPulse.autoGenerate",
+        "dailyPulse.cardsPerRun",
         "dailyPulse.includeMCPContext",
         "dailyPulse.includeShortcutContext",
         "dailyPulse.includeRecentExternalResults",
@@ -77,6 +79,7 @@ enum AppConfigLegacyUserDefaultsMigration {
         "networkProxy.global.port",
         "dailyPulse.delivery.reminderHour",
         "dailyPulse.delivery.reminderMinute",
+        "dailyPulse.delivery.times",
         "tts.speechRate",
         "tts.pitch",
         "tts.playbackSpeed",
@@ -165,6 +168,7 @@ enum AppConfigLegacyUserDefaultsMigration {
             "tts.onlyReadQuotedContent",
             "tts.watchUseLightweightPreprocess",
             "networkProxy.global.isEnabled",
+            "dailyPulse.enabled",
             "dailyPulse.autoGenerate",
             "dailyPulse.includeMCPContext",
             "dailyPulse.includeShortcutContext",
@@ -178,6 +182,7 @@ enum AppConfigLegacyUserDefaultsMigration {
             "tool.permission.autoApproveCountdownSeconds",
             "tts.watchSpeechMaxCharacters",
             "networkProxy.global.port",
+            "dailyPulse.cardsPerRun",
             "dailyPulse.delivery.reminderHour",
             "dailyPulse.delivery.reminderMinute"
         ].forEach { migrateInteger($0, from: defaults, existingKeys: &existingKeys) }
@@ -202,6 +207,7 @@ enum AppConfigLegacyUserDefaultsMigration {
             "dailyPulse.focusText",
             "dailyPulse.lastViewedDayKey",
             "dailyPulse.lastDeliveryAttemptDayKey",
+            "dailyPulse.delivery.times",
             "dailyPulse.delivery.lastReadyDayKey",
             "cloudSync.deviceIdentifier"
         ].forEach { migrateText($0, from: defaults, existingKeys: &existingKeys) }

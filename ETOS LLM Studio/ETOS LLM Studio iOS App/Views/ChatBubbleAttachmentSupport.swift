@@ -56,11 +56,10 @@ extension ChatBubble {
 
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(fileNames, id: \.self) { fileName in
-                    Button {
-                        loadFilePreview(fileName)
-                    } label: {
+                    let isVideo = VideoAttachmentSupport.isVideo(fileName: fileName)
+                    if isVideo {
                         HStack(spacing: 8) {
-                            Image(systemName: "doc")
+                            Image(systemName: "video")
                                 .etFont(.system(size: 16, weight: .semibold))
                                 .foregroundStyle(fileAttachmentSecondaryColor)
                             Text(fileName)
@@ -68,9 +67,6 @@ extension ChatBubble {
                                 .lineLimit(1)
                                 .foregroundStyle(fileAttachmentTextColor)
                             Spacer(minLength: 8)
-                            Image(systemName: "eye")
-                                .etFont(.caption)
-                                .foregroundStyle(fileAttachmentSecondaryColor)
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
@@ -79,9 +75,34 @@ extension ChatBubble {
                             RoundedRectangle(cornerRadius: 12)
                                 .fill(fileAttachmentBackgroundColor)
                         )
+                    } else {
+                        Button {
+                            loadFilePreview(fileName)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "doc")
+                                    .etFont(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(fileAttachmentSecondaryColor)
+                                Text(fileName)
+                                    .etFont(.system(size: 13, weight: .medium))
+                                    .lineLimit(1)
+                                    .foregroundStyle(fileAttachmentTextColor)
+                                Spacer(minLength: 8)
+                                Image(systemName: "eye")
+                                    .etFont(.caption)
+                                    .foregroundStyle(fileAttachmentSecondaryColor)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(fileAttachmentBackgroundColor)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(NSLocalizedString("预览", comment: ""))
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(NSLocalizedString("预览", comment: ""))
                 }
             }
             .frame(maxWidth: attachmentMaxWidth, alignment: isOutgoing ? .trailing : .leading)
@@ -129,16 +150,43 @@ extension ChatBubble {
     @ViewBuilder
     func renderContent(_ content: String) -> some View {
         let shouldRenderAsOutgoing = isOutgoing || isError
-        ETAdvancedMarkdownRenderer(
-            content: content,
-            preparedContent: preparedMarkdownPayload,
-            enableMarkdown: enableMarkdown,
-            isOutgoing: shouldRenderAsOutgoing,
-            enableAdvancedRenderer: enableAdvancedRenderer,
-            enableMathRendering: enableMathRendering,
-            customTextColor: customTextColorOverride,
-            isStreaming: showsStreamingIndicators
-        )
+        if let extraction = messageState.roleplayHTML,
+           let roleplaySessionID,
+           extraction.containsHTML {
+            VStack(alignment: .leading) {
+                if !extraction.remainingText.isEmpty {
+                    ETAdvancedMarkdownRenderer(
+                        content: extraction.remainingText,
+                        preparedContent: nil,
+                        enableMarkdown: enableMarkdown,
+                        isOutgoing: shouldRenderAsOutgoing,
+                        enableAdvancedRenderer: enableAdvancedRenderer,
+                        enableMathRendering: enableMathRendering,
+                        customTextColor: customTextColorOverride,
+                        customTextStyleColors: customTextStyleColors,
+                        isStreaming: showsStreamingIndicators
+                    )
+                }
+                RoleplayHTMLCardView(
+                    extraction: extraction,
+                    sessionID: roleplaySessionID,
+                    messageID: message.id,
+                    versionIndex: message.getCurrentVersionIndex()
+                )
+            }
+        } else {
+            ETAdvancedMarkdownRenderer(
+                content: content,
+                preparedContent: preparedMarkdownPayload,
+                enableMarkdown: enableMarkdown,
+                isOutgoing: shouldRenderAsOutgoing,
+                enableAdvancedRenderer: enableAdvancedRenderer,
+                enableMathRendering: enableMathRendering,
+                customTextColor: customTextColorOverride,
+                customTextStyleColors: customTextStyleColors,
+                isStreaming: showsStreamingIndicators
+            )
+        }
     }
 
     @ViewBuilder
@@ -207,6 +255,21 @@ struct ChatFileAttachmentPreviewSheet: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 12) {
                             fileInfoView
+
+                            if payload.isTextTruncated {
+                                Text(String(format: NSLocalizedString("已显示前 %d 个字符，共 %d 个字符。", comment: ""), payload.previewCharacterLimit, payload.originalCharacterCount))
+                                    .etFont(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                NavigationLink {
+                                    FileAttachmentPagedTextView(
+                                        title: payload.fileName,
+                                        text: payload.fullText ?? text
+                                    )
+                                } label: {
+                                    Label(NSLocalizedString("查看完整内容", comment: "Open full file attachment preview"), systemImage: "doc.text.magnifyingglass")
+                                }
+                            }
 
                             Text(text)
                                 .etFont(.system(.caption, design: .monospaced))

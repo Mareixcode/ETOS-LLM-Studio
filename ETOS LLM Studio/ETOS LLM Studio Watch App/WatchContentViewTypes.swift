@@ -50,12 +50,34 @@ enum WatchChatInputActionState: Equatable {
     }
 }
 
+enum WatchChatInputSubmission {
+    static func normalizedText(from submittedText: String) -> String {
+        submittedText.watchKeyboardUnescapedNewlines()
+    }
+
+    static func shouldUseBoundEditor(for currentText: String) -> Bool {
+        // TextFieldLink 没有初始文本入口，已有草稿要走可绑定编辑页才能回填。
+        !currentText.isEmpty
+    }
+}
+
 struct WatchMessageActionsNavigationTarget: Identifiable, Hashable {
     let id: UUID
 }
 
 struct WatchMessageRewriteNavigationTarget: Identifiable, Hashable {
     let id: UUID
+    let selectionTarget: MessageRewriteSelectionTarget?
+
+    init(id: UUID, selectionTarget: MessageRewriteSelectionTarget? = nil) {
+        self.id = id
+        self.selectionTarget = selectionTarget
+    }
+}
+
+struct WatchSelectedMessagesExportNavigationTarget: Identifiable, Hashable {
+    let id = UUID()
+    let messageIDs: Set<UUID>
 }
 
 struct FullErrorContentWrapper: Identifiable {

@@ -66,6 +66,187 @@ extension ChatService {
         return NSLocalizedString("响应体为空。", comment: "Empty response body")
     }
 
+    func isOpenAIResponsesRequest(_ request: URLRequest) -> Bool {
+        guard let lastPathComponent = request.url?.path.split(separator: "/").last else {
+            return false
+        }
+        return lastPathComponent == "responses"
+    }
+
+    func openAIResponsesRequestUsesPreviousResponseID(_ request: URLRequest) -> Bool {
+        guard isOpenAIResponsesRequest(request),
+              let payload = jsonObjectBody(from: request),
+              let previousResponseID = payload["previous_response_id"] as? String else {
+            return false
+        }
+        return !previousResponseID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func openAIResponsesRequestSignature(from request: URLRequest) -> JSONValue? {
+        guard isOpenAIResponsesRequest(request),
+              var payload = jsonObjectBody(from: request) else {
+            return nil
+        }
+        payload.removeValue(forKey: "input")
+        payload.removeValue(forKey: "previous_response_id")
+        payload.removeValue(forKey: OpenAIAdapter.responsesForceFullInputControlKey)
+        return jsonValueForRequestMetadata(from: payload)
+    }
+
+    func attachOpenAIResponsesRequestMetadata(
+        to message: inout ChatMessage,
+        request: URLRequest,
+        messagesBeforeResponse: [ChatMessage] = []
+    ) {
+        guard let requestSignature = openAIResponsesRequestSignature(from: request) else { return }
+        var metadata = message.providerResponseMetadata ?? [:]
+        metadata[OpenAIAdapter.responsesRequestSignatureKey] = requestSignature
+        if let contextSignature = openAIResponsesContextSignature(
+            for: message,
+            request: request,
+            messagesBeforeResponse: messagesBeforeResponse
+        ) {
+            metadata[OpenAIAdapter.responsesContextSignatureKey] = contextSignature
+        }
+        message.providerResponseMetadata = metadata
+    }
+
+    func openAIResponsesContextSignature(
+        for message: ChatMessage,
+        request: URLRequest,
+        messagesBeforeResponse: [ChatMessage]
+    ) -> JSONValue? {
+        guard isOpenAIResponsesRequest(request),
+              let payload = jsonObjectBody(from: request),
+              let inputItems = payload["input"] as? [[String: Any]] else {
+            return nil
+        }
+
+        let previousSignature: String?
+        if let previousResponseID = payload["previous_response_id"] as? String,
+           !previousResponseID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            previousSignature = openAIResponsesStoredContextSignature(
+                responseID: previousResponseID,
+                messages: messagesBeforeResponse
+            )
+            guard previousSignature != nil else { return nil }
+        } else {
+            previousSignature = nil
+        }
+
+        let outputItems = openAIResponsesOutputItems(from: message)
+        return OpenAIAdapter.responsesContextSignature(
+            previousSignature: previousSignature,
+            appending: inputItems + outputItems
+        )
+    }
+
+    func openAIResponsesStoredContextSignature(responseID: String, messages: [ChatMessage]) -> String? {
+        for message in messages.reversed() where message.role == .assistant {
+            guard let metadata = message.providerResponseMetadata,
+                  case let .string(storedResponseID)? = metadata[OpenAIAdapter.responsesResponseIDKey],
+                  storedResponseID == responseID,
+                  case let .string(contextSignature)? = metadata[OpenAIAdapter.responsesContextSignatureKey],
+                  !contextSignature.isEmpty else {
+                continue
+            }
+            return contextSignature
+        }
+        return nil
+    }
+
+    func openAIResponsesOutputItems(from message: ChatMessage) -> [[String: Any]] {
+        guard let metadata = message.providerResponseMetadata,
+              case let .array(items)? = metadata[OpenAIAdapter.responsesOutputItemsKey] else {
+            return []
+        }
+        return items.compactMap { $0.toAny() as? [String: Any] }
+    }
+
+    func isOpenAIResponsesPreviousResponseMissing(statusCode: Int, bodyData: Data?) -> Bool {
+        guard statusCode == 400 || statusCode == 404 else { return false }
+        guard let bodyData,
+              let text = String(data: bodyData, encoding: .utf8)?.lowercased() else {
+            return false
+        }
+
+        if let object = try? JSONSerialization.jsonObject(with: bodyData),
+           let payload = object as? [String: Any],
+           let error = payload["error"] as? [String: Any] {
+            let code = (error["code"] as? String)?.lowercased() ?? ""
+            let message = (error["message"] as? String)?.lowercased() ?? ""
+            if code.contains("previous_response") || code.contains("response_not_found") {
+                return true
+            }
+            if message.contains("previous_response_id")
+                && (message.contains("not found")
+                    || message.contains("not exist")
+                    || message.contains("could not find")
+                    || message.contains("missing")) {
+                return true
+            }
+        }
+
+        return text.contains("previous_response_not_found")
+            || (text.contains("previous_response_id")
+                && (text.contains("not found")
+                    || text.contains("not exist")
+                    || text.contains("could not find")
+                    || text.contains("missing")))
+    }
+
+    func jsonObjectBody(from request: URLRequest) -> [String: Any]? {
+        guard let body = request.httpBody,
+              let object = try? JSONSerialization.jsonObject(with: body) else {
+            return nil
+        }
+        return object as? [String: Any]
+    }
+
+    func jsonValueForRequestMetadata(from object: Any) -> JSONValue? {
+        switch object {
+        case let string as String:
+            return .string(string)
+        case let bool as Bool:
+            return .bool(bool)
+        case let int as Int:
+            return .int(int)
+        case let double as Double:
+            return .double(double)
+        case let number as NSNumber:
+            let objCType = String(cString: number.objCType)
+            if objCType == "c" || objCType == "B" {
+                return .bool(number.boolValue)
+            }
+            let doubleValue = number.doubleValue
+            if doubleValue.isFinite,
+               floor(doubleValue) == doubleValue,
+               doubleValue >= Double(Int.min),
+               doubleValue <= Double(Int.max) {
+                return .int(number.intValue)
+            }
+            return .double(doubleValue)
+        case let dictionary as [String: Any]:
+            var result: [String: JSONValue] = [:]
+            for (key, value) in dictionary {
+                guard let jsonValue = jsonValueForRequestMetadata(from: value) else { return nil }
+                result[key] = jsonValue
+            }
+            return .dictionary(result)
+        case let array as [Any]:
+            var result: [JSONValue] = []
+            for value in array {
+                guard let jsonValue = jsonValueForRequestMetadata(from: value) else { return nil }
+                result.append(jsonValue)
+            }
+            return .array(result)
+        case _ as NSNull:
+            return .null
+        default:
+            return nil
+        }
+    }
+
     func providerConfigurationValidationErrorMessage(for provider: Provider, action: String) -> String? {
         let providerName = provider.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? NSLocalizedString("未命名提供商", comment: "Unnamed provider fallback name")
@@ -124,7 +305,16 @@ extension ChatService {
         errorKind: String? = nil
     ) {
         let normalizedUsage = tokenUsage?.hasAnyData == true ? tokenUsage : nil
-        if context.requestSource == .chat {
+        RequestTransactionLogRegistry.finalize(
+            requestID: context.requestID,
+            status: status,
+            finishedAt: finishedAt,
+            httpStatusCode: httpStatusCode,
+            errorKind: errorKind,
+            tokenUsage: normalizedUsage
+        )
+        if (context.requestSource == .chat || context.requestSource == .imageGeneration),
+           AppConfigStore.boolValue(for: .requestLogEnabled) {
             let logEntry = RequestLogEntry(
                 requestID: context.requestID,
                 sessionID: context.sessionID,
@@ -158,6 +348,113 @@ extension ChatService {
             tokenUsage: normalizedUsage
         )
         Persistence.appendUsageAnalyticsEvent(usageEvent)
+    }
+
+    func makeResponseBodySnapshotPayload(
+        context: RequestLogContext,
+        request: URLRequest,
+        body: String,
+        byteCount: Int,
+        httpStatusCode: Int? = nil,
+        isPartial: Bool = false
+    ) -> [String: String]? {
+        guard AppConfigStore.boolValue(for: .requestLogEnabled) else { return nil }
+
+        var payload: [String: String] = [
+            NSLocalizedString("提供商", comment: "App log payload key"): context.providerName,
+            NSLocalizedString("模型", comment: "App log payload key"): context.modelID,
+            NSLocalizedString("请求 ID", comment: "App log payload key"): context.requestID.uuidString,
+            NSLocalizedString("方法", comment: "App log payload key"): request.httpMethod ?? "POST",
+            NSLocalizedString("地址", comment: "App log payload key"): AppLogRedactor.sanitizeURLForLog(request.url),
+            NSLocalizedString("流式", comment: "App log payload key"): context.isStreaming
+                ? NSLocalizedString("是", comment: "App log payload value")
+                : NSLocalizedString("否", comment: "App log payload value"),
+            NSLocalizedString("响应体字节数", comment: "App log payload key"): "\(byteCount)"
+        ]
+
+        if let httpStatusCode {
+            payload[NSLocalizedString("状态码", comment: "App log payload key")] = "\(httpStatusCode)"
+        }
+
+        let bodyKey: String
+        if context.isStreaming {
+            bodyKey = isPartial
+                ? NSLocalizedString("流式响应体(部分)", comment: "App log payload key")
+                : NSLocalizedString("流式响应体", comment: "App log payload key")
+        } else {
+            bodyKey = isPartial
+                ? NSLocalizedString("响应体(部分)", comment: "App log payload key")
+                : NSLocalizedString("响应体", comment: "App log payload key")
+        }
+        if context.isStreaming &&
+            !AppConfigStore.boolValue(for: .requestLogPlainMessageEnabled) {
+            payload[bodyKey] = AppLogRedactor.streamingResponseNotRecordedToken
+        } else {
+            payload[bodyKey] = AppLogRedactor.sanitizeResponseBodyForLog(body)
+        }
+        return payload
+    }
+
+    func logResponseBodySnapshot(
+        context: RequestLogContext,
+        request: URLRequest,
+        body: String,
+        byteCount: Int? = nil,
+        httpStatusCode: Int? = nil,
+        isPartial: Bool = false,
+        hasCapturedStreamingBody: Bool = true
+    ) {
+        let resolvedByteCount = byteCount ?? body.data(using: .utf8)?.count ?? 0
+        guard AppConfigStore.boolValue(for: .requestLogEnabled) else { return }
+        let recordsPlainMessages = AppConfigStore.boolValue(for: .requestLogPlainMessageEnabled)
+        let sanitizedBody: String
+        if context.isStreaming && (!recordsPlainMessages || !hasCapturedStreamingBody) {
+            sanitizedBody = AppLogRedactor.streamingResponseNotRecordedToken
+        } else {
+            sanitizedBody = AppLogRedactor.sanitizeResponseBodyForLog(body)
+        }
+        RequestTransactionLogRegistry.stageResponse(
+            requestID: context.requestID,
+            request: request,
+            requestedAt: context.requestedAt,
+            providerName: context.providerName,
+            modelID: context.modelID,
+            isStreaming: context.isStreaming,
+            sanitizedBody: sanitizedBody,
+            bodyBytes: resolvedByteCount,
+            statusCode: httpStatusCode,
+            isPartial: isPartial
+        )
+    }
+
+    func logResponseBodySnapshot(
+        context: RequestLogContext,
+        request: URLRequest,
+        bodyData: Data?,
+        httpStatusCode: Int? = nil,
+        isPartial: Bool = false
+    ) {
+        let bodyText: String
+        if let bodyData, let text = String(data: bodyData, encoding: .utf8) {
+            bodyText = text
+        } else if let bodyData, !bodyData.isEmpty {
+            bodyText = String(
+                format: NSLocalizedString("响应体包含 %d 字节，无法以 UTF-8 解码。", comment: "Response body not UTF-8 with byte count"),
+                bodyData.count
+            )
+        } else {
+            bodyText = NSLocalizedString("响应体为空。", comment: "Empty response body")
+        }
+
+        logResponseBodySnapshot(
+            context: context,
+            request: request,
+            body: bodyText,
+            byteCount: bodyData?.count ?? 0,
+            httpStatusCode: httpStatusCode,
+            isPartial: isPartial,
+            hasCapturedStreamingBody: true
+        )
     }
 
     private func makeProxySessionIfNeeded(for provider: Provider?) -> (session: URLSession, proxy: NetworkProxyConfiguration?) {
@@ -198,13 +495,7 @@ extension ChatService {
         let (data, response) = try await requestData(for: request, provider: provider)
         guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-            if let prettyBody = String(data: data, encoding: .utf8) {
-                logger.error("  - 网络请求失败，状态码: \(statusCode)，响应体:\n---\n\(prettyBody)\n---")
-            } else if !data.isEmpty {
-                logger.error("  - 网络请求失败，状态码: \(statusCode)，响应体包含 \(data.count) 字节的二进制数据。")
-            } else {
-                logger.error("  - 网络请求失败，状态码: \(statusCode)，响应体为空。")
-            }
+            logger.error("  - 网络请求失败，状态码: \(statusCode)，响应体大小: \(data.count) 字节。")
             throw NetworkError.badStatusCode(code: statusCode, responseBody: data.isEmpty ? nil : data)
         }
         return data
@@ -229,13 +520,7 @@ extension ChatService {
             } catch {
                 logger.error("  - 读取流式错误响应体失败: \(error.localizedDescription)")
             }
-            if let capturedBody, let prettyBody = String(data: capturedBody, encoding: .utf8) {
-                logger.error("  - 流式网络请求失败，状态码: \(statusCode)，响应体:\n---\n\(prettyBody)\n---")
-            } else if let capturedBody, !capturedBody.isEmpty {
-                logger.error("  - 流式网络请求失败，状态码: \(statusCode)，响应体包含 \(capturedBody.count) 字节的二进制数据。")
-            } else {
-                logger.error("  - 流式网络请求失败，状态码: \(statusCode)，响应体为空。")
-            }
+            logger.error("  - 流式网络请求失败，状态码: \(statusCode)，已捕获响应体大小: \(capturedBody?.count ?? 0) 字节。")
             throw NetworkError.badStatusCode(code: statusCode, responseBody: capturedBody)
         }
         return bytes

@@ -12,12 +12,11 @@ import Combine
 @testable import ETOSCore
 
 extension ChatServiceTests {
-    @Test("世界书隔离策略会显式屏蔽内置工具")
-    func testWorldbookIsolationPolicySuppressesBuiltInAppTools() async throws {
+    @Test("会话隔离策略无需绑定世界书即可屏蔽记忆与工具")
+    func testSessionIsolationPolicySuppressesMemoryAndToolsWithoutWorldbook() async throws {
         await cleanup()
 
         var isolatedSession = ChatSession(id: UUID(), name: "隔离策略会话")
-        isolatedSession.lorebookIDs = [UUID()]
         isolatedSession.worldbookContextIsolationEnabled = true
 
         let normalPolicy = chatService.auxiliaryContextPolicy(
@@ -35,8 +34,47 @@ extension ChatServiceTests {
 
         #expect(normalPolicy.includeBuiltInAppTools)
         #expect(normalPolicy.includeMCPTools)
+        #expect(normalPolicy.enableMemory)
+        #expect(normalPolicy.enableMemoryWrite)
         #expect(!isolatedPolicy.includeBuiltInAppTools)
         #expect(!isolatedPolicy.includeMCPTools)
+        #expect(!isolatedPolicy.includeShortcutTools)
+        #expect(!isolatedPolicy.includeSkills)
+        #expect(!isolatedPolicy.enableMemory)
+        #expect(!isolatedPolicy.enableMemoryWrite)
+        #expect(!isolatedPolicy.enableMemoryActiveRetrieval)
+
+        await cleanup()
+    }
+
+    @Test("会话隔离无需绑定世界书即可移除历史工具调用")
+    func testSessionIsolationRemovesHistoricalToolCallsWithoutWorldbook() async throws {
+        await cleanup()
+
+        var isolatedSession = ChatSession(id: UUID(), name: "历史工具隔离会话")
+        isolatedSession.worldbookContextIsolationEnabled = true
+        let historicalToolCall = InternalToolCall(
+            id: "historical-tool-call",
+            toolName: "test_tool",
+            arguments: "{}"
+        )
+        let messages = [
+            ChatMessage(role: .user, content: "保留这条消息"),
+            ChatMessage(role: .assistant, content: "", toolCalls: [historicalToolCall]),
+            ChatMessage(role: .tool, content: "不应发送", toolCalls: [historicalToolCall])
+        ]
+
+        let preparedMessages = chatService.preparedMessagesForRequest(
+            from: messages,
+            loadingMessageID: UUID(),
+            session: isolatedSession
+        )
+
+        #expect(preparedMessages.count == 1)
+        #expect(preparedMessages.first?.role == .user)
+        #expect(preparedMessages.first?.content == "保留这条消息")
+        #expect(!preparedMessages.contains(where: { $0.role == .tool }))
+        #expect(!preparedMessages.contains(where: { !($0.toolCalls?.isEmpty ?? true) }))
 
         await cleanup()
     }
@@ -143,7 +181,7 @@ extension ChatServiceTests {
         await cleanup()
     }
 
-    @Test("系统时间可作为末尾 system 消息注入")
+    @Test("OpenAI 系统时间可作为末尾 system 消息注入")
     func testSystemTimeTailPromptInjection() async throws {
         await cleanup()
         mockAdapter.responseToReturn = ChatMessage(role: .assistant, content: "ok")
@@ -177,6 +215,128 @@ extension ChatServiceTests {
         #expect(lastMessage?.content.contains("ISO8601") == false)
 
         await cleanup()
+    }
+
+    @Test("增强提示词和末尾时间共用协议角色设置")
+    func testTailContextMessagesUseRoleByAPIFormatAndPreference() throws {
+        for apiFormat in ["anthropic", "claude", "gemini", "google", "vertex"] {
+            let timeMessage = chatService.makeTailSystemTimeMessage(
+                apiFormat: apiFormat,
+                openAIUsesSystemRole: true
+            )
+            let enhancedMessage = try #require(chatService.makeEnhancedPromptMessage(
+                "保持简洁",
+                apiFormat: apiFormat,
+                openAIUsesSystemRole: true
+            ))
+
+            #expect(timeMessage.role == .user)
+            #expect(timeMessage.content.contains("<time>"))
+            #expect(enhancedMessage.role == .user)
+        }
+
+        let localTimeMessage = chatService.makeTailSystemTimeMessage(
+            apiFormat: LocalModelProviderBridge.apiFormat,
+            openAIUsesSystemRole: false
+        )
+        let localEnhancedMessage = try #require(chatService.makeEnhancedPromptMessage(
+            "保持简洁",
+            apiFormat: LocalModelProviderBridge.apiFormat,
+            openAIUsesSystemRole: false
+        ))
+        #expect(localTimeMessage.role == .system)
+        #expect(localEnhancedMessage.role == .system)
+
+        for apiFormat in ["openai-compatible", "openai-responses"] {
+            let systemTimeMessage = chatService.makeTailSystemTimeMessage(
+                apiFormat: apiFormat,
+                openAIUsesSystemRole: true
+            )
+            let userTimeMessage = chatService.makeTailSystemTimeMessage(
+                apiFormat: apiFormat,
+                openAIUsesSystemRole: false
+            )
+            let systemEnhancedMessage = try #require(chatService.makeEnhancedPromptMessage(
+                "保持简洁",
+                apiFormat: apiFormat,
+                openAIUsesSystemRole: true
+            ))
+            let userEnhancedMessage = try #require(chatService.makeEnhancedPromptMessage(
+                "保持简洁",
+                apiFormat: apiFormat,
+                openAIUsesSystemRole: false
+            ))
+
+            #expect(systemTimeMessage.role == .system)
+            #expect(userTimeMessage.role == .user)
+            #expect(systemEnhancedMessage.role == .system)
+            #expect(userEnhancedMessage.role == .user)
+        }
+
+        var localMessages = [
+            ChatMessage(role: .system, content: "稳定系统提示"),
+            ChatMessage(role: .user, content: "现在几点？"),
+            ChatMessage(role: .system, content: "增强提示")
+        ]
+        let appendedLocalTimeMessage = chatService.makeTailSystemTimeMessage(
+            apiFormat: LocalModelProviderBridge.apiFormat,
+            openAIUsesSystemRole: true
+        )
+        chatService.appendTailContextMessage(
+            appendedLocalTimeMessage,
+            to: &localMessages,
+            apiFormat: LocalModelProviderBridge.apiFormat
+        )
+
+        #expect(localMessages.count == 4)
+        #expect(localMessages.last?.role == .system)
+        #expect(localMessages.last?.content.hasPrefix("<time>") == true)
+    }
+
+    @Test("尾部 user 上下文按适配器顺序安全合并")
+    func testTailUserContextMergesWithoutBreakingMessageOrder() throws {
+        let enhancedMessage = try #require(chatService.makeEnhancedPromptMessage(
+            "保持简洁",
+            apiFormat: "anthropic",
+            openAIUsesSystemRole: true
+        ))
+        let timeMessage = chatService.makeTailSystemTimeMessage(
+            apiFormat: "anthropic",
+            openAIUsesSystemRole: true
+        )
+        var anthropicMessages = [
+            ChatMessage(role: .user, content: "原始问题"),
+            ChatMessage(role: .system, content: "后置说明")
+        ]
+
+        chatService.appendTailContextMessage(enhancedMessage, to: &anthropicMessages, apiFormat: "anthropic")
+        chatService.appendTailContextMessage(timeMessage, to: &anthropicMessages, apiFormat: "anthropic")
+
+        #expect(anthropicMessages.count == 2)
+        #expect(anthropicMessages.first?.content.contains("<enhanced_prompt>") == true)
+        #expect(anthropicMessages.first?.content.contains("<time>") == true)
+
+        var openAIMessages = [
+            ChatMessage(role: .user, content: "原始问题"),
+            ChatMessage(role: .system, content: "后置说明")
+        ]
+        let openAIEnhancedMessage = try #require(chatService.makeEnhancedPromptMessage(
+            "保持简洁",
+            apiFormat: "openai-compatible",
+            openAIUsesSystemRole: false
+        ))
+        let openAITimeMessage = chatService.makeTailSystemTimeMessage(
+            apiFormat: "openai-compatible",
+            openAIUsesSystemRole: false
+        )
+
+        chatService.appendTailContextMessage(openAIEnhancedMessage, to: &openAIMessages, apiFormat: "openai-compatible")
+        chatService.appendTailContextMessage(openAITimeMessage, to: &openAIMessages, apiFormat: "openai-compatible")
+
+        #expect(openAIMessages.count == 3)
+        #expect(openAIMessages.last?.role == .user)
+        #expect(openAIMessages.last?.content.contains("<enhanced_prompt>") == true)
+        #expect(openAIMessages.last?.content.contains("<time>") == true)
     }
 
     @Test("周期性时间路标支持自定义分钟并插入在锚点消息前")
@@ -442,7 +602,8 @@ extension ChatServiceTests {
             conversationProfile: nil,
             includeSystemTime: false
         )
-        #expect(promptWithTime.contains("): 用户喜欢喝抹茶拿铁。"))
+        #expect(promptWithTime.contains("updated_at="))
+        #expect(promptWithTime.contains("用户喜欢喝抹茶拿铁。"))
 
         Persistence.writeAppConfig(
             key: AppConfigKey.memorySendUpdateTime.rawValue,
@@ -457,8 +618,8 @@ extension ChatServiceTests {
             conversationProfile: nil,
             includeSystemTime: false
         )
-        #expect(promptWithoutTime.contains("- 用户喜欢喝抹茶拿铁。"))
-        #expect(!promptWithoutTime.contains("): 用户喜欢喝抹茶拿铁。"))
+        #expect(promptWithoutTime.contains("用户喜欢喝抹茶拿铁。"))
+        #expect(!promptWithoutTime.contains("updated_at="))
 
         await cleanup()
     }
@@ -584,6 +745,45 @@ extension ChatServiceTests {
         await cleanup()
     }
 
+    @Test("工具结果二次请求沿用流式设置")
+    func testToolFollowUpRequestKeepsStreamingPreference() async throws {
+        await cleanup()
+        await memoryManager.addMemory(content: "用户喜欢喝抹茶拿铁。")
+        setupMockResponsesForChatAndTitle()
+
+        let sessionID = try #require(chatService.currentSessionSubject.value?.id)
+        let loadingMessage = ChatMessage(role: .assistant, content: "", requestedAt: Date())
+        chatService.updateMessages([loadingMessage], for: sessionID)
+
+        let toolCall = InternalToolCall(
+            id: "call_search_stream",
+            toolName: "search_memory",
+            arguments: #"{"mode":"keyword","query":"抹茶","count":1}"#
+        )
+
+        await chatService.processResponseMessage(
+            responseMessage: ChatMessage(role: .assistant, content: "", toolCalls: [toolCall]),
+            loadingMessageID: loadingMessage.id,
+            currentSessionID: sessionID,
+            userMessage: nil,
+            wasTemporarySession: false,
+            availableTools: [chatService.searchMemoryTool],
+            aiTemperature: 0,
+            aiTopP: 0,
+            systemPrompt: "",
+            maxChatHistory: 0,
+            enableStreaming: true,
+            enableMemory: true,
+            enableMemoryWrite: false,
+            enableMemoryActiveRetrieval: true,
+            includeSystemTime: false
+        )
+
+        #expect(mockAdapter.receivedChatStreamFlags.last == true)
+
+        await cleanup()
+    }
+
     @Test("Worldbook prompt injection order and depth insertion")
     func testWorldbookInjectionOrderAndDepth() async throws {
         await cleanup()
@@ -607,7 +807,7 @@ extension ChatServiceTests {
         )
         store.saveWorldbooks([book])
 
-        var session = chatService.currentSessionSubject.value ?? ChatSession(id: UUID(), name: "测试会话")
+        var session = createPermanentTestSession(name: "测试会话")
         session.lorebookIDs = [book.id]
         chatService.setCurrentSession(session)
 
@@ -657,7 +857,7 @@ extension ChatServiceTests {
         )
         store.saveWorldbooks([book])
 
-        var session = chatService.currentSessionSubject.value ?? ChatSession(id: UUID(), name: "顺序测试会话")
+        var session = createPermanentTestSession(name: "顺序测试会话")
         session.lorebookIDs = [book.id]
         session.topicPrompt = "topic-order-hit"
         chatService.setCurrentSession(session)
@@ -708,7 +908,7 @@ extension ChatServiceTests {
         )
         store.saveWorldbooks([book])
 
-        var session = chatService.currentSessionSubject.value ?? ChatSession(id: UUID(), name: "共存会话")
+        var session = createPermanentTestSession(name: "共存会话")
         session.lorebookIDs = [book.id]
         chatService.setCurrentSession(session)
 
@@ -798,7 +998,7 @@ extension ChatServiceTests {
         )
         store.saveWorldbooks([firstBook, secondBook])
 
-        var session = chatService.currentSessionSubject.value ?? ChatSession(id: UUID(), name: "多本绑定会话")
+        var session = createPermanentTestSession(name: "多本绑定会话")
         session.lorebookIDs = [firstBook.id, secondBook.id]
         chatService.setCurrentSession(session)
 

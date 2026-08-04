@@ -13,6 +13,7 @@ import ETOSCore
 
 struct WorldbookSettingsView: View {
     @EnvironmentObject private var viewModel: ChatViewModel
+    @ObservedObject private var appConfig = AppConfigStore.shared
 
     @State private var worldbooks: [Worldbook] = []
     @State private var isImporting = false
@@ -38,6 +39,15 @@ struct WorldbookSettingsView: View {
                     details: NSLocalizedString("世界书说明正文", comment: "Worldbook intro details"),
                     isExpanded: $isShowingIntroDetails
                 )
+            }
+
+            Section {
+                Toggle(
+                    NSLocalizedString("在模型选择器中显示世界书", comment: "Show worldbook shortcut in model picker"),
+                    isOn: $appConfig.modelPickerWorldbookShortcutEnabled
+                )
+            } footer: {
+                Text(NSLocalizedString("开启后，可从模型选择器快速绑定当前对话使用的世界书。", comment: "Worldbook shortcut setting description"))
             }
 
             if let session = viewModel.currentSession {
@@ -345,13 +355,11 @@ struct WorldbookSettingsView: View {
         let boundSet = Set(session.lorebookIDs)
         let boundBookCount = worldbooks.filter { boundSet.contains($0.id) }.count
         let totalBookCount = worldbooks.count
-        let base = String(
+        return String(
             format: NSLocalizedString("%d/%d 本", comment: "Bound worldbook count summary"),
             boundBookCount,
             totalBookCount
         )
-        guard session.worldbookContextIsolationEnabled else { return base }
-        return "\(base) · \(NSLocalizedString("已启用隔离发送", comment: "Isolation enabled summary"))"
     }
 
     private func enabledEntrySummary(for book: Worldbook) -> String {
@@ -572,7 +580,7 @@ private struct WorldbookDownloadProgressView: View {
                 Text(NSLocalizedString("正在下载并导入...", comment: "Downloading and importing"))
                 Spacer()
                 if let progress, progress.totalBytes > 0 {
-                    Text(String(format: "%.0f%%", progress.fractionCompleted * 100))
+                    Text(String(format: "%d%%", progress.displayPercentage))
                         .monospacedDigit()
                 } else {
                     ProgressView()
@@ -585,8 +593,8 @@ private struct WorldbookDownloadProgressView: View {
                 Text(
                     String(
                         format: NSLocalizedString("已下载 %@ / %@", comment: ""),
-                        StorageUtility.formatSize(progress.bytesReceived),
-                        StorageUtility.formatSize(progress.totalBytes)
+                        StorageUtility.formatTransferSize(progress.bytesReceived),
+                        StorageUtility.formatTransferSize(progress.totalBytes)
                     )
                 )
                 .etFont(.caption)

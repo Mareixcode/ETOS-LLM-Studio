@@ -54,6 +54,7 @@ struct SessionFolderBrowserView: View {
     @State var draftSessionName: String = ""
     @State var sessionToDelete: ChatSession?
     @State var sessionInfo: SessionInfoPayload?
+    @State var contextCompressionSourceSession: ChatSession?
     @State var showGhostSessionAlert = false
     @State var ghostSession: ChatSession?
 
@@ -187,6 +188,31 @@ struct SessionFolderBrowserView: View {
         selectedBatchItemCount > 0
     }
 
+    var nativeBatchSelection: Binding<Set<SessionBatchSelectionID>> {
+        Binding(
+            get: {
+                Set(selectedSessionIDs.map(SessionBatchSelectionID.session))
+                    .union(selectedFolderIDs.map(SessionBatchSelectionID.folder))
+            },
+            set: { selection in
+                var sessionIDs = Set<UUID>()
+                var folderIDs = Set<UUID>()
+
+                for item in selection {
+                    switch item {
+                    case .session(let id):
+                        sessionIDs.insert(id)
+                    case .folder(let id):
+                        folderIDs.insert(id)
+                    }
+                }
+
+                selectedSessionIDs = sessionIDs
+                selectedFolderIDs = folderIDs
+            }
+        )
+    }
+
     var normalizedSearchQuery: String {
         SessionHistorySearchSupport.normalizedQuery(searchText)
     }
@@ -256,7 +282,7 @@ struct SessionFolderBrowserView: View {
 
     private var listScaffold: some View {
         let entries = mergedEntries
-        let baseList = List {
+        let baseList = List(selection: isBatchSelecting ? nativeBatchSelection : nil) {
             if isTagFilterActive {
                 activeTagFilterRow
             }
@@ -270,6 +296,7 @@ struct SessionFolderBrowserView: View {
 
                 ForEach(entries) { entry in
                     mergedEntryRow(entry)
+                        .tag(entry.batchSelectionID)
                         .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
@@ -282,6 +309,7 @@ struct SessionFolderBrowserView: View {
                 }
             }
         }
+        .environment(\.editMode, .constant(isBatchSelecting ? .active : .inactive))
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(Color(.systemGroupedBackground))

@@ -21,7 +21,11 @@ struct ToolPermissionBubble: View {
     }
 
     private var trimmedArguments: String {
-        request.arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = request.arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > ToolCallTextPreviewConstants.previewLimit else {
+            return trimmed
+        }
+        return String(trimmed.prefix(ToolCallTextPreviewConstants.previewLimit))
     }
 
     private var bubbleShape: TelegramBubbleShape {
@@ -125,4 +129,69 @@ struct ToolPermissionBubble: View {
                 .fill(bubbleGradient)
         }
     }
+}
+
+struct GlobalToolPermissionSheet: View {
+    let request: ToolPermissionRequest
+    let onDecision: (ToolPermissionDecision) -> Void
+
+    @ObservedObject private var permissionCenter = ToolPermissionCenter.shared
+
+    private var toolName: String {
+        request.displayName ?? request.toolName
+    }
+
+    private var argumentText: String {
+        formattedToolCallJSONOrRaw(request.arguments)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Label {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(toolName)
+                                .font(.headline)
+                            Text(NSLocalizedString("等待你的审批后继续执行。", comment: ""))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            if let countdownText {
+                                Text(countdownText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } icon: {
+                        Image(systemName: "hand.raised.circle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Section {
+                    ToolCallLongTextPreview(
+                        title: NSLocalizedString("工具参数", comment: "Tool detail arguments section title"),
+                        text: argumentText,
+                        usesMonospacedFont: true
+                    )
+                } header: {
+                    Text(NSLocalizedString("工具参数", comment: "Tool detail arguments section title"))
+                }
+
+                Section(NSLocalizedString("审批操作", comment: "")) {
+                    ToolPermissionInlineView(request: request, onDecision: onDecision)
+                }
+            }
+            .navigationTitle(NSLocalizedString("调用工具", comment: ""))
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private var countdownText: String? {
+        guard let remaining = permissionCenter.autoApproveRemainingSeconds(for: request) else {
+            return nil
+        }
+        return String(format: NSLocalizedString("将在 %ds 后自动允许", comment: ""), remaining)
+    }
+
 }

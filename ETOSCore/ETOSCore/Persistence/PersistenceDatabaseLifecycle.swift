@@ -16,13 +16,14 @@ extension Persistence {
             return override
         }
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
-            return false
+            return true
         }
         return true
     }
 
     static func activeGRDBStore() -> PersistenceGRDBStore? {
         guard shouldUseGRDBStore() else { return nil }
+        guard !DatabaseEncryptionManager.shared.requiresManualUnlock else { return nil }
         if let store = cachedGRDBStore {
             return store
         }
@@ -80,53 +81,68 @@ extension Persistence {
 
     static func activeAuxiliaryStore(kind: AuxiliaryStoreKind) -> PersistenceAuxiliaryGRDBStore? {
         guard shouldUseGRDBStore() else { return nil }
+        guard !DatabaseEncryptionManager.shared.requiresManualUnlock else { return nil }
         if let store = cachedAuxiliaryStores[kind] {
             return store
         }
 
-        auxiliaryStoreLock.lock()
-        defer { auxiliaryStoreLock.unlock() }
+        var shouldPersistRecoveryNotice = false
+        let resolvedStore: PersistenceAuxiliaryGRDBStore? = {
+            auxiliaryStoreLock.lock()
+            defer { auxiliaryStoreLock.unlock() }
 
-        if let store = cachedAuxiliaryStores[kind] {
-            return store
-        }
-
-        if let failedAt = lastAuxiliaryStoreInitializationFailedAt[kind],
-           Date().timeIntervalSince(failedAt) < auxiliaryStoreRetryInterval {
-            return nil
-        }
-
-        do {
-            let databaseURL = auxiliaryStoreDatabaseURL(for: kind)
-            migrateLegacyAuxiliaryStoreFileIfNeeded(kind: kind, targetURL: databaseURL)
-            let store = try PersistenceAuxiliaryGRDBStore(
-                databaseURL: databaseURL,
-                loggerCategory: kind.loggerCategory
-            )
-            cachedAuxiliaryStores[kind] = store
-            lastAuxiliaryStoreInitializationFailedAt[kind] = nil
-            return store
-        } catch {
-            let launchKind: LaunchDatabaseKind = kind == .config ? .config : .memory
-            if quarantineDatabaseAfterInitializationFailure(kind: launchKind, error: error) {
-                do {
-                    let databaseURL = auxiliaryStoreDatabaseURL(for: kind)
-                    let store = try PersistenceAuxiliaryGRDBStore(
-                        databaseURL: databaseURL,
-                        loggerCategory: kind.loggerCategory
-                    )
-                    cachedAuxiliaryStores[kind] = store
-                    lastAuxiliaryStoreInitializationFailedAt[kind] = nil
-                    logger.info("辅助数据库已自动重建(\(kind.rawValue))。")
-                    return store
-                } catch {
-                    logger.error("辅助数据库自动重建后仍初始化失败(\(kind.rawValue)): \(String(describing: error))")
-                }
+            if let store = cachedAuxiliaryStores[kind] {
+                return store
             }
-            lastAuxiliaryStoreInitializationFailedAt[kind] = Date()
-            logger.error("辅助存储初始化失败(\(kind.rawValue)): \(String(describing: error))")
-            return nil
+
+            if let failedAt = lastAuxiliaryStoreInitializationFailedAt[kind],
+               Date().timeIntervalSince(failedAt) < auxiliaryStoreRetryInterval {
+                return nil
+            }
+
+            do {
+                let databaseURL = auxiliaryStoreDatabaseURL(for: kind)
+                migrateLegacyAuxiliaryStoreFileIfNeeded(kind: kind, targetURL: databaseURL)
+                let store = try PersistenceAuxiliaryGRDBStore(
+                    databaseURL: databaseURL,
+                    loggerCategory: kind.loggerCategory
+                )
+                cachedAuxiliaryStores[kind] = store
+                lastAuxiliaryStoreInitializationFailedAt[kind] = nil
+                return store
+            } catch {
+                let launchKind: LaunchDatabaseKind = kind == .config ? .config : .memory
+                // 恢复通知会写入配置分库，必须等辅助分库锁释放后再持久化。
+                if quarantineDatabaseAfterInitializationFailure(
+                    kind: launchKind,
+                    error: error,
+                    persistRecoveryNotice: false
+                ) {
+                    do {
+                        let databaseURL = auxiliaryStoreDatabaseURL(for: kind)
+                        let store = try PersistenceAuxiliaryGRDBStore(
+                            databaseURL: databaseURL,
+                            loggerCategory: kind.loggerCategory
+                        )
+                        cachedAuxiliaryStores[kind] = store
+                        lastAuxiliaryStoreInitializationFailedAt[kind] = nil
+                        shouldPersistRecoveryNotice = true
+                        logger.info("辅助数据库已自动重建(\(kind.rawValue))。")
+                        return store
+                    } catch {
+                        logger.error("辅助数据库自动重建后仍初始化失败(\(kind.rawValue)): \(String(describing: error))")
+                    }
+                }
+                lastAuxiliaryStoreInitializationFailedAt[kind] = Date()
+                logger.error("辅助存储初始化失败(\(kind.rawValue)): \(String(describing: error))")
+                return nil
+            }
+        }()
+
+        if shouldPersistRecoveryNotice {
+            persistPendingLaunchRecoveryNotice()
         }
+        return resolvedStore
     }
 
     static func auxiliaryStoreDatabaseURL(for kind: AuxiliaryStoreKind) -> URL {
@@ -204,7 +220,15 @@ extension Persistence {
     }
 
     public static func bootstrapGRDBStoreOnLaunch() {
+        guard !DatabaseEncryptionManager.shared.requiresManualUnlock else {
+            logger.info("数据库加密处于手动解锁模式，启动期等待用户输入主密码。")
+            return
+        }
         let launchPreparation = prepareDatabasesForLaunchIfNeeded()
+        guard !launchPreparation.hasPendingRecoveryRequest else {
+            logger.warning("启动阶段检测到可恢复的数据库损坏，等待用户确认。")
+            return
+        }
         let grdbStore = activeGRDBStore()
         _ = activeAuxiliaryStore(kind: .config)
         _ = activeAuxiliaryStore(kind: .memory)
@@ -280,8 +304,9 @@ extension Persistence {
         hasCreatedLaunchBackupPoint = false
         hasScheduledLaunchBackupPoint = false
         pendingLaunchRecoveryNotice = nil
+        pendingLaunchRecoveryRequest = nil
+        pendingLaunchRecoveryKinds = []
         launchBackupAndRecoveryLock.unlock()
-        deleteAppConfig(key: launchRecoveryNoticeKey)
     }
 
     public static func consumeLaunchRecoveryNotice() -> String? {

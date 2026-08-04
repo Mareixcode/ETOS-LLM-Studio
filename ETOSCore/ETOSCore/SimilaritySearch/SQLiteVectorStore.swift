@@ -27,12 +27,15 @@ public final class SQLiteVectorStore: VectorStoreProtocol {
             throw SQLiteError.openDatabase(databaseURL.path)
         }
         defer { sqlite3_close(db) }
+
+        try configureIncrementalAutoVacuumIfNeeded(in: db)
         
         try createTableIfNeeded(in: db)
         try beginExclusiveTransaction(in: db)
         try clearExistingRows(in: db)
         try insert(items, into: db)
         try commitTransaction(in: db)
+        try reclaimFreePages(in: db)
         
         return databaseURL
     }
@@ -94,6 +97,19 @@ private extension SQLiteVectorStore {
     func clearExistingRows(in db: OpaquePointer?) throws {
         try execute(sql: "DELETE FROM \(tableName);", in: db)
     }
+
+    func configureIncrementalAutoVacuumIfNeeded(in db: OpaquePointer?) throws {
+        let currentMode = try intValue(sql: "PRAGMA auto_vacuum;", in: db) ?? 0
+        guard currentMode != 2 else { return }
+
+        // 向量库会被整库重写，启用增量 vacuum 避免旧索引页长期占用磁盘空间。
+        try execute(sql: "PRAGMA auto_vacuum=INCREMENTAL;", in: db)
+        try execute(sql: "VACUUM;", in: db)
+    }
+
+    func reclaimFreePages(in db: OpaquePointer?) throws {
+        try execute(sql: "PRAGMA incremental_vacuum;", in: db)
+    }
     
     func insert(_ items: [IndexItem], into db: OpaquePointer?) throws {
         let insertSQL = """
@@ -102,7 +118,9 @@ private extension SQLiteVectorStore {
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, insertSQL, -1, &statement, nil) == SQLITE_OK else {
-            throw SQLiteError.prepareStatement("无法准备 INSERT 语句")
+            throw SQLiteError.prepareStatement(
+                NSLocalizedString("无法准备 INSERT 语句", comment: "Vector store INSERT statement preparation failure")
+            )
         }
         defer { sqlite3_finalize(statement) }
         
@@ -124,7 +142,12 @@ private extension SQLiteVectorStore {
             sqlite3_bind_text(statement, 5, (metadataJSONString as NSString).utf8String, -1, SQLITE_TRANSIENT)
             
             if sqlite3_step(statement) != SQLITE_DONE {
-                throw SQLiteError.executionFailed("插入向量失败: \(sqlite3_errmsg(db).flatMap { String(cString: $0) } ?? "")")
+                throw SQLiteError.executionFailed(
+                    String(
+                        format: NSLocalizedString("插入向量失败：%@", comment: "Vector insertion failure"),
+                        sqlite3_errmsg(db).flatMap { String(cString: $0) } ?? ""
+                    )
+                )
             }
         }
     }
@@ -133,7 +156,9 @@ private extension SQLiteVectorStore {
         let querySQL = "SELECT chunk_id, text, embedding, metadata FROM \(tableName);"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, querySQL, -1, &statement, nil) == SQLITE_OK else {
-            throw SQLiteError.prepareStatement("无法准备 SELECT 语句")
+            throw SQLiteError.prepareStatement(
+                NSLocalizedString("无法准备 SELECT 语句", comment: "Vector store SELECT statement preparation failure")
+            )
         }
         defer { sqlite3_finalize(statement) }
         
@@ -161,6 +186,21 @@ private extension SQLiteVectorStore {
             let message = sqlite3_errmsg(db).flatMap { String(cString: $0) } ?? "未知错误"
             throw SQLiteError.executionFailed(message)
         }
+    }
+
+    func intValue(sql: String, in db: OpaquePointer?) throws -> Int? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw SQLiteError.prepareStatement(
+                NSLocalizedString("无法准备 PRAGMA 语句", comment: "Vector store PRAGMA statement preparation failure")
+            )
+        }
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+        return Int(sqlite3_column_int(statement, 0))
     }
 }
 

@@ -143,9 +143,14 @@ public final class SkillManager: ObservableObject {
     @Published public private(set) var lastErrorMessage: String?
 
     private init(defaults: UserDefaults = .standard) {
+        let newlyInstalledBuiltInSkillNames = SkillStore.installBuiltInSkillsIfNeeded()
         self.defaults = defaults
         self.enabledSkillNames = Set(Self.stringArrayValue(forKey: DefaultsKey.enabledSkillNames, defaults: defaults))
         self.chatToolsEnabled = Self.boolValue(forKey: DefaultsKey.chatToolsEnabled, defaults: defaults, defaultValue: true)
+        if !newlyInstalledBuiltInSkillNames.isEmpty {
+            enabledSkillNames.formUnion(newlyInstalledBuiltInSkillNames)
+            persistEnabledSkillNames()
+        }
         reloadFromDisk()
     }
 
@@ -215,15 +220,15 @@ public final class SkillManager: ObservableObject {
 
         let fallback = fallbackName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !fallback.isEmpty else {
-            lastErrorMessage = "SKILL.md 缺少 name 字段。"
+            lastErrorMessage = NSLocalizedString("SKILL.md 缺少 name 字段。", comment: "Skill manifest missing name")
             return false
         }
         guard SkillPaths.isValidSkillName(fallback) else {
-            lastErrorMessage = "技能名称不合法。仅支持字母、数字、点、下划线、中划线。"
+            lastErrorMessage = NSLocalizedString("技能名称不合法。仅支持字母、数字、点、下划线、中划线。", comment: "Invalid skill name characters")
             return false
         }
         guard let manifest = try? SkillManifestResolver.resolve(content: content, fallbackName: fallback) else {
-            lastErrorMessage = "SKILL.md 格式错误：name 字段无效。"
+            lastErrorMessage = NSLocalizedString("SKILL.md 格式错误：name 字段无效。", comment: "Invalid skill manifest name")
             return false
         }
         return saveSkill(name: manifest.name, content: content)
@@ -232,18 +237,18 @@ public final class SkillManager: ObservableObject {
     @discardableResult
     public func saveSkill(name: String, content: String) -> Bool {
         guard SkillPaths.isValidSkillName(name) else {
-            lastErrorMessage = "技能名称不合法。仅支持字母、数字、点、下划线、中划线。"
+            lastErrorMessage = NSLocalizedString("技能名称不合法。仅支持字母、数字、点、下划线、中划线。", comment: "Invalid skill name characters")
             return false
         }
         guard let manifest = try? SkillManifestResolver.resolve(content: content, fallbackName: name),
               manifest.name == name else {
-            lastErrorMessage = "SKILL.md 格式错误：name 字段无效。"
+            lastErrorMessage = NSLocalizedString("SKILL.md 格式错误：name 字段无效。", comment: "Invalid skill manifest name")
             return false
         }
 
         let saved = SkillStore.saveSkill(name: name, content: content) != nil
         if !saved {
-            lastErrorMessage = "保存技能失败。"
+            lastErrorMessage = NSLocalizedString("保存技能失败。", comment: "Save skill failure")
             return false
         }
         reloadFromDisk()
@@ -265,22 +270,22 @@ public final class SkillManager: ObservableObject {
     @discardableResult
     public func saveSkillDataFilesAtomically(skillName: String, files: [String: Data]) -> Bool {
         guard let skillMD = files["SKILL.md"] else {
-            lastErrorMessage = "导入失败：缺少 SKILL.md。"
+            lastErrorMessage = NSLocalizedString("导入失败：缺少 SKILL.md。", comment: "Skill import missing manifest")
             return false
         }
         guard let skillContent = String(data: skillMD, encoding: .utf8) else {
-            lastErrorMessage = "导入失败：SKILL.md 不是 UTF-8 文本。"
+            lastErrorMessage = NSLocalizedString("导入失败：SKILL.md 不是 UTF-8 文本。", comment: "Skill import manifest is not UTF-8")
             return false
         }
         guard let manifest = try? SkillManifestResolver.resolve(content: skillContent, fallbackName: skillName),
               manifest.name == skillName else {
-            lastErrorMessage = "导入失败：SKILL.md 的 name 与技能目录名不一致。"
+            lastErrorMessage = NSLocalizedString("导入失败：SKILL.md 的 name 与技能目录名不一致。", comment: "Skill import name mismatch")
             return false
         }
 
         let saved = SkillStore.saveSkillDataFilesAtomically(skillName: skillName, files: files)
         if !saved {
-            lastErrorMessage = "导入失败：写入技能目录失败。"
+            lastErrorMessage = NSLocalizedString("导入失败：写入技能目录失败。", comment: "Skill import directory write failure")
             return false
         }
         reloadFromDisk()
@@ -300,7 +305,7 @@ public final class SkillManager: ObservableObject {
             reloadFromDisk()
             NotificationCenter.default.post(name: .cloudSyncLocalDataDidChange, object: nil)
         } else {
-            lastErrorMessage = "删除技能失败。"
+            lastErrorMessage = NSLocalizedString("删除技能失败。", comment: "Delete skill failure")
         }
         return deleted
     }
@@ -318,7 +323,10 @@ public final class SkillManager: ObservableObject {
         if relativePath == "SKILL.md" {
             guard let manifest = try? SkillManifestResolver.resolve(content: content, fallbackName: skillName),
                   manifest.name == skillName else {
-                lastErrorMessage = "不允许修改技能名称（name 必须保持为 \(skillName)）。"
+                lastErrorMessage = String(
+                    format: NSLocalizedString("不允许修改技能名称（name 必须保持为 %@）。", comment: "Skill name modification forbidden"),
+                    skillName
+                )
                 return false
             }
         }
@@ -327,7 +335,7 @@ public final class SkillManager: ObservableObject {
             reloadFromDisk()
             lastErrorMessage = nil
         } else {
-            lastErrorMessage = "保存文件失败。"
+            lastErrorMessage = NSLocalizedString("保存文件失败。", comment: "Save skill file failure")
         }
         return success
     }
@@ -339,7 +347,7 @@ public final class SkillManager: ObservableObject {
             reloadFromDisk()
             lastErrorMessage = nil
         } else {
-            lastErrorMessage = "删除文件失败。"
+            lastErrorMessage = NSLocalizedString("删除文件失败。", comment: "Delete skill file failure")
         }
         return success
     }
@@ -424,7 +432,10 @@ public final class SkillManager: ObservableObject {
             if saved {
                 return (true, result.skillName)
             }
-            return (false, lastErrorMessage ?? "保存技能失败。")
+            return (
+                false,
+                lastErrorMessage ?? NSLocalizedString("保存技能失败。", comment: "Save skill failure")
+            )
         } catch {
             let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             lastErrorMessage = reason
@@ -496,7 +507,16 @@ public final class SkillManager: ObservableObject {
 
     public func chatToolsForLLM() -> [InternalToolDefinition] {
         guard chatToolsEnabled else { return [] }
-        let available = skills.filter { enabledSkillNames.contains($0.name) }
+        let available = skills
+            .filter { enabledSkillNames.contains($0.name) }
+            .sorted { lhs, rhs in
+                let lhsName = lhs.name.lowercased()
+                let rhsName = rhs.name.lowercased()
+                if lhsName != rhsName {
+                    return lhsName < rhsName
+                }
+                return lhs.name < rhs.name
+            }
         guard !available.isEmpty else { return [] }
         let actionDescription = [
             "\(SkillToolAction.readInstructions.rawValue): \(NSLocalizedString("读取 SKILL.md 正文说明。", comment: "Skill tool action description sent to model"))",
@@ -568,31 +588,41 @@ public final class SkillManager: ObservableObject {
             )
         }
         guard snapshot.chatToolsEnabled else {
-            throw SkillStoreError.saveFailed("Agent Skills 总开关已关闭。")
+            throw SkillStoreError.saveFailed(
+                NSLocalizedString("Agent Skills 总开关已关闭。", comment: "Agent Skills tool group disabled")
+            )
         }
 
         guard let data = argumentsJSON.data(using: .utf8),
               let args = try? JSONDecoder().decode(UseSkillArgs.self, from: data) else {
-            throw SkillStoreError.saveFailed("无法解析 use_skill 参数，请提供 name，path 可选。")
+            throw SkillStoreError.saveFailed(
+                NSLocalizedString("无法解析 use_skill 参数，请提供 name，path 可选。", comment: "Invalid use_skill arguments")
+            )
         }
 
         let requestedName = args.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requestedName.isEmpty else {
-            throw SkillStoreError.saveFailed("use_skill 的 name 不能为空。")
+            throw SkillStoreError.saveFailed(
+                NSLocalizedString("use_skill 的 name 不能为空。", comment: "use_skill name is empty")
+            )
         }
         guard let name = Self.resolveSkillNameForToolCall(
             requestedName,
             enabledSkillNames: snapshot.enabledSkillNames,
             skills: snapshot.skills
         ) else {
-            throw SkillStoreError.saveFailed("技能 \(requestedName) 未启用或不存在。")
+            throw SkillStoreError.saveFailed(
+                String(format: NSLocalizedString("技能 %@ 未启用或不存在。", comment: "Requested skill unavailable"), requestedName)
+            )
         }
 
         let path = args.path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let action: SkillToolAction
         if let rawAction = args.action?.trimmingCharacters(in: .whitespacesAndNewlines), !rawAction.isEmpty {
             guard let resolvedAction = SkillToolAction.resolveToolArgument(rawAction) else {
-                throw SkillStoreError.saveFailed("use_skill 的 action 无效：\(rawAction)。")
+                throw SkillStoreError.saveFailed(
+                    String(format: NSLocalizedString("use_skill 的 action 无效：%@。", comment: "Invalid use_skill action"), rawAction)
+                )
             }
             action = resolvedAction
         } else {
@@ -602,7 +632,12 @@ public final class SkillManager: ObservableObject {
             switch action {
             case .readInstructions:
                 guard path.isEmpty || path == SkillStore.defaultSkillFileName else {
-                    throw SkillStoreError.saveFailed("read_instructions 不需要 path；读取其他文件请使用 read_resource。")
+                    throw SkillStoreError.saveFailed(
+                        NSLocalizedString(
+                            "read_instructions 不需要 path；读取其他文件请使用 read_resource。",
+                            comment: "read_instructions received a resource path"
+                        )
+                    )
                 }
                 guard let body = SkillStore.readSkillBody(skillName: name) else {
                     throw SkillStoreError.fileNotFound
@@ -613,7 +648,9 @@ public final class SkillManager: ObservableObject {
                 return Self.formatResourceList(skillName: name, files: files)
             case .readResource:
                 guard !path.isEmpty else {
-                    throw SkillStoreError.saveFailed("read_resource 必须提供 path。")
+                    throw SkillStoreError.saveFailed(
+                        NSLocalizedString("read_resource 必须提供 path。", comment: "read_resource path is required")
+                    )
                 }
                 if args.startLine != nil || args.maxLines != nil {
                     let chunk = try await SkillStore.loadSkillReadableResourceChunk(
@@ -700,7 +737,7 @@ public final class SkillManager: ObservableObject {
             lines.append("  </skill>")
         }
         lines.append("</available_skills>")
-        return ModelPromptLanguage.appendingToolArgumentInstruction(to: lines.joined(separator: "\n"))
+        return lines.joined(separator: "\n")
     }
 
     private nonisolated static func escapeXMLText(_ value: String) -> String {

@@ -51,9 +51,93 @@ struct RequestBodyControlRow: View {
     }
 }
 
+struct RequestBodyControlImportView: View {
+    @Environment(\.dismiss) private var dismiss
+    let sources: [RunnableModel]
+    let onImport: (RunnableModel) -> Void
+
+    var body: some View {
+        List {
+            Section {
+                if sources.isEmpty {
+                    Text(NSLocalizedString("没有其他已配置结构化控制的模型。", comment: ""))
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(sources) { source in
+                        Button {
+                            onImport(source)
+                            dismiss()
+                        } label: {
+                            RequestBodyControlImportRow(source: source)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } footer: {
+                Text(NSLocalizedString("选择后会将来源模型的全部结构化控制追加到当前模型，现有控制不会被替换。", comment: ""))
+            }
+        }
+        .navigationTitle(NSLocalizedString("选择来源模型", comment: ""))
+    }
+}
+
+private struct RequestBodyControlImportRow: View {
+    let source: RunnableModel
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text(displayTitle)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(providerAndModelText)
+                    .etFont(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(controlCountText)
+                    .etFont(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Image(systemName: "square.and.arrow.down")
+                .foregroundStyle(.tint)
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var displayTitle: String {
+        let title = source.model.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? source.model.modelName : title
+    }
+
+    private var controlCountText: String {
+        String(
+            format: NSLocalizedString("%d 个结构化控制", comment: ""),
+            source.model.requestBodyControls.count
+        )
+    }
+
+    private var providerAndModelText: String {
+        String(
+            format: NSLocalizedString("%@ · %@", comment: ""),
+            source.provider.name,
+            source.model.modelName
+        )
+    }
+}
+
 struct RequestBodyControlDetailView: View {
+    @Environment(\.dismiss) private var dismiss
     @Binding var control: ModelRequestBodyControl
     let payloadDisplayMode: Model.RequestBodyOverrideMode
+    let onSplit: ([ModelRequestBodyControl]) -> Void
+    @State private var payloadSuggestionsByOptionID: [String: [String: JSONValue]] = [:]
+    @State private var hasInitializedPayloadSuggestions = false
+    @State private var automaticSliderGranularity: Double?
+    @State private var showsNumericSortAction = false
+    @State private var canAutomaticallySplit = false
 
     var body: some View {
         Form {
@@ -73,7 +157,9 @@ struct RequestBodyControlDetailView: View {
 
                     RequestBodyPayloadEditor(
                         payloadDisplayMode: payloadDisplayMode,
-                        payload: $control.payload
+                        payload: $control.payload,
+                        suggestedPayload: nil,
+                        onSuggestionConsumed: {}
                     )
                     .id("\(control.id)-toggle-payload")
                 }
@@ -83,13 +169,19 @@ struct RequestBodyControlDetailView: View {
                         Text(NSLocalizedString("暂无", comment: ""))
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach($control.options) { $option in
+                        ForEach(optionsBinding, id: \.id, editActions: .move) { $option in
                             let optionID = option.id
                             NavigationLink {
                                 RequestBodyOptionDetailView(
                                     option: $option,
                                     defaultOptionID: $control.defaultOptionID,
-                                    payloadDisplayMode: payloadDisplayMode
+                                    payloadDisplayMode: payloadDisplayMode,
+                                    suggestedPayload: payloadSuggestionsByOptionID[optionID],
+                                    onSuggestionConsumed: {
+                                        payloadSuggestionsByOptionID.removeValue(forKey: optionID)
+                                    },
+                                    onEditingFinished: initializePayloadSuggestionsIfNeeded,
+                                    maximumRainbowEnabled: maximumRainbowBinding(for: optionID)
                                 )
                             } label: {
                                 RequestBodyOptionRow(
@@ -114,8 +206,72 @@ struct RequestBodyControlDetailView: View {
                     }
                 }
             }
+
+            if canAutomaticallySplit {
+                Section(
+                    footer: Text(NSLocalizedString("Split nested control footer", comment: "结构化控制自动拆分说明"))
+                ) {
+                    Button(action: splitNestedPayload) {
+                        Label(
+                            NSLocalizedString("Split by nested paths", comment: "结构化控制自动拆分按钮"),
+                            systemImage: "square.split.2x1"
+                        )
+                    }
+                }
+            }
+
+            if control.kind == .optionGroup {
+                Section(
+                    header: Text(NSLocalizedString("滑块", comment: "")),
+                    footer: Text(NSLocalizedString("启用后，字符串选项会吸附到档位，数字选项可在档位之间连续调节。数字粒度默认取相邻档位最小差值的 10%，也可手动覆盖。至少需要两个选项。", comment: ""))
+                ) {
+                    Toggle(NSLocalizedString("启用滑块", comment: ""), isOn: $control.isSliderEnabled)
+                        .disabled(control.options.count < 2)
+
+                    if control.isSliderEnabled {
+                        NavigationLink {
+                            RequestBodySliderColorSettingsView(control: $control)
+                        } label: {
+                            Label(NSLocalizedString("滑块颜色", comment: ""), systemImage: "paintpalette")
+                        }
+                    }
+
+                    if showsNumericSortAction {
+                        Button(action: sortOptionsByNumericValue) {
+                            Label(
+                                NSLocalizedString("按数值从小到大排序", comment: ""),
+                                systemImage: "arrow.up"
+                            )
+                        }
+                    }
+
+                    if let automaticSliderGranularity {
+                        TextField(
+                            NSLocalizedString("粒度", comment: "数值滑块每次调节的最小变化量"),
+                            value: sliderGranularityBinding(defaultValue: automaticSliderGranularity),
+                            format: .number.precision(.fractionLength(0...8))
+                        )
+                        .keyboardType(.decimalPad)
+                    }
+                }
+            }
         }
         .navigationTitle(displayTitle)
+        .onAppear {
+            initializePayloadSuggestionsIfNeeded()
+            refreshSliderConfiguration()
+            refreshSplitAvailability()
+        }
+        .onChange(of: control.payload) { _, _ in
+            refreshSplitAvailability()
+        }
+        .onChange(of: control.options) { _, options in
+            if options.count < 2 {
+                control.isSliderEnabled = false
+            }
+            refreshSliderConfiguration()
+            refreshSplitAvailability()
+        }
     }
 
     private var displayTitle: String {
@@ -123,8 +279,81 @@ struct RequestBodyControlDetailView: View {
         return trimmedTitle.isEmpty ? NSLocalizedString("未命名提示词", comment: "") : trimmedTitle
     }
 
+    private var optionsBinding: Binding<[ModelRequestBodyControlOption]> {
+        Binding(
+            get: { control.options },
+            set: { control.options = $0 }
+        )
+    }
+
+    private func initializePayloadSuggestionsIfNeeded() {
+        guard !hasInitializedPayloadSuggestions,
+              control.options.contains(where: { !$0.payload.isEmpty }) else {
+            return
+        }
+        payloadSuggestionsByOptionID = control.initialOptionPayloadSuggestions
+        hasInitializedPayloadSuggestions = true
+    }
+
+    private func refreshSliderConfiguration() {
+        let descriptor = ModelRequestBodyControlSliderDescriptor(control: control)
+        automaticSliderGranularity = descriptor?.automaticNumericGranularity
+        showsNumericSortAction = descriptor?.mode == .continuousNumeric
+            && descriptor?.isNumericOrderAscending == false
+    }
+
+    private func refreshSplitAvailability() {
+        canAutomaticallySplit = ModelRequestBodyControlSplitter.canSplit(control)
+    }
+
+    private func splitNestedPayload() {
+        guard let splitControls = ModelRequestBodyControlSplitter.split(control) else { return }
+        onSplit(splitControls)
+        dismiss()
+    }
+
+    private func sortOptionsByNumericValue() {
+        guard let sortedOptions = ModelRequestBodyControlSliderDescriptor(control: control)?
+            .optionsSortedByNumericValue() else {
+            return
+        }
+        withAnimation {
+            control.options = sortedOptions
+            showsNumericSortAction = false
+        }
+    }
+
+    private func sliderGranularityBinding(defaultValue: Double) -> Binding<Double> {
+        Binding(
+            get: {
+                guard let granularity = control.sliderGranularity,
+                      granularity.isFinite,
+                      granularity > 0 else {
+                    return defaultValue
+                }
+                return granularity
+            },
+            set: { granularity in
+                control.sliderGranularity = granularity.isFinite && granularity > 0
+                    ? granularity
+                    : nil
+            }
+        )
+    }
+
+    private func maximumRainbowBinding(for optionID: String) -> Binding<Bool>? {
+        guard control.isSliderEnabled, control.options.last?.id == optionID else { return nil }
+        return Binding(
+            get: { control.usesRainbowAtMaximum },
+            set: { control.usesRainbowAtMaximum = $0 }
+        )
+    }
+
     private func addOption() {
         let optionID = UUID().uuidString
+        let payloadSuggestion = control.payloadSuggestionForAppendingOption(
+            existingSuggestions: payloadSuggestionsByOptionID
+        )
         control.options.append(
             ModelRequestBodyControlOption(
                 id: optionID,
@@ -132,6 +361,9 @@ struct RequestBodyControlDetailView: View {
                 payload: [:]
             )
         )
+        if let payloadSuggestion {
+            payloadSuggestionsByOptionID[optionID] = payloadSuggestion
+        }
         if control.defaultOptionID == nil {
             control.defaultOptionID = optionID
         }
@@ -142,6 +374,9 @@ struct RequestBodyControlDetailView: View {
             control.options.indices.contains(index) ? control.options[index].id : nil
         }
         control.options.remove(atOffsets: offsets)
+        for deletedID in deletedIDs {
+            payloadSuggestionsByOptionID.removeValue(forKey: deletedID)
+        }
         if let defaultOptionID = control.defaultOptionID,
            deletedIDs.contains(defaultOptionID) {
             control.defaultOptionID = control.options.first?.id
@@ -185,6 +420,10 @@ struct RequestBodyOptionDetailView: View {
     @Binding var option: ModelRequestBodyControlOption
     @Binding var defaultOptionID: String?
     let payloadDisplayMode: Model.RequestBodyOverrideMode
+    let suggestedPayload: [String: JSONValue]?
+    let onSuggestionConsumed: () -> Void
+    let onEditingFinished: () -> Void
+    let maximumRainbowEnabled: Binding<Bool>?
 
     var body: some View {
         Form {
@@ -200,12 +439,28 @@ struct RequestBodyOptionDetailView: View {
             Section(header: Text(NSLocalizedString("详情", comment: ""))) {
                 RequestBodyPayloadEditor(
                     payloadDisplayMode: payloadDisplayMode,
-                    payload: $option.payload
+                    payload: $option.payload,
+                    suggestedPayload: suggestedPayload,
+                    onSuggestionConsumed: onSuggestionConsumed
                 )
                 .id("\(option.id)-payload")
             }
+
+            if let maximumRainbowEnabled {
+                Section {
+                    Toggle(
+                        NSLocalizedString("最高档彩虹效果", comment: ""),
+                        isOn: maximumRainbowEnabled
+                    )
+                } footer: {
+                    Text(NSLocalizedString("开启后，滑块到达当前最后一档时，档位文字与滑块会显示流动彩虹。", comment: ""))
+                        .etFont(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .navigationTitle(displayTitle)
+        .onDisappear(perform: onEditingFinished)
     }
 
     private var displayTitle: String {
@@ -229,14 +484,21 @@ struct RequestBodyOptionDetailView: View {
 struct RequestBodyPayloadEditor: View {
     let payloadDisplayMode: Model.RequestBodyOverrideMode
     @Binding var payload: [String: JSONValue]
+    let suggestedPayload: [String: JSONValue]?
+    let onSuggestionConsumed: () -> Void
     @State private var text: String = ""
     @State private var error: String?
+    @State private var hasEditedSuggestion = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             switch payloadDisplayMode {
             case .keyValue:
-                RequestBodyPayloadKeyValueEditor(payload: $payload)
+                RequestBodyPayloadKeyValueEditor(
+                    payload: $payload,
+                    suggestedPayload: suggestedPayload,
+                    onSuggestionConsumed: onSuggestionConsumed
+                )
             case .rawJSON:
                 textPayloadEditor(
                     title: nil,
@@ -271,10 +533,21 @@ struct RequestBodyPayloadEditor: View {
                 .lineLimit(lineLimit)
                 .onAppear(perform: syncTextFromPayload)
                 .onChange(of: text) { _, newValue in
+                    if payload.isEmpty,
+                       let suggestedText = suggestedText(),
+                       newValue != suggestedText {
+                        hasEditedSuggestion = true
+                        onSuggestionConsumed()
+                    }
                     parse(newValue)
                 }
                 .onChange(of: payloadDisplayMode) { _, _ in
                     syncTextFromPayload()
+                }
+                .onChange(of: suggestedPayload) { _, _ in
+                    if payload.isEmpty, !hasEditedSuggestion {
+                        syncTextFromPayload()
+                    }
                 }
 
             if let error {
@@ -286,6 +559,12 @@ struct RequestBodyPayloadEditor: View {
     }
 
     private func syncTextFromPayload() {
+        if payload.isEmpty, let suggestedText = suggestedText() {
+            text = suggestedText
+            error = nil
+            return
+        }
+
         switch payloadDisplayMode {
         case .rawJSON:
             text = ParameterExpressionParser.serializeRawJSONObject(parameters: payload)
@@ -297,6 +576,11 @@ struct RequestBodyPayloadEditor: View {
     }
 
     private func parse(_ rawText: String) {
+        if payload.isEmpty, rawText == suggestedText() {
+            error = nil
+            return
+        }
+
         do {
             switch payloadDisplayMode {
             case .rawJSON:
@@ -321,6 +605,20 @@ struct RequestBodyPayloadEditor: View {
             self.error = error.localizedDescription
         }
     }
+
+    private func suggestedText() -> String? {
+        guard let suggestedPayload, !suggestedPayload.isEmpty else { return nil }
+        switch payloadDisplayMode {
+        case .rawJSON:
+            return ParameterExpressionParser.serializeRawJSONTemplate(parameters: suggestedPayload)
+        case .keyValue, .expression:
+            return ParameterExpressionParser.serializeTemplate(parameters: suggestedPayload)
+                .joined(separator: "\n")
+        @unknown default:
+            return ParameterExpressionParser.serializeTemplate(parameters: suggestedPayload)
+                .joined(separator: "\n")
+        }
+    }
 }
 
 struct RequestBodyPayloadKeyValueEntry: Identifiable, Equatable {
@@ -339,7 +637,10 @@ struct RequestBodyPayloadKeyValueEntry: Identifiable, Equatable {
 
 struct RequestBodyPayloadKeyValueEditor: View {
     @Binding var payload: [String: JSONValue]
+    let suggestedPayload: [String: JSONValue]?
+    let onSuggestionConsumed: () -> Void
     @State private var entries: [RequestBodyPayloadKeyValueEntry] = []
+    @State private var hasEditedSuggestion = false
 
     var body: some View {
         Group {
@@ -348,26 +649,46 @@ struct RequestBodyPayloadKeyValueEditor: View {
                     entry: $entry,
                     canDelete: entries.count > 1,
                     onDelete: {
+                        consumeSuggestion()
                         deleteEntry(withID: entry.id)
                     },
-                    onChange: updatePayload
+                    onChange: {
+                        consumeSuggestion()
+                        updatePayload()
+                    }
                 )
             }
 
             Button {
+                consumeSuggestion()
                 entries.append(RequestBodyPayloadKeyValueEntry(key: "", value: ""))
             } label: {
                 Label(NSLocalizedString("添加键值对", comment: ""), systemImage: "plus")
             }
         }
         .onAppear(perform: syncEntriesFromPayload)
+        .onChange(of: suggestedPayload) { _, _ in
+            if payload.isEmpty, !hasEditedSuggestion {
+                syncEntriesFromPayload()
+            }
+        }
     }
 
     private func syncEntriesFromPayload() {
         let rows = payload
             .sorted(by: { $0.key < $1.key })
             .map { RequestBodyPayloadKeyValueEntry(key: $0.key, value: stringValue(for: $0.value)) }
-        entries = rows.isEmpty ? [RequestBodyPayloadKeyValueEntry(key: "", value: "")] : rows
+        let suggestedRows = (suggestedPayload ?? [:])
+            .sorted(by: { $0.key < $1.key })
+            .map {
+                RequestBodyPayloadKeyValueEntry(
+                    key: $0.key,
+                    value: ParameterExpressionParser.serializeTemplateValue($0.value)
+                )
+            }
+        entries = rows.isEmpty
+            ? (suggestedRows.isEmpty ? [RequestBodyPayloadKeyValueEntry(key: "", value: "")] : suggestedRows)
+            : rows
     }
 
     private func updatePayload() {
@@ -402,7 +723,7 @@ struct RequestBodyPayloadKeyValueEditor: View {
             throw ParameterExpressionParser.ParserError.invalidKey
         }
         if value.isEmpty {
-            return ParameterExpressionParser.ParsedExpression(key: key, value: .string(""))
+            return nil
         }
         return try ParameterExpressionParser.parse("\(key) = \(entry.value)")
     }
@@ -413,6 +734,12 @@ struct RequestBodyPayloadKeyValueEditor: View {
             entries.append(RequestBodyPayloadKeyValueEntry(key: "", value: ""))
         }
         updatePayload()
+    }
+
+    private func consumeSuggestion() {
+        guard suggestedPayload != nil, !hasEditedSuggestion else { return }
+        hasEditedSuggestion = true
+        onSuggestionConsumed()
     }
 
     private func stringValue(for value: JSONValue) -> String {

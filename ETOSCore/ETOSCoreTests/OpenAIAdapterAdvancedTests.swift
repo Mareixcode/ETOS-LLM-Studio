@@ -55,6 +55,18 @@ struct OpenAIAdapterAdvancedTests {
         #expect(firstDelta.providerSpecificFields?["thought_signature"] == .string("sig-stream-extra"))
     }
 
+    @Test("OpenAI 流式工具参数片段允许省略 type")
+    func testStreamingToolArgumentDeltaAllowsMissingType() throws {
+        let line = """
+        data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}
+        """
+
+        let part = adapter.parseStreamingResponse(line: line)
+        let firstDelta = try #require(part?.toolCallDeltas?.first)
+        #expect(firstDelta.index == 0)
+        #expect(firstDelta.argumentsFragment == "{")
+    }
+
     @Test("OpenAI 流式 usage-only 片段可解析 token 用量")
     func testStreamingUsageOnlyChunkParsesTokenUsage() throws {
         let line = """
@@ -69,6 +81,17 @@ struct OpenAIAdapterAdvancedTests {
         #expect(usage.thinkingTokens == 3)
         #expect(part.content == nil)
         #expect(part.reasoningContent == nil)
+    }
+
+    @Test("OpenAI 流式 usage-only 片段可解析 DeepSeek prompt cache 字段")
+    func testStreamingUsageOnlyChunkParsesDeepSeekPromptCacheHitTokens() throws {
+        let line = """
+        data: {"id":"chatcmpl-usage","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":29,"total_tokens":40,"prompt_cache_hit_tokens":8,"prompt_cache_miss_tokens":3}}
+        """
+        let part = try #require(adapter.parseStreamingResponse(line: line))
+        let usage = try #require(part.tokenUsage)
+        #expect(usage.promptTokens == 11)
+        #expect(usage.cacheReadTokens == 8)
     }
 
     @Test("OpenAI 流式请求默认附带 include_usage")
@@ -116,6 +139,67 @@ struct OpenAIAdapterAdvancedTests {
 
         #expect(jsonPayload["stream_options"] == nil)
         #expect(jsonPayload[OpenAIAdapter.streamIncludeUsageControlKey] == nil)
+    }
+
+    @Test("OpenAI Chat 响应支持数组 content")
+    func testOpenAIChatResponseParsesArrayContent() throws {
+        let pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        let payload = """
+        {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": [
+                  { "type": "text", "text": "图片已生成。" },
+                  { "type": "image", "image": "\(pngBase64)" }
+                ]
+              }
+            }
+          ]
+        }
+        """
+
+        let message = try adapter.parseResponse(data: Data(payload.utf8))
+
+        #expect(message.content == "图片已生成。")
+    }
+
+    @Test("OpenAI Chat 请求会回传 assistant 图片附件")
+    func testChatRequestIncludesAssistantImageAttachments() throws {
+        let imageData = try #require(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="))
+        let assistantMessage = ChatMessage(role: .assistant, content: "上一张图")
+        let imageAttachment = ImageAttachment(
+            data: imageData,
+            mimeType: "image/png",
+            fileName: "generated.png"
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: dummyModel,
+            commonPayload: [:],
+            messages: [assistantMessage],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [assistantMessage.id: [imageAttachment]],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let messages = try #require(jsonPayload["messages"] as? [[String: Any]])
+        let firstMessage = try #require(messages.first)
+        let contentParts = try #require(firstMessage["content"] as? [[String: Any]])
+
+        #expect(firstMessage["role"] as? String == MessageRole.assistant.rawValue)
+        #expect(contentParts.contains { $0["type"] as? String == "text" })
+        #expect(contentParts.contains { part in
+            guard part["type"] as? String == "image_url",
+                  let imageURL = part["image_url"] as? [String: Any],
+                  let url = imageURL["url"] as? String else {
+                return false
+            }
+            return url.hasPrefix("data:image/png;base64,")
+        })
     }
 
     @Test("OpenAI 可切换为 Responses API 请求体")
@@ -207,14 +291,17 @@ struct OpenAIAdapterAdvancedTests {
 
     @Test("OpenAI Responses 独立适配器默认使用 Responses 请求体")
     func testOpenAIResponsesAdapterBuildsResponsesPayloadByDefault() throws {
+        var thinkingControl = ModelRequestBodyControlDefaults.thinkingOptionGroup(for: "openai-responses")
+        thinkingControl.defaultOptionID = "high"
         let model = RunnableModel(
             provider: responsesDummyModel.provider,
             model: Model(
-                modelName: "gpt-5.4",
+                modelName: "adapter-only-model",
                 overrideParameters: [
                     "max_tokens": .int(512),
                     "messages": .array([.dictionary(["role": .string("user")])])
-                ]
+                ],
+                requestBodyControls: [thinkingControl]
             )
         )
         let messages = [ChatMessage(role: .user, content: "你好")]
@@ -241,6 +328,8 @@ struct OpenAIAdapterAdvancedTests {
         #expect(jsonPayload["messages"] == nil)
         #expect(jsonPayload["max_tokens"] == nil)
         #expect(jsonPayload["max_output_tokens"] as? Int == 512)
+        #expect((jsonPayload["reasoning"] as? [String: Any])?["effort"] as? String == "high")
+        #expect(jsonPayload["reasoning_effort"] == nil)
         #expect(inputItems.first?["role"] as? String == "user")
         #expect(firstTool["type"] as? String == "function")
         #expect(firstTool["name"] as? String == "save_memory")
@@ -269,8 +358,8 @@ struct OpenAIAdapterAdvancedTests {
         #expect(request == nil)
     }
 
-    @Test("OpenAI Responses 无工具请求会移除覆盖参数里的工具字段")
-    func testOpenAIResponsesRequestWithoutToolsRemovesOverrideToolFields() throws {
+    @Test("OpenAI Responses 无工具请求会保留覆盖参数里的工具字段")
+    func testOpenAIResponsesRequestWithoutToolsKeepsOverrideToolFields() throws {
         let model = RunnableModel(
             provider: responsesDummyModel.provider,
             model: Model(
@@ -304,9 +393,46 @@ struct OpenAIAdapterAdvancedTests {
             return
         }
 
-        #expect(jsonPayload["tools"] == nil)
-        #expect(jsonPayload["tool_choice"] == nil)
-        #expect(jsonPayload["parallel_tool_calls"] == nil)
+        let toolsPayload = try #require(jsonPayload["tools"] as? [[String: Any]])
+        #expect(toolsPayload.first?["name"] as? String == "stale_tool")
+        #expect(jsonPayload["tool_choice"] as? String == "auto")
+        #expect(jsonPayload["parallel_tool_calls"] as? Bool == true)
+    }
+
+    @Test("OpenAI Responses 运行时工具会和自定义 tools 合并")
+    func testOpenAIResponsesToolsMergeRuntimeAndOverrideTools() throws {
+        let model = RunnableModel(
+            provider: responsesDummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "tools": .array([
+                        .dictionary(["type": .string("web_search_preview")])
+                    ])
+                ]
+            )
+        )
+        let messages = [ChatMessage(role: .user, content: "你好")]
+
+        guard let request = responsesAdapter.buildChatRequest(
+            for: model,
+            commonPayload: [:],
+            messages: messages,
+            tools: [saveMemoryToolDefinition()],
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ),
+        let httpBody = request.httpBody,
+        let jsonPayload = try? JSONSerialization.jsonObject(with: httpBody) as? [String: Any],
+        let toolsPayload = jsonPayload["tools"] as? [[String: Any]] else {
+            Issue.record("无法解析 OpenAI Responses 合并后的工具字段。")
+            return
+        }
+
+        #expect(toolsPayload.count == 2)
+        #expect(toolsPayload.first?["type"] as? String == "web_search_preview")
+        #expect(toolsPayload.last?["name"] as? String == "save_memory")
     }
 
     @Test("OpenAI Responses 响应可解析正文、推理与工具调用")
@@ -329,12 +455,15 @@ struct OpenAIAdapterAdvancedTests {
             },
             {
               "type": "function_call",
+              "id": "fc_123",
               "call_id": "call_resp_1",
               "name": "save_memory",
-              "arguments": "{\\"content\\":\\"你好\\"}"
+              "arguments": "{\\"content\\":\\"你好\\"}",
+              "status": "completed"
             },
             {
               "type": "message",
+              "id": "msg_123",
               "role": "assistant",
               "content": [
                 {
@@ -362,9 +491,12 @@ struct OpenAIAdapterAdvancedTests {
         let toolCall = try #require(message.toolCalls?.first)
         let usage = try #require(message.tokenUsage)
         let rawReasoningItems = try #require(message.reasoningProviderSpecificFields?["openai_responses_reasoning_items"])
+        let providerMetadata = try #require(message.providerResponseMetadata)
+        let rawOutputItems = try #require(providerMetadata["openai_responses_output_items"])
 
         #expect(message.content == "已经帮你记住啦。")
         #expect(message.reasoningContent == "先检查记忆是否已有相同信息。")
+        #expect(providerMetadata["openai_responses_response_id"] == .string("resp_123"))
         if case let .array(reasoningItems) = rawReasoningItems,
            let firstReasoningItem = reasoningItems.first,
            case let .dictionary(reasoningItem) = firstReasoningItem {
@@ -376,6 +508,13 @@ struct OpenAIAdapterAdvancedTests {
         #expect(toolCall.id == "call_resp_1")
         #expect(toolCall.toolName == "save_memory")
         #expect(toolCall.arguments == "{\"content\":\"你好\"}")
+        #expect(toolCall.providerSpecificFields?["openai_responses_output_item_id"] == .string("fc_123"))
+        #expect(toolCall.providerSpecificFields?["openai_responses_output_item_status"] == .string("completed"))
+        if case let .array(outputItems) = rawOutputItems {
+            #expect(outputItems.count == 3)
+        } else {
+            Issue.record("Responses API 响应未保留原始 output items。")
+        }
         #expect(usage.promptTokens == 12)
         #expect(usage.completionTokens == 18)
         #expect(usage.thinkingTokens == 5)
@@ -485,6 +624,492 @@ struct OpenAIAdapterAdvancedTests {
         #expect(inputItems[2]["call_id"] as? String == "call_resp_2")
     }
 
+    @Test("OpenAI Responses 请求优先回传原始 output items")
+    func testBuildResponsesAPIRequestReplaysRawOutputItems() throws {
+        let responseModel = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "openai_api": .string("responses")
+                ]
+            )
+        )
+        let assistantMessage = ChatMessage(
+            role: .assistant,
+            content: "本地展示文本不会覆盖原始 output。",
+            providerResponseMetadata: [
+                "openai_responses_output_items": .array([
+                    .dictionary([
+                        "type": .string("reasoning"),
+                        "id": .string("rs_raw"),
+                        "encrypted_content": .string("enc_raw")
+                    ]),
+                    .dictionary([
+                        "type": .string("message"),
+                        "id": .string("msg_raw"),
+                        "role": .string("assistant"),
+                        "content": .array([
+                            .dictionary([
+                                "type": .string("output_text"),
+                                "text": .string("原始输出文本。")
+                            ])
+                        ])
+                    ]),
+                    .dictionary([
+                        "type": .string("function_call"),
+                        "id": .string("fc_raw"),
+                        "call_id": .string("call_raw"),
+                        "name": .string("save_memory"),
+                        "arguments": .string("{\"content\":\"原始\"}"),
+                        "status": .string("completed")
+                    ])
+                ])
+            ],
+            toolCalls: [
+                InternalToolCall(
+                    id: "call_local",
+                    toolName: "save_memory",
+                    arguments: "{\"content\":\"本地\"}"
+                )
+            ]
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: responseModel,
+            commonPayload: [
+                OpenAIAdapter.reasoningContentEchoModeControlKey: ReasoningContentEchoMode.never.rawValue
+            ],
+            messages: [
+                ChatMessage(role: .user, content: "继续"),
+                assistantMessage
+            ],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let inputItems = try #require(jsonPayload["input"] as? [[String: Any]])
+
+        #expect(inputItems.count == 3)
+        #expect(inputItems[0]["type"] as? String == "message")
+        #expect(inputItems[1]["id"] as? String == "msg_raw")
+        #expect(inputItems[1]["type"] as? String == "message")
+        let rawContent = try #require(inputItems[1]["content"] as? [[String: Any]])
+        #expect(rawContent.first?["text"] as? String == "原始输出文本。")
+        #expect(inputItems[2]["id"] as? String == "fc_raw")
+        #expect(inputItems[2]["call_id"] as? String == "call_raw")
+        #expect(inputItems[2]["arguments"] as? String == "{\"content\":\"原始\"}")
+        #expect(inputItems.contains { $0["type"] as? String == "reasoning" } == false)
+    }
+
+    @Test("OpenAI Responses 请求可用 previous_response_id 只发送增量 input")
+    func testBuildResponsesAPIRequestUsesPreviousResponseIDForIncrementalInput() throws {
+        let responseModel = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "openai_api": .string("responses")
+                ]
+            )
+        )
+        let requestSignature = try #require(adapter.responsesRequestSignature(from: [
+            "model": "gpt-5.4"
+        ]))
+        let previousContextSignature = try #require(OpenAIAdapter.responsesContextSignature(appending: [
+            [
+                "type": "message",
+                "role": "user",
+                "content": "第一轮问题"
+            ],
+            [
+                "type": "message",
+                "id": "msg_prev_1",
+                "role": "assistant",
+                "content": [
+                    [
+                        "type": "output_text",
+                        "text": "第一轮回答。"
+                    ]
+                ]
+            ]
+        ]))
+        let previousAssistant = ChatMessage(
+            role: .assistant,
+            content: "第一轮回答。",
+            providerResponseMetadata: [
+                "openai_responses_response_id": .string("resp_prev_1"),
+                "openai_responses_request_signature": requestSignature,
+                "openai_responses_context_signature": previousContextSignature,
+                "openai_responses_output_items": .array([
+                    .dictionary([
+                        "type": .string("message"),
+                        "id": .string("msg_prev_1"),
+                        "role": .string("assistant"),
+                        "content": .array([
+                            .dictionary([
+                                "type": .string("output_text"),
+                                "text": .string("第一轮回答。")
+                            ])
+                        ])
+                    ])
+                ])
+            ]
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: responseModel,
+            commonPayload: [:],
+            messages: [
+                ChatMessage(role: .user, content: "第一轮问题"),
+                previousAssistant,
+                ChatMessage(role: .user, content: "继续")
+            ],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let inputItems = try #require(jsonPayload["input"] as? [[String: Any]])
+
+        #expect(jsonPayload["previous_response_id"] as? String == "resp_prev_1")
+        #expect(inputItems.count == 1)
+        #expect(inputItems.first?["role"] as? String == "user")
+        #expect(inputItems.first?["content"] as? String == "继续")
+    }
+
+    @Test("OpenAI Responses 前文变更时不会复用 previous_response_id")
+    func testBuildResponsesAPIRequestSkipsPreviousResponseIDWhenHistoryPrefixChanged() throws {
+        let responseModel = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "openai_api": .string("responses")
+                ]
+            )
+        )
+        let requestSignature = try #require(adapter.responsesRequestSignature(from: [
+            "model": "gpt-5.4"
+        ]))
+        let oldContextSignature = try #require(OpenAIAdapter.responsesContextSignature(appending: [
+            [
+                "type": "message",
+                "role": "user",
+                "content": "第一轮问题"
+            ],
+            [
+                "type": "message",
+                "id": "msg_prev_changed",
+                "role": "assistant",
+                "content": [
+                    [
+                        "type": "output_text",
+                        "text": "第一轮回答。"
+                    ]
+                ]
+            ]
+        ]))
+        let previousAssistant = ChatMessage(
+            role: .assistant,
+            content: "第一轮回答。",
+            providerResponseMetadata: [
+                "openai_responses_response_id": .string("resp_prev_changed"),
+                "openai_responses_request_signature": requestSignature,
+                "openai_responses_context_signature": oldContextSignature,
+                "openai_responses_output_items": .array([
+                    .dictionary([
+                        "type": .string("message"),
+                        "id": .string("msg_prev_changed"),
+                        "role": .string("assistant"),
+                        "content": .array([
+                            .dictionary([
+                                "type": .string("output_text"),
+                                "text": .string("第一轮回答。")
+                            ])
+                        ])
+                    ])
+                ])
+            ]
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: responseModel,
+            commonPayload: [:],
+            messages: [
+                ChatMessage(role: .user, content: "第一轮问题（已编辑）"),
+                previousAssistant,
+                ChatMessage(role: .user, content: "继续")
+            ],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let inputItems = try #require(jsonPayload["input"] as? [[String: Any]])
+
+        #expect(jsonPayload["previous_response_id"] == nil)
+        #expect(inputItems.count == 3)
+        #expect(inputItems[0]["content"] as? String == "第一轮问题（已编辑）")
+        #expect(inputItems[1]["id"] as? String == "msg_prev_changed")
+        #expect(inputItems[2]["content"] as? String == "继续")
+    }
+
+    @Test("OpenAI Responses 工具结果增量只回传 function_call_output")
+    func testBuildResponsesAPIRequestUsesPreviousResponseIDForToolOutputOnly() throws {
+        let responseModel = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "openai_api": .string("responses")
+                ]
+            )
+        )
+        let requestSignature = try #require(adapter.responsesRequestSignature(from: [
+            "model": "gpt-5.4"
+        ]))
+        let functionCallItem: [String: Any] = [
+            "type": "function_call",
+            "id": "fc_prev_tool",
+            "call_id": "call_prev_tool",
+            "name": "save_memory",
+            "arguments": "{\"content\":\"记住这个\"}",
+            "status": "completed"
+        ]
+        let previousContextSignature = try #require(OpenAIAdapter.responsesContextSignature(appending: [
+            [
+                "type": "message",
+                "role": "user",
+                "content": "记住这个"
+            ],
+            functionCallItem
+        ]))
+        let previousAssistant = ChatMessage(
+            role: .assistant,
+            content: "",
+            providerResponseMetadata: [
+                "openai_responses_response_id": .string("resp_prev_tool"),
+                "openai_responses_request_signature": requestSignature,
+                "openai_responses_context_signature": previousContextSignature,
+                "openai_responses_output_items": .array([
+                    .dictionary([
+                        "type": .string("function_call"),
+                        "id": .string("fc_prev_tool"),
+                        "call_id": .string("call_prev_tool"),
+                        "name": .string("save_memory"),
+                        "arguments": .string("{\"content\":\"记住这个\"}"),
+                        "status": .string("completed")
+                    ])
+                ])
+            ]
+        )
+        let toolMessage = ChatMessage(
+            role: .tool,
+            content: "{\"saved\":true}",
+            toolCalls: [
+                InternalToolCall(
+                    id: "call_prev_tool",
+                    toolName: "save_memory",
+                    arguments: "{}"
+                )
+            ]
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: responseModel,
+            commonPayload: [:],
+            messages: [
+                ChatMessage(role: .user, content: "记住这个"),
+                previousAssistant,
+                toolMessage
+            ],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let inputItems = try #require(jsonPayload["input"] as? [[String: Any]])
+
+        #expect(jsonPayload["previous_response_id"] as? String == "resp_prev_tool")
+        #expect(inputItems.count == 1)
+        #expect(inputItems.first?["type"] as? String == "function_call_output")
+        #expect(inputItems.first?["call_id"] as? String == "call_prev_tool")
+        #expect(inputItems.first?["output"] as? String == "{\"saved\":true}")
+    }
+
+    @Test("OpenAI Responses conversation 模式不会自动叠加 previous_response_id")
+    func testBuildResponsesAPIRequestDoesNotAutoPreviousResponseIDWithConversation() throws {
+        let responseModel = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "openai_api": .string("responses")
+                ]
+            )
+        )
+        let requestSignature = try #require(adapter.responsesRequestSignature(from: [
+            "conversation": "conv_1",
+            "model": "gpt-5.4"
+        ]))
+        let previousContextSignature = try #require(OpenAIAdapter.responsesContextSignature(appending: [
+            [
+                "type": "message",
+                "role": "user",
+                "content": "第一轮问题"
+            ],
+            [
+                "type": "message",
+                "id": "msg_prev_conversation",
+                "role": "assistant",
+                "content": [
+                    [
+                        "type": "output_text",
+                        "text": "第一轮回答。"
+                    ]
+                ]
+            ]
+        ]))
+        let previousAssistant = ChatMessage(
+            role: .assistant,
+            content: "第一轮回答。",
+            providerResponseMetadata: [
+                "openai_responses_response_id": .string("resp_prev_conversation"),
+                "openai_responses_request_signature": requestSignature,
+                "openai_responses_context_signature": previousContextSignature,
+                "openai_responses_output_items": .array([
+                    .dictionary([
+                        "type": .string("message"),
+                        "id": .string("msg_prev_conversation"),
+                        "role": .string("assistant"),
+                        "content": .array([
+                            .dictionary([
+                                "type": .string("output_text"),
+                                "text": .string("第一轮回答。")
+                            ])
+                        ])
+                    ])
+                ])
+            ]
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: responseModel,
+            commonPayload: [
+                "conversation": "conv_1",
+                "previous_response_id": "resp_manual_should_drop"
+            ],
+            messages: [
+                ChatMessage(role: .user, content: "第一轮问题"),
+                previousAssistant,
+                ChatMessage(role: .user, content: "继续")
+            ],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let inputItems = try #require(jsonPayload["input"] as? [[String: Any]])
+
+        #expect(jsonPayload["conversation"] as? String == "conv_1")
+        #expect(jsonPayload["previous_response_id"] == nil)
+        #expect(inputItems.count == 3)
+    }
+
+    @Test("OpenAI Responses 强制全量 input 会移除 previous_response_id 控制状态")
+    func testBuildResponsesAPIRequestCanForceFullInput() throws {
+        let responseModel = RunnableModel(
+            provider: dummyModel.provider,
+            model: Model(
+                modelName: "gpt-5.4",
+                overrideParameters: [
+                    "openai_api": .string("responses")
+                ]
+            )
+        )
+        let requestSignature = try #require(adapter.responsesRequestSignature(from: [
+            "model": "gpt-5.4"
+        ]))
+        let previousAssistant = ChatMessage(
+            role: .assistant,
+            content: "第一轮回答。",
+            providerResponseMetadata: [
+                "openai_responses_response_id": .string("resp_prev_2"),
+                "openai_responses_request_signature": requestSignature,
+                "openai_responses_output_items": .array([
+                    .dictionary([
+                        "type": .string("message"),
+                        "id": .string("msg_prev_2"),
+                        "role": .string("assistant"),
+                        "content": .array([
+                            .dictionary([
+                                "type": .string("output_text"),
+                                "text": .string("第一轮回答。")
+                            ])
+                        ])
+                    ])
+                ])
+            ]
+        )
+
+        let request = try #require(adapter.buildChatRequest(
+            for: responseModel,
+            commonPayload: [
+                OpenAIAdapter.responsesForceFullInputControlKey: true
+            ],
+            messages: [
+                ChatMessage(role: .user, content: "第一轮问题"),
+                previousAssistant,
+                ChatMessage(role: .user, content: "继续")
+            ],
+            tools: nil,
+            audioAttachments: [:],
+            imageAttachments: [:],
+            fileAttachments: [:]
+        ))
+        let httpBody = try #require(request.httpBody)
+        let jsonPayload = try #require(JSONSerialization.jsonObject(with: httpBody) as? [String: Any])
+        let inputItems = try #require(jsonPayload["input"] as? [[String: Any]])
+
+        #expect(jsonPayload["previous_response_id"] == nil)
+        #expect(jsonPayload[OpenAIAdapter.responsesForceFullInputControlKey] == nil)
+        #expect(inputItems.count == 3)
+        #expect(inputItems[0]["role"] as? String == "user")
+        #expect(inputItems[1]["id"] as? String == "msg_prev_2")
+        #expect(inputItems[2]["role"] as? String == "user")
+    }
+
+    @Test("OpenAI Responses previous_response_id miss 可识别为全量回退条件")
+    func testOpenAIResponsesPreviousResponseMissingDetection() throws {
+        let service = ChatService()
+        let missingBody = """
+        {"error":{"code":"response_not_found","message":"Could not find previous_response_id resp_missing"}}
+        """.data(using: .utf8)
+        let plainMissingBody = """
+        previous_response_id resp_missing not found
+        """.data(using: .utf8)
+        let unrelatedBody = """
+        {"error":{"code":"invalid_request_error","message":"model is required"}}
+        """.data(using: .utf8)
+
+        #expect(service.isOpenAIResponsesPreviousResponseMissing(statusCode: 400, bodyData: missingBody))
+        #expect(service.isOpenAIResponsesPreviousResponseMissing(statusCode: 404, bodyData: plainMissingBody))
+        #expect(service.isOpenAIResponsesPreviousResponseMissing(statusCode: 400, bodyData: unrelatedBody) == false)
+        #expect(service.isOpenAIResponsesPreviousResponseMissing(statusCode: 500, bodyData: missingBody) == false)
+    }
+
     @Test("OpenAI Responses 不回传模式会移除 reasoning item")
     func testBuildResponsesAPIRequestOmitsReasoningItemsWhenDisabled() throws {
         let responseModel = RunnableModel(
@@ -550,10 +1175,16 @@ struct OpenAIAdapterAdvancedTests {
         data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_stream","encrypted_content":"enc_stream"}}
         """
         let toolStart = """
-        data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_stream_1","name":"save_memory","arguments":""}}
+        data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_stream_1","name":"save_memory","arguments":""}}
         """
         let toolDelta = """
-        data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","call_id":"call_stream_1","delta":"{\\"content\\":\\"你好\\"}"}
+        data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\\"content\\":\\"你好\\""}
+        """
+        let toolArgumentsDone = """
+        data: {"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_1","arguments":"{\\"content\\":\\"你好\\"}"}
+        """
+        let toolDone = """
+        data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_stream_1","name":"save_memory","arguments":"{\\"content\\":\\"你好\\"}","status":"completed"}}
         """
         let textDelta = """
         data: {"type":"response.output_text.delta","output_index":2,"item_id":"msg_1","content_index":0,"delta":"已经完成"}
@@ -566,13 +1197,19 @@ struct OpenAIAdapterAdvancedTests {
         let reasoningDonePart = try #require(adapter.parseStreamingResponse(line: reasoningDone))
         let toolStartPart = try #require(adapter.parseStreamingResponse(line: toolStart))
         let toolDeltaPart = try #require(adapter.parseStreamingResponse(line: toolDelta))
+        let toolArgumentsDonePart = try #require(adapter.parseStreamingResponse(line: toolArgumentsDone))
+        let toolDonePart = try #require(adapter.parseStreamingResponse(line: toolDone))
         let textPart = try #require(adapter.parseStreamingResponse(line: textDelta))
         let completedPart = try #require(adapter.parseStreamingResponse(line: completed))
 
         let rawReasoningItems = try #require(reasoningPart.reasoningProviderSpecificFields?["openai_responses_reasoning_items"])
         let rawDoneReasoningItems = try #require(reasoningDonePart.reasoningProviderSpecificFields?["openai_responses_reasoning_items"])
+        let rawStreamingOutputItems = try #require(reasoningDonePart.providerResponseMetadata?["openai_responses_output_items"])
+        let rawToolOutputItems = try #require(toolStartPart.providerResponseMetadata?["openai_responses_output_items"])
         let startedTool = try #require(toolStartPart.toolCallDeltas?.first)
         let toolArguments = try #require(toolDeltaPart.toolCallDeltas?.first)
+        let doneArguments = try #require(toolArgumentsDonePart.toolCallDeltas?.first)
+        let finishedTool = try #require(toolDonePart.toolCallDeltas?.first)
         let usage = try #require(completedPart.tokenUsage)
 
         if case let .array(reasoningItems) = rawReasoningItems,
@@ -590,15 +1227,64 @@ struct OpenAIAdapterAdvancedTests {
         } else {
             Issue.record("Responses API 流式完成事件未保留 reasoning item。")
         }
+        if case let .array(outputItems) = rawStreamingOutputItems,
+           let firstOutputItem = outputItems.first,
+           case let .dictionary(outputItem) = firstOutputItem {
+            #expect(outputItem["id"] == .string("rs_stream"))
+            #expect(outputItem["encrypted_content"] == .string("enc_stream"))
+        } else {
+            Issue.record("Responses API 流式事件未保留 output item。")
+        }
+        if case let .array(toolOutputItems) = rawToolOutputItems,
+           let firstToolOutputItem = toolOutputItems.first,
+           case let .dictionary(toolOutputItem) = firstToolOutputItem {
+            #expect(toolOutputItem["call_id"] == .string("call_stream_1"))
+        } else {
+            Issue.record("Responses API 流式工具事件未保留 output item。")
+        }
         #expect(startedTool.id == "call_stream_1")
         #expect(startedTool.nameFragment == "save_memory")
-        #expect(toolArguments.argumentsFragment == "{\"content\":\"你好\"}")
+        #expect(startedTool.providerSpecificFields?["openai_responses_output_item_id"] == .string("fc_1"))
+        #expect(toolArguments.id == nil)
+        #expect(toolArguments.argumentsFragment == "{\"content\":\"你好\"")
+        #expect(toolArguments.providerSpecificFields?["openai_responses_output_item_id"] == .string("fc_1"))
+        #expect(doneArguments.id == nil)
+        #expect(doneArguments.argumentsReplacement == "{\"content\":\"你好\"}")
+        #expect(finishedTool.id == "call_stream_1")
+        #expect(finishedTool.nameFragment == "save_memory")
+        #expect(finishedTool.argumentsReplacement == "{\"content\":\"你好\"}")
+        #expect(finishedTool.providerSpecificFields?["openai_responses_output_item_status"] == .string("completed"))
         #expect(textPart.content == "已经完成")
         #expect(usage.promptTokens == 9)
         #expect(usage.completionTokens == 7)
         #expect(usage.thinkingTokens == 2)
         #expect(usage.cacheReadTokens == 4)
         #expect(usage.totalTokens == 16)
+    }
+
+    @Test("OpenAI Responses 流式工具参数完成事件可从 item 补齐工具信息")
+    func testParseResponsesFunctionCallArgumentsDoneUsesNestedItem() throws {
+        let line = """
+        data: {"type":"response.function_call_arguments.done","output_index":1,"item":{"type":"function_call","id":"fc_done_1","call_id":"call_done_1","name":"save_memory","arguments":"{\\"content\\":\\"你好\\"}","status":"completed"}}
+        """
+
+        let part = try #require(adapter.parseStreamingResponse(line: line))
+        let delta = try #require(part.toolCallDeltas?.first)
+        let rawOutputItems = try #require(part.providerResponseMetadata?["openai_responses_output_items"])
+
+        #expect(delta.id == "call_done_1")
+        #expect(delta.nameFragment == "save_memory")
+        #expect(delta.argumentsReplacement == "{\"content\":\"你好\"}")
+        #expect(delta.providerSpecificFields?["openai_responses_output_item_id"] == .string("fc_done_1"))
+        #expect(delta.providerSpecificFields?["openai_responses_output_item_status"] == .string("completed"))
+        if case let .array(outputItems) = rawOutputItems,
+           let firstOutputItem = outputItems.first,
+           case let .dictionary(outputItem) = firstOutputItem {
+            #expect(outputItem["id"] == .string("fc_done_1"))
+            #expect(outputItem["call_id"] == .string("call_done_1"))
+        } else {
+            Issue.record("Responses API 流式工具参数完成事件未保留 output item。")
+        }
     }
 
     @Test("OpenAI Responses 独立适配器可解析 Responses 流式事件")
@@ -648,14 +1334,90 @@ struct OpenAIAdapterAdvancedTests {
         )
         let contentType = try #require(request.value(forHTTPHeaderField: "Content-Type"))
         let bodyData = try #require(request.httpBody)
-        let bodyString = String(data: bodyData, encoding: .utf8) ?? ""
-
         #expect(request.url?.absoluteString == "https://api.test.com/v1/images/edits")
         #expect(request.httpMethod == "POST")
         #expect(contentType.contains("multipart/form-data; boundary="))
-        #expect(bodyString.contains("name=\"model\""))
-        #expect(bodyString.contains("name=\"prompt\""))
-        #expect(bodyString.contains("name=\"image\""))
-        #expect(bodyString.contains("filename=\"ref.png\""))
+        #expect(bodyData.range(of: Data(#"name="model""#.utf8)) != nil)
+        #expect(bodyData.range(of: Data(#"name="prompt""#.utf8)) != nil)
+        #expect(bodyData.range(of: Data(#"name="image""#.utf8)) != nil)
+        #expect(bodyData.range(of: Data(#"filename="ref.png""#.utf8)) != nil)
+    }
+
+    @Test("OpenAI Responses 图片输出模型自动启用内置生图工具")
+    func testResponsesImageOutputModelAddsImageGenerationTool() throws {
+        var imageOutputModel = responsesDummyModel.model
+        imageOutputModel.outputModalities = [.text, .image]
+        let runnableModel = RunnableModel(
+            provider: responsesDummyModel.provider,
+            model: imageOutputModel
+        )
+
+        let request = try #require(
+            responsesAdapter.buildChatRequest(
+                for: runnableModel,
+                commonPayload: ["stream": false],
+                messages: [ChatMessage(role: .user, content: "画一只猫")],
+                tools: [saveMemoryToolDefinition()],
+                audioAttachments: [:],
+                imageAttachments: [:],
+                fileAttachments: [:]
+            )
+        )
+        let body = try #require(request.httpBody)
+        let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let tools = try #require(payload["tools"] as? [[String: Any]])
+
+        #expect(tools.contains { ($0["type"] as? String) == "image_generation" })
+        #expect(tools.contains {
+            ($0["type"] as? String) == "function"
+                && ($0["name"] as? String) == "save_memory"
+        })
+        #expect(payload["tool_choice"] as? String == "auto")
+    }
+
+    @Test("OpenAI Responses 完整历史仅回传图片生成调用 ID")
+    func testResponsesImageGenerationHistoryReplaysCallIDOnly() throws {
+        let assistantMessage = ChatMessage(
+            role: .assistant,
+            content: "",
+            providerResponseMetadata: [
+                OpenAIAdapter.responsesOutputItemsKey: .array([
+                    .dictionary([
+                        "type": .string("image_generation_call"),
+                        "id": .string("ig_history_1"),
+                        "status": .string("completed"),
+                        "result": .string("large-base64-payload")
+                    ])
+                ])
+            ]
+        )
+        let request = try #require(
+            responsesAdapter.buildChatRequest(
+                for: responsesDummyModel,
+                commonPayload: [
+                    "stream": false,
+                    OpenAIAdapter.responsesForceFullInputControlKey: true
+                ],
+                messages: [
+                    assistantMessage,
+                    ChatMessage(role: .user, content: "把它改成写实风格")
+                ],
+                tools: nil,
+                audioAttachments: [:],
+                imageAttachments: [:],
+                fileAttachments: [:]
+            )
+        )
+        let body = try #require(request.httpBody)
+        let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let input = try #require(payload["input"] as? [[String: Any]])
+        let imageCall = try #require(
+            input.first(where: { ($0["type"] as? String) == "image_generation_call" })
+        )
+
+        #expect(imageCall["id"] as? String == "ig_history_1")
+        #expect(imageCall["result"] == nil)
+        #expect(imageCall["status"] == nil)
+        #expect(Set(imageCall.keys) == Set(["type", "id"]))
     }
 }

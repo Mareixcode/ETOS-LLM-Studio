@@ -12,7 +12,7 @@ import UIKit
 #endif
 
 /// 图片附件，用于发送给支持视觉的模型
-public struct ImageAttachment: Identifiable {
+public struct ImageAttachment: Identifiable, Sendable {
     public let id: UUID
     public let data: Data
     public let mimeType: String
@@ -73,16 +73,25 @@ public struct ImageAttachment: Identifiable {
 }
 
 /// 通用文件附件，用于发送给支持文件输入的模型
-public struct FileAttachment: Identifiable {
+public struct FileAttachment: Identifiable, Sendable {
     public let id: UUID
     public let data: Data
     public let mimeType: String
     public let fileName: String
+    /// Gemini Files API 返回的临时文件地址，仅用于当前请求构建。
+    public let remoteFileURI: String?
     
-    public init(id: UUID = UUID(), data: Data, mimeType: String, fileName: String) {
+    public init(
+        id: UUID = UUID(),
+        data: Data,
+        mimeType: String,
+        fileName: String,
+        remoteFileURI: String? = nil
+    ) {
         self.id = id
         self.data = data
         self.mimeType = mimeType
         self.fileName = fileName
+        self.remoteFileURI = remoteFileURI
     }
 }

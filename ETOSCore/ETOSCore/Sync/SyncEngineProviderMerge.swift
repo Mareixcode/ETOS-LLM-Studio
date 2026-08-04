@@ -67,6 +67,15 @@ extension SyncEngine {
             changed = true
         }
 
+        let mergedChatEndpointPath = mergeProviderChatEndpointPathConservatively(
+            merged.normalizedChatEndpointPath,
+            incoming.normalizedChatEndpointPath
+        )
+        if mergedChatEndpointPath != merged.normalizedChatEndpointPath {
+            merged.chatEndpointPath = mergedChatEndpointPath
+            changed = true
+        }
+
         let mergedHeaders = mergeStringDictionaryConservatively(merged.headerOverrides, incoming.headerOverrides)
         if mergedHeaders != merged.headerOverrides {
             merged.headerOverrides = mergedHeaders
@@ -152,6 +161,12 @@ extension SyncEngine {
            incoming.displayName != incoming.modelName,
            incoming.displayName != merged.displayName {
             merged.displayName = incoming.displayName
+            changed = true
+        }
+
+        if merged.pickerGroupName == nil,
+           let incomingGroupName = Model.normalizedPickerGroupName(incoming.pickerGroupName) {
+            merged.pickerGroupName = incomingGroupName
             changed = true
         }
 
@@ -332,6 +347,17 @@ extension SyncEngine {
             changed = true
         }
 
+        guard let mergedChatEndpointPath = mergeProviderChatEndpointPath(
+            local.normalizedChatEndpointPath,
+            incoming.normalizedChatEndpointPath
+        ) else {
+            return .conflict
+        }
+        if mergedChatEndpointPath != local.normalizedChatEndpointPath {
+            merged.chatEndpointPath = mergedChatEndpointPath
+            changed = true
+        }
+
         guard let mergedHeaders = mergeStringDictionary(local.headerOverrides, incoming.headerOverrides) else {
             return .conflict
         }
@@ -363,6 +389,25 @@ extension SyncEngine {
             return .merged(merged)
         }
         return .unchanged(merged)
+    }
+
+    static func mergeProviderChatEndpointPath(_ local: String, _ incoming: String) -> String? {
+        let localPath = Provider.normalizedChatEndpointPath(local)
+        let incomingPath = Provider.normalizedChatEndpointPath(incoming)
+        if localPath == incomingPath {
+            return localPath
+        }
+        if localPath == Provider.defaultChatEndpointPath {
+            return incomingPath
+        }
+        if incomingPath == Provider.defaultChatEndpointPath {
+            return localPath
+        }
+        return nil
+    }
+
+    static func mergeProviderChatEndpointPathConservatively(_ local: String, _ incoming: String) -> String {
+        mergeProviderChatEndpointPath(local, incoming) ?? Provider.normalizedChatEndpointPath(local)
     }
 
     static func mergeProviderModels(
@@ -414,6 +459,18 @@ extension SyncEngine {
         }
         if displayName != local.displayName {
             merged.displayName = displayName
+            changed = true
+        }
+
+        guard let pickerGroupName = mergeOptionalStringField(
+            Model.normalizedPickerGroupName(local.pickerGroupName),
+            Model.normalizedPickerGroupName(incoming.pickerGroupName),
+            allowPrefixExtension: false
+        ) else {
+            return .conflict
+        }
+        if pickerGroupName.value != Model.normalizedPickerGroupName(local.pickerGroupName) {
+            merged.pickerGroupName = pickerGroupName.value
             changed = true
         }
 

@@ -15,6 +15,8 @@ final class MockAPIAdapter: APIAdapter {
     var receivedReasoningSummaryMessages: [ChatMessage]?
     var receivedConversationSummaryMessages: [ChatMessage]?
     var receivedConversationProfileMessages: [ChatMessage]?
+    var receivedContextCompressionMessages: [ChatMessage]?
+    var contextCompressionRequestCount = 0
     var receivedTools: [InternalToolDefinition]?
     var receivedAudioAttachments: [UUID: AudioAttachment]?
     var receivedImageAttachments: [UUID: [ImageAttachment]]?
@@ -23,17 +25,26 @@ final class MockAPIAdapter: APIAdapter {
     var receivedChatModel: RunnableModel?
     var receivedTitleModel: RunnableModel?
     var receivedReasoningSummaryModel: RunnableModel?
+    var receivedChatStreamFlags: [Bool] = []
+    var receivedTranscriptionModel: RunnableModel?
+    var transcriptionRequestURL: URL?
+    var transcriptionResponseToReturn = ""
 
     func buildChatRequest(for model: RunnableModel, commonPayload: [String : Any], messages: [ChatMessage], tools: [InternalToolDefinition]?, audioAttachments: [UUID: AudioAttachment], imageAttachments: [UUID: [ImageAttachment]], fileAttachments: [UUID: [FileAttachment]]) -> URLRequest? {
-        if messages.first?.content.contains("思考摘要助手") == true {
+        let firstContent = messages.first?.content
+        if firstContent == BuiltInPromptStore.render(.reasoningSummarySystem) {
             receivedReasoningSummaryMessages = messages
             receivedReasoningSummaryModel = model
             return URLRequest(url: URL(string: "https://fake.url/reasoning-summary")!)
-        } else if messages.first?.content.contains("会话压缩助手") == true {
+        } else if messages.first?.content == ContextCompressionPromptBuilder.systemPrompt {
+            receivedContextCompressionMessages = messages
+            contextCompressionRequestCount += 1
+            return URLRequest(url: URL(string: "https://fake.url/chat")!)
+        } else if firstContent == BuiltInPromptStore.render(.conversationSummarySystem) {
             receivedConversationSummaryMessages = messages
             return URLRequest(url: URL(string: "https://fake.url/chat")!)
-        } else if messages.first?.content.contains("用户画像整理助手") == true ||
-                    messages.first?.content.contains("用户画像去重助手") == true {
+        } else if firstContent == BuiltInPromptStore.render(.conversationProfileUpdateSystem) ||
+                    firstContent == BuiltInPromptStore.render(.conversationProfileDedupSystem) {
             receivedConversationProfileMessages = messages
             return URLRequest(url: URL(string: "https://fake.url/conversation-profile")!)
         } else if messages.first?.content.contains("为本次对话生成一个简短、精炼的标题") == true {
@@ -47,6 +58,9 @@ final class MockAPIAdapter: APIAdapter {
             receivedImageAttachments = imageAttachments
             receivedFileAttachments = fileAttachments
             receivedChatModel = model
+            if let stream = commonPayload["stream"] as? Bool {
+                receivedChatStreamFlags.append(stream)
+            }
             return URLRequest(url: URL(string: "https://fake.url/chat")!)
         }
     }
@@ -64,6 +78,21 @@ final class MockAPIAdapter: APIAdapter {
         }
 
         return responseToReturn ?? ChatMessage(role: .assistant, content: "Default mock response")
+    }
+
+    func buildTranscriptionRequest(
+        for model: RunnableModel,
+        audioData: Data,
+        fileName: String,
+        mimeType: String,
+        language: String?
+    ) -> URLRequest? {
+        receivedTranscriptionModel = model
+        return transcriptionRequestURL.map { URLRequest(url: $0) }
+    }
+
+    func parseTranscriptionResponse(data: Data) throws -> String {
+        transcriptionResponseToReturn
     }
 
     func buildModelListRequest(for provider: Provider) -> URLRequest? { nil }

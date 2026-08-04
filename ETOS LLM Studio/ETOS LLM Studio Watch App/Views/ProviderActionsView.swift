@@ -32,6 +32,7 @@ struct ProviderActionsView: View {
                     ProviderDetailView(
                         provider: provider,
                         allowsRemoteModelFetch: !isLocalProvider && provider.apiFormat.lowercased() != "anthropic",
+                        allowsModelTesting: !isLocalProvider,
                         allowsManualModelAdd: !isLocalProvider
                     ) { updatedProvider in
                         updateProvider(updatedProvider)
@@ -45,7 +46,6 @@ struct ProviderActionsView: View {
                     ProviderEditView(
                         provider: provider,
                         isNew: false,
-                        dismissAfterSave: false,
                         showsCancelButton: false,
                         navigationTitleOverride: NSLocalizedString("提供商配置", comment: "")
                     ) { updatedProvider in

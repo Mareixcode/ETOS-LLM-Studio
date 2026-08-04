@@ -8,6 +8,39 @@
 
 import Foundation
 
+public enum LocalSpeechModelArchitecture: String, Codable, Hashable, Sendable {
+    case senseVoiceSmall = "sensevoice-small"
+    case paraformer
+    case funASRNanoEncoder = "funasr-sensevoice-encoder"
+    case fsmnVAD = "fsmn-vad"
+
+    public var isTranscriptionModel: Bool {
+        switch self {
+        case .senseVoiceSmall, .paraformer, .funASRNanoEncoder:
+            return true
+        case .fsmnVAD:
+            return false
+        }
+    }
+
+    public var requiresDecoderModel: Bool {
+        self == .funASRNanoEncoder
+    }
+
+    public var localizedTitle: String {
+        switch self {
+        case .senseVoiceSmall:
+            return "SenseVoiceSmall"
+        case .paraformer:
+            return "Paraformer"
+        case .funASRNanoEncoder:
+            return "Fun-ASR-Nano"
+        case .fsmnVAD:
+            return "FSMN-VAD"
+        }
+    }
+}
+
 public enum LocalLLMFlashAttentionMode: Int32, Codable, CaseIterable, Identifiable, Hashable, Sendable {
     case auto = -1
     case disabled = 0
@@ -60,6 +93,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
     public static let defaultPresencePenalty = 0.0
     public static let defaultGrammar = ""
     public static let defaultIgnoreEOS = false
+    public static let defaultImageMinTokens = -1
+    public static let defaultImageMaxTokens = -1
 
     private static let legacyForcedDefaultTemperature = 0.8
     private static let legacyForcedDefaultTopK = 40
@@ -72,6 +107,12 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
     public var fileName: String
     public var relativePath: String
     public var fileSize: Int64
+    public var mmprojFileName: String?
+    public var mmprojRelativePath: String?
+    public var mmprojFileSize: Int64?
+    public var ggufArchitecture: String?
+    public var speechDecoderModelID: UUID?
+    public var speechVADModelID: UUID?
     public var createdAt: Date
     public var updatedAt: Date
     public var isActivated: Bool
@@ -93,6 +134,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
     public var presencePenalty: Double?
     public var grammar: String?
     public var ignoreEOS: Bool?
+    public var imageMinTokens: Int?
+    public var imageMaxTokens: Int?
     public var samplerKinds: [LocalLLMSamplerKind]?
     public var advancedArguments: String
     public var note: String?
@@ -103,6 +146,12 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         fileName: String,
         relativePath: String,
         fileSize: Int64,
+        mmprojFileName: String? = nil,
+        mmprojRelativePath: String? = nil,
+        mmprojFileSize: Int64? = nil,
+        ggufArchitecture: String? = nil,
+        speechDecoderModelID: UUID? = nil,
+        speechVADModelID: UUID? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         isActivated: Bool = true,
@@ -124,6 +173,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         presencePenalty: Double? = nil,
         grammar: String? = nil,
         ignoreEOS: Bool? = nil,
+        imageMinTokens: Int? = nil,
+        imageMaxTokens: Int? = nil,
         samplerKinds: [LocalLLMSamplerKind]? = nil,
         advancedArguments: String = LocalModelRecord.defaultAdvancedArguments,
         note: String? = nil
@@ -133,6 +184,12 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         self.fileName = fileName
         self.relativePath = relativePath
         self.fileSize = fileSize
+        self.mmprojFileName = mmprojFileName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.mmprojRelativePath = mmprojRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.mmprojFileSize = mmprojFileSize
+        self.ggufArchitecture = ggufArchitecture?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.speechDecoderModelID = speechDecoderModelID
+        self.speechVADModelID = speechVADModelID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.isActivated = isActivated
@@ -154,6 +211,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         self.presencePenalty = presencePenalty
         self.grammar = grammar.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }
         self.ignoreEOS = ignoreEOS
+        self.imageMinTokens = imageMinTokens
+        self.imageMaxTokens = imageMaxTokens
         self.samplerKinds = samplerKinds.flatMap { LocalLLMSamplerKind.unique($0).nilIfEmpty }
         self.advancedArguments = advancedArguments.trimmingCharacters(in: .whitespacesAndNewlines)
         self.note = note?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -241,8 +300,33 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         ignoreEOS ?? Self.defaultIgnoreEOS
     }
 
+    public var effectiveImageMinTokens: Int {
+        imageMinTokens ?? Self.defaultImageMinTokens
+    }
+
+    public var effectiveImageMaxTokens: Int {
+        imageMaxTokens ?? Self.defaultImageMaxTokens
+    }
+
     public var effectiveSamplerKinds: [LocalLLMSamplerKind] {
         samplerKinds ?? LocalLLMSamplerKind.defaultChain
+    }
+
+    public var hasMultimodalProjector: Bool {
+        mmprojRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    public var speechArchitecture: LocalSpeechModelArchitecture? {
+        guard let ggufArchitecture else { return nil }
+        return LocalSpeechModelArchitecture(rawValue: ggufArchitecture)
+    }
+
+    public var isSpeechTranscriptionModel: Bool {
+        speechArchitecture?.isTranscriptionModel == true
+    }
+
+    public var isSpeechAuxiliaryModel: Bool {
+        speechArchitecture == .fsmnVAD
     }
 
     enum CodingKeys: String, CodingKey {
@@ -251,6 +335,12 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         case fileName
         case relativePath
         case fileSize
+        case mmprojFileName
+        case mmprojRelativePath
+        case mmprojFileSize
+        case ggufArchitecture
+        case speechDecoderModelID
+        case speechVADModelID
         case createdAt
         case updatedAt
         case isActivated
@@ -272,6 +362,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         case presencePenalty
         case grammar
         case ignoreEOS
+        case imageMinTokens
+        case imageMaxTokens
         case samplerKinds
         case advancedArguments
         case note
@@ -285,6 +377,12 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
             fileName: try container.decode(String.self, forKey: .fileName),
             relativePath: try container.decode(String.self, forKey: .relativePath),
             fileSize: try container.decode(Int64.self, forKey: .fileSize),
+            mmprojFileName: try container.decodeIfPresent(String.self, forKey: .mmprojFileName),
+            mmprojRelativePath: try container.decodeIfPresent(String.self, forKey: .mmprojRelativePath),
+            mmprojFileSize: try container.decodeIfPresent(Int64.self, forKey: .mmprojFileSize),
+            ggufArchitecture: try container.decodeIfPresent(String.self, forKey: .ggufArchitecture),
+            speechDecoderModelID: try container.decodeIfPresent(UUID.self, forKey: .speechDecoderModelID),
+            speechVADModelID: try container.decodeIfPresent(UUID.self, forKey: .speechVADModelID),
             createdAt: try container.decode(Date.self, forKey: .createdAt),
             updatedAt: try container.decode(Date.self, forKey: .updatedAt),
             isActivated: try container.decodeIfPresent(Bool.self, forKey: .isActivated) ?? true,
@@ -306,6 +404,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
             presencePenalty: try container.decodeIfPresent(Double.self, forKey: .presencePenalty),
             grammar: try container.decodeIfPresent(String.self, forKey: .grammar),
             ignoreEOS: try container.decodeIfPresent(Bool.self, forKey: .ignoreEOS),
+            imageMinTokens: try container.decodeIfPresent(Int.self, forKey: .imageMinTokens),
+            imageMaxTokens: try container.decodeIfPresent(Int.self, forKey: .imageMaxTokens),
             samplerKinds: try container.decodeIfPresent([LocalLLMSamplerKind].self, forKey: .samplerKinds),
             advancedArguments: try container.decodeIfPresent(String.self, forKey: .advancedArguments) ?? Self.defaultAdvancedArguments,
             note: try container.decodeIfPresent(String.self, forKey: .note)
@@ -313,6 +413,13 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
     }
 
     public mutating func normalizeGenerationParameters() {
+        mmprojFileName = mmprojFileName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        mmprojRelativePath = mmprojRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        ggufArchitecture = ggufArchitecture?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        if mmprojRelativePath == nil {
+            mmprojFileName = nil
+            mmprojFileSize = nil
+        }
         contextSize = contextSize?.clamped(to: 1...1_048_576)
         maxOutputTokens = maxOutputTokens?.clamped(to: 1...131_072)
         gpuLayers = gpuLayers?.clamped(to: -1...999)
@@ -327,6 +434,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
         frequencyPenalty = frequencyPenalty?.clamped(to: -2...2)
         presencePenalty = presencePenalty?.clamped(to: -2...2)
         grammar = grammar.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }
+        imageMinTokens = imageMinTokens?.clamped(to: -1...1_048_576)
+        imageMaxTokens = imageMaxTokens?.clamped(to: -1...1_048_576)
         samplerKinds = samplerKinds.flatMap { LocalLLMSamplerKind.unique($0).nilIfEmpty }
         advancedArguments = advancedArguments.trimmingCharacters(in: .whitespacesAndNewlines)
         note = note?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -354,6 +463,8 @@ public struct LocalModelRecord: Codable, Identifiable, Hashable, Sendable {
             record.grammar = nil
         }
         if record.ignoreEOS == Self.defaultIgnoreEOS { record.ignoreEOS = nil }
+        if record.imageMinTokens == Self.defaultImageMinTokens { record.imageMinTokens = nil }
+        if record.imageMaxTokens == Self.defaultImageMaxTokens { record.imageMaxTokens = nil }
         if LocalLLMSamplerKind.unique(record.samplerKinds ?? []) == Self.legacyForcedDefaultSamplerKinds {
             record.samplerKinds = nil
         }

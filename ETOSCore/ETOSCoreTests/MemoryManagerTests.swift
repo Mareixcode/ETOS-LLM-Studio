@@ -88,6 +88,37 @@ struct MemoryManagerTests {
         }
     }
 
+    actor MultimodalEmbeddingGenerator: MemoryEmbeddingGenerating {
+        private var latestImageCount = 0
+
+        func generateEmbeddings(
+            for texts: [String],
+            preferredModelID: String?
+        ) async throws -> [[Float]] {
+            texts.map(Self.textEmbedding)
+        }
+
+        func generateEmbeddings(
+            for inputs: [MemoryEmbeddingInput],
+            preferredModelID: String?
+        ) async throws -> [[Float]] {
+            latestImageCount = inputs.reduce(0) { $0 + $1.imageAttachments.count }
+            return inputs.map { input in
+                input.imageAttachments.isEmpty
+                    ? Self.textEmbedding(input.text)
+                    : [1, 0, 0, 0]
+            }
+        }
+
+        func observedImageCount() -> Int {
+            latestImageCount
+        }
+
+        private static func textEmbedding(_ text: String) -> [Float] {
+            text.contains("咖啡") ? [1, 0, 0, 0] : [0, 1, 0, 0]
+        }
+    }
+
     actor ProgressEventRecorder {
         private var events: [MemoryEmbeddingProgress] = []
 
@@ -513,5 +544,229 @@ struct MemoryManagerTests {
         #expect(results.first?.content.contains("抹茶") == true)
 
         await cleanup(memoryManager: memoryManager)
+    }
+
+    @Test("图片查询会通过多模态嵌入召回文本记忆")
+    func multimodalImageQueryRetrievesTextMemory() async throws {
+        let generator = MultimodalEmbeddingGenerator()
+        let memoryManager = MemoryManager(
+            embeddingGenerator: generator,
+            chunkSize: 50
+        )
+        await memoryManager.waitForInitialization()
+        await cleanup(memoryManager: memoryManager)
+
+        await memoryManager.addMemory(content: "用户喜欢手冲咖啡。")
+        await memoryManager.addMemory(content: "用户最喜欢的编辑器是 Xcode。")
+
+        let image = ImageAttachment(
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            mimeType: "image/png",
+            fileName: "query.png"
+        )
+        let results = await memoryManager.searchMemoriesHybrid(
+            query: "",
+            imageAttachments: [image],
+            topK: 1
+        )
+
+        #expect(results.first?.content.contains("咖啡") == true)
+        let observedImageCount = await generator.observedImageCount()
+        #expect(observedImageCount == 1)
+
+        await cleanup(memoryManager: memoryManager)
+    }
+
+    @Test("混合检索融合重要度、实体与时间有效性")
+    func hybridRetrievalUsesMultipleSignalsAndValidity() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let expired = MemoryItem(
+            content: "用户以前喜欢深烘咖啡。",
+            embedding: [],
+            createdAt: now.addingTimeInterval(-100_000),
+            importance: 0.9,
+            entities: ["咖啡"],
+            validUntil: now.addingTimeInterval(-10)
+        )
+        let current = MemoryItem(
+            content: "用户现在喜欢浅烘咖啡。",
+            embedding: [],
+            createdAt: now,
+            kind: .preference,
+            importance: 0.8,
+            entities: ["咖啡"]
+        )
+        let lowImportance = MemoryItem(
+            content: "用户现在喜欢浅烘咖啡。",
+            embedding: [],
+            createdAt: now,
+            kind: .preference,
+            importance: 0.1,
+            entities: ["咖啡"]
+        )
+
+        let currentMatches = MemoryHybridRetriever.rank(
+            query: "用户现在喜欢什么咖啡",
+            tokens: ["用户", "现在", "喜欢", "咖啡"],
+            memories: [expired, lowImportance, current],
+            semanticScores: [current.id: 0.8, lowImportance.id: 0.8, expired.id: 0.9],
+            limit: 3,
+            now: now
+        )
+        #expect(!currentMatches.contains { $0.memory.id == expired.id })
+        #expect(currentMatches.first?.memory.id == current.id)
+
+        let historicalMatches = MemoryHybridRetriever.rank(
+            query: "用户以前喜欢什么咖啡",
+            tokens: ["用户", "以前", "喜欢", "咖啡"],
+            memories: [expired, current],
+            semanticScores: [expired.id: 0.9, current.id: 0.7],
+            limit: 2,
+            now: now
+        )
+        #expect(historicalMatches.contains { $0.memory.id == expired.id })
+    }
+
+    @Test("结构化记忆元数据可编码并兼容往返")
+    func structuredMemoryMetadataRoundTrip() throws {
+        let original = MemoryItem(
+            content: "用户偏好原生 SwiftUI 界面。",
+            embedding: [0.1, 0.2],
+            kind: .preference,
+            source: .userStatement,
+            importance: 0.85,
+            confidence: 0.95,
+            entities: ["SwiftUI", "Apple"],
+            sourceSessionID: UUID(),
+            accessCount: 4,
+            lastAccessedAt: Date()
+        )
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(MemoryItem.self, from: data)
+        #expect(decoded == original)
+    }
+
+    @Test("长期记忆整理达到数量与时间门槛后才触发")
+    func memoryConsolidationRespectsLowFrequencyPolicy() {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        let memories = (0..<8).map { index in
+            MemoryItem(
+                content: "长期记忆 \(index)",
+                embedding: [],
+                createdAt: now.addingTimeInterval(Double(index - 20))
+            )
+        }
+
+        #expect(LongTermMemoryConsolidationPlanner.shouldRun(
+            memories: memories,
+            state: MemoryConsolidationState(),
+            now: now
+        ))
+
+        #expect(!LongTermMemoryConsolidationPlanner.shouldRun(
+            memories: memories,
+            state: MemoryConsolidationState(lastAttemptAt: now.addingTimeInterval(-60), lastSuccessAt: nil),
+            now: now
+        ))
+
+        #expect(!LongTermMemoryConsolidationPlanner.shouldRun(
+            memories: memories,
+            state: MemoryConsolidationState(lastAttemptAt: nil, lastSuccessAt: now.addingTimeInterval(-10)),
+            now: now
+        ))
+    }
+
+    @Test("长期记忆整理只接受通过本地相似度校验的重复项")
+    func memoryConsolidationRejectsUnrelatedModelSuggestions() {
+        let keeper = MemoryItem(
+            content: "用户偏好原生 SwiftUI 界面。",
+            embedding: [1, 0, 0],
+            kind: .preference,
+            entities: ["SwiftUI"]
+        )
+        let duplicate = MemoryItem(
+            content: "用户偏好原生 SwiftUI 界面",
+            embedding: [0.99, 0.01, 0],
+            kind: .preference,
+            entities: ["SwiftUI"]
+        )
+        let unrelated = MemoryItem(
+            content: "用户每周末跑步。",
+            embedding: [0, 1, 0],
+            kind: .preference,
+            entities: ["跑步"]
+        )
+        let response = """
+        {
+          "groups": [
+            {
+              "keeper_id": "\(keeper.id.uuidString)",
+              "duplicate_ids": ["\(duplicate.id.uuidString)", "\(unrelated.id.uuidString)"],
+              "canonical_content": "用户偏好原生 SwiftUI 界面。"
+            }
+          ]
+        }
+        """
+
+        let plan = LongTermMemoryConsolidationPlanner.plan(
+            from: response,
+            candidates: [keeper, duplicate, unrelated]
+        )
+        #expect(plan?.merges.count == 1)
+        #expect(plan?.merges.first?.keeperID == keeper.id)
+        #expect(plan?.merges.first?.duplicateIDs == [duplicate.id])
+    }
+
+    @Test("长期记忆整理拒绝跨类型合并")
+    func memoryConsolidationRejectsCrossKindMerge() {
+        let fact = MemoryItem(
+            content: "用户使用 Swift。",
+            embedding: [1, 0],
+            kind: .semantic
+        )
+        let rule = MemoryItem(
+            content: "用户使用 Swift。",
+            embedding: [1, 0],
+            kind: .procedural
+        )
+        let response = """
+        {"groups":[{"keeper_id":"\(fact.id.uuidString)","duplicate_ids":["\(rule.id.uuidString)"],"canonical_content":"用户使用 Swift。"}]}
+        """
+
+        let plan = LongTermMemoryConsolidationPlanner.plan(
+            from: response,
+            candidates: [fact, rule]
+        )
+        #expect(plan?.merges.isEmpty == true)
+    }
+
+    @Test("长期记忆整理用新事实结束旧事实的有效期")
+    func memoryConsolidationBuildsValidatedSupersession() {
+        let oldDate = Date(timeIntervalSince1970: 1_800_000_000)
+        let newDate = oldDate.addingTimeInterval(86_400)
+        let oldMemory = MemoryItem(
+            content: "用户当前使用模型 Alpha。",
+            embedding: [0.9, 0.1],
+            createdAt: oldDate,
+            kind: .semantic,
+            entities: ["模型"]
+        )
+        let newMemory = MemoryItem(
+            content: "用户当前使用模型 Beta。",
+            embedding: [0.88, 0.12],
+            createdAt: newDate,
+            kind: .semantic,
+            entities: ["模型"]
+        )
+        let response = """
+        {"groups":[],"supersessions":[{"older_id":"\(oldMemory.id.uuidString)","newer_id":"\(newMemory.id.uuidString)"}]}
+        """
+
+        let plan = LongTermMemoryConsolidationPlanner.plan(
+            from: response,
+            candidates: [oldMemory, newMemory]
+        )
+        #expect(plan?.supersessions.count == 1)
+        #expect(plan?.supersessions.first?.validUntil == newDate)
     }
 }

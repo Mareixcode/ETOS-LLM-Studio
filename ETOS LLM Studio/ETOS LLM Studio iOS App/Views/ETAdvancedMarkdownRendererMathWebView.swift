@@ -16,8 +16,12 @@ struct ETMathWebMarkdownView: View {
     let enableMarkdown: Bool
     let isOutgoing: Bool
     let customTextHex: String?
+    let customEmphasisTextHex: String?
+    let customStrongTextHex: String?
+    let customCodeTextHex: String?
     let prefersDarkPalette: Bool
     let fontScale: Double
+    let lineSpacingEm: Double
 
     @State private var renderedHeight: CGFloat = 28
 
@@ -28,8 +32,12 @@ struct ETMathWebMarkdownView: View {
                 enableMarkdown: enableMarkdown,
                 isOutgoing: isOutgoing,
                 customTextHex: customTextHex,
+                customEmphasisTextHex: customEmphasisTextHex,
+                customStrongTextHex: customStrongTextHex,
+                customCodeTextHex: customCodeTextHex,
                 prefersDarkPalette: prefersDarkPalette,
                 fontScale: fontScale,
+                lineSpacingEm: lineSpacingEm,
                 availableWidth: max(1, geometry.size.width),
                 renderedHeight: $renderedHeight
             )
@@ -81,8 +89,12 @@ private struct ETMathWebViewRepresentable: UIViewRepresentable {
     let enableMarkdown: Bool
     let isOutgoing: Bool
     let customTextHex: String?
+    let customEmphasisTextHex: String?
+    let customStrongTextHex: String?
+    let customCodeTextHex: String?
     let prefersDarkPalette: Bool
     let fontScale: Double
+    let lineSpacingEm: Double
     let availableWidth: CGFloat
     @Binding var renderedHeight: CGFloat
 
@@ -138,8 +150,12 @@ private struct ETMathWebViewRepresentable: UIViewRepresentable {
             enableMarkdown: enableMarkdown,
             isOutgoing: isOutgoing,
             customTextHex: customTextHex,
+            customEmphasisTextHex: customEmphasisTextHex,
+            customStrongTextHex: customStrongTextHex,
+            customCodeTextHex: customCodeTextHex,
             prefersDarkPalette: prefersDarkPalette,
-            fontScale: fontScale
+            fontScale: fontScale,
+            lineSpacingEm: lineSpacingEm
         )
         context.coordinator.render(
             payload,

@@ -2,8 +2,8 @@
 // ChatTranscriptExportServiceTests.swift
 // ============================================================================
 // ChatTranscriptExportServiceTests 测试文件
-// - 覆盖会话导出的格式内容
-// - 覆盖“截至某条消息”范围裁剪行为
+// - 覆盖会话导出的格式内容与 PNG 长图文件
+// - 覆盖“截至某条消息”与任意多选消息的范围裁剪行为
 // ============================================================================
 
 import Testing
@@ -20,6 +20,7 @@ struct ChatTranscriptExportServiceTests {
 
         var assistant = ChatMessage(role: .assistant, content: "这是回复")
         assistant.reasoningContent = "这是推理"
+        assistant.sentSystemPromptSnapshot = "<long_term_memory>记忆内容</long_term_memory>"
         assistant.toolCalls = [
             InternalToolCall(id: "call_1", toolName: "search", arguments: "{\"q\":\"swift\"}", result: "ok")
         ]
@@ -42,6 +43,58 @@ struct ChatTranscriptExportServiceTests {
         #expect(text.contains("## 2. 助手"))
         #expect(text.contains("### 工具调用"))
         #expect(text.contains("search"))
+        #expect(text.contains("<long_term_memory>记忆内容</long_term_memory>"))
+    }
+
+    @Test("完整导出会保留一等续聊上下文")
+    func testFullExportIncludesConversationContinuationContext() throws {
+        let retained = [
+            ChatMessage(role: .user, content: "最近问题原文"),
+            ChatMessage(role: .assistant, content: "最近回答原文")
+        ]
+        let session = ChatSession(id: UUID(), name: "续聊会话")
+        let continuation = ConversationContinuationContext(
+            childSessionID: session.id,
+            sourceSessionID: UUID(),
+            sourceSessionNameSnapshot: "原始会话",
+            sourceThroughMessageID: retained[1].id,
+            summary: "较早对话的完整摘要",
+            retainedMessages: retained,
+            retainedRoundCount: 1,
+            compressionModelIdentifier: "model",
+            sourceMessageCount: 8,
+            summarizedMessageCount: 6
+        )
+
+        let output = try ChatTranscriptExportService().export(
+            session: session,
+            messages: [],
+            format: .markdown,
+            continuationContext: continuation
+        )
+
+        let text = String(decoding: output.data, as: UTF8.self)
+        #expect(text.contains("## 续聊上下文"))
+        #expect(text.contains("原始会话"))
+        #expect(text.contains("较早对话的完整摘要"))
+        #expect(text.contains("最近问题原文"))
+        #expect(text.contains("最近回答原文"))
+
+        let prepared = try ChatTranscriptExportService().prepareImageExport(
+            session: session,
+            messages: [],
+            continuationContext: continuation
+        )
+        #expect(prepared.messages.isEmpty)
+        #expect(prepared.continuationContext == continuation)
+
+        let png = try ChatTranscriptExportService().export(
+            session: session,
+            messages: [],
+            format: .png,
+            continuationContext: continuation
+        )
+        #expect(png.data.starts(with: Data([0x89, 0x50, 0x4E, 0x47])))
     }
 
     @Test("不包含思考导出时会移除推理段落并标记文件名")
@@ -61,9 +114,45 @@ struct ChatTranscriptExportServiceTests {
 
         let text = String(decoding: output.data, as: UTF8.self)
         #expect(output.suggestedFileName.contains("不含思考"))
-        #expect(text.contains("思考/推理：不包含"))
+        #expect(text.contains("- 思考/推理: 不包含"))
         #expect(!text.contains("### 推理"))
         #expect(!text.contains("这段推理不应被导出"))
+    }
+
+    @Test("不包含系统提示词时会移除实际快照与系统消息")
+    func testExportWithoutSystemPromptRemovesSnapshotsAndSystemMessages() throws {
+        let service = ChatTranscriptExportService()
+        let systemMessage = ChatMessage(role: .system, content: "旧系统消息")
+        var assistant = ChatMessage(role: .assistant, content: "正文")
+        assistant.sentSystemPromptSnapshot = "包含动态记忆的实际系统提示词"
+
+        let output = try service.export(
+            session: ChatSession(id: UUID(), name: "系统提示词开关"),
+            messages: [systemMessage, assistant],
+            format: .markdown,
+            includeSystemPrompt: false,
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_075)
+        )
+
+        let text = String(decoding: output.data, as: UTF8.self)
+        #expect(output.suggestedFileName.contains("不含系统提示"))
+        #expect(text.contains("系统提示词: 不包含") || text.contains("系统提示词：不包含"))
+        #expect(!text.contains("旧系统消息"))
+        #expect(!text.contains("包含动态记忆的实际系统提示词"))
+    }
+
+    @Test("旧消息没有系统提示词快照时会给出明确说明")
+    func testExportWithMissingSystemPromptSnapshotShowsNotice() throws {
+        let output = try ChatTranscriptExportService().export(
+            session: ChatSession(id: UUID(), name: "旧会话"),
+            messages: [ChatMessage(role: .assistant, content: "历史回复")],
+            format: .text,
+            includeSystemPrompt: true,
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_080)
+        )
+
+        let text = String(decoding: output.data, as: UTF8.self)
+        #expect(text.contains("未记录此回复的系统提示词快照。"))
     }
 
     @Test("截至指定消息导出时只包含上文")
@@ -89,6 +178,31 @@ struct ChatTranscriptExportServiceTests {
         #expect(!text.contains("第三条"))
     }
 
+    @Test("导出所选消息时会保留原始顺序并排除未选内容")
+    func testExportSelectedMessagesPreservesSourceOrder() throws {
+        let service = ChatTranscriptExportService()
+        let first = ChatMessage(id: UUID(), role: .user, content: "第一条")
+        let second = ChatMessage(id: UUID(), role: .assistant, content: "第二条")
+        let third = ChatMessage(id: UUID(), role: .user, content: "第三条")
+
+        let output = try service.export(
+            session: ChatSession(id: UUID(), name: "多选范围"),
+            messages: [first, second, third],
+            format: .text,
+            selectedMessageIDs: [third.id, first.id],
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_150)
+        )
+
+        let text = String(decoding: output.data, as: UTF8.self)
+        #expect(output.suggestedFileName.contains("已选2条"))
+        #expect(text.contains("第一条"))
+        #expect(!text.contains("第二条"))
+        #expect(text.contains("第三条"))
+        let firstRange = try #require(text.range(of: "第一条"))
+        let thirdRange = try #require(text.range(of: "第三条"))
+        #expect(firstRange.lowerBound < thirdRange.lowerBound)
+    }
+
     @Test("PDF 导出会生成有效文件头")
     func testPDFExportHasValidHeader() throws {
         let service = ChatTranscriptExportService()
@@ -102,6 +216,134 @@ struct ChatTranscriptExportServiceTests {
         let header = Data([0x25, 0x50, 0x44, 0x46]) // %PDF
         #expect(output.suggestedFileName.hasSuffix(".pdf"))
         #expect(output.data.starts(with: header))
+    }
+
+    @Test("PNG 导出会生成聊天长图并过滤系统消息")
+    func testPNGExportHasValidHeaderAndFiltersSystemMessages() throws {
+        let service = ChatTranscriptExportService()
+        let system = ChatMessage(role: .system, content: "不可见的系统提示词")
+        var user = ChatMessage(role: .user, content: "可见消息")
+        user.sentSystemPromptSnapshot = "不可写入图片的快照"
+        let output = try service.export(
+            session: ChatSession(id: UUID(), name: "长图会话"),
+            messages: [system, user],
+            format: .png,
+            imageStyle: ChatTranscriptImageStyle(subtitle: "Test"),
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_250)
+        )
+
+        let pngHeader = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        #expect(output.suggestedFileName.hasSuffix(".png"))
+        #expect(output.suggestedFileName.contains("不含系统提示"))
+        #expect(output.data.starts(with: pngHeader))
+    }
+
+    @Test("PNG 预处理会过滤系统消息并生成完整文件名")
+    func testPrepareImageExportFiltersSystemMessagesAndBuildsFileName() throws {
+        let system = ChatMessage(role: .system, content: "不可见的系统提示词")
+        var assistant = ChatMessage(role: .assistant, content: "可见回复")
+        assistant.reasoningContent = "可选思考"
+
+        let prepared = try ChatTranscriptExportService().prepareImageExport(
+            session: ChatSession(id: UUID(), name: "测试/长图"),
+            messages: [system, assistant],
+            includeReasoning: false,
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_260)
+        )
+
+        #expect(prepared.messages.map(\.id) == [assistant.id])
+        #expect(prepared.suggestedFileName.hasPrefix("测试-长图-完整-不含思考-不含系统提示-"))
+        #expect(prepared.suggestedFileName.hasSuffix(".png"))
+    }
+
+    @Test("PNG 预处理会按原始顺序保留选中的可见消息")
+    func testPrepareImageExportSelectedMessagesPreservesVisibleSourceOrder() throws {
+        let first = ChatMessage(id: UUID(), role: .user, content: "第一条")
+        let system = ChatMessage(id: UUID(), role: .system, content: "系统消息")
+        let second = ChatMessage(id: UUID(), role: .assistant, content: "第二条")
+        let third = ChatMessage(id: UUID(), role: .user, content: "第三条")
+
+        let prepared = try ChatTranscriptExportService().prepareImageExport(
+            session: ChatSession(id: UUID(), name: "多选长图"),
+            messages: [first, system, second, third],
+            selectedMessageIDs: [third.id, system.id, first.id],
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_270)
+        )
+
+        #expect(prepared.messages.map(\.id) == [first.id, third.id])
+        #expect(prepared.suggestedFileName.contains("-已选2条-"))
+    }
+
+    @Test("PNG 预处理会隐藏已内嵌到助手气泡的工具结果行")
+    func testPrepareImageExportFiltersEmbeddedToolResultMessages() throws {
+        let call = InternalToolCall(
+            id: "call_embedded",
+            toolName: "search",
+            arguments: "{}",
+            result: "已在助手气泡中显示"
+        )
+        var assistant = ChatMessage(role: .assistant, content: "调用工具")
+        assistant.toolCalls = [call]
+        let tool = ChatMessage(
+            role: .tool,
+            content: "重复的工具结果",
+            toolCalls: [call]
+        )
+
+        let prepared = try ChatTranscriptExportService().prepareImageExport(
+            session: nil,
+            messages: [assistant, tool],
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_275)
+        )
+
+        #expect(prepared.messages.map(\.id) == [assistant.id])
+    }
+
+    @Test("PNG 预处理截至指定消息且不包含后文")
+    func testPrepareImageExportUpToMessageTruncatesFollowingMessages() throws {
+        let first = ChatMessage(id: UUID(), role: .user, content: "第一条")
+        let second = ChatMessage(id: UUID(), role: .assistant, content: "第二条")
+        let third = ChatMessage(id: UUID(), role: .user, content: "第三条")
+
+        let prepared = try ChatTranscriptExportService().prepareImageExport(
+            session: ChatSession(id: UUID(), name: "截止长图"),
+            messages: [first, second, third],
+            upToMessageID: second.id,
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_280)
+        )
+
+        #expect(prepared.messages.map(\.id) == [first.id, second.id])
+        #expect(prepared.suggestedFileName.contains("-截至第2条-"))
+    }
+
+    @Test("PNG 预处理输出会保留数据、格式与文件名")
+    func testPreparedImageOutputWrapsPNGData() throws {
+        let prepared = try ChatTranscriptExportService().prepareImageExport(
+            session: ChatSession(id: UUID(), name: "输出长图"),
+            messages: [ChatMessage(role: .user, content: "可见消息")],
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_290)
+        )
+        let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+
+        let output = prepared.output(data: pngData)
+
+        #expect(output.data == pngData)
+        #expect(output.format == .png)
+        #expect(output.suggestedFileName == prepared.suggestedFileName)
+    }
+
+    @Test("PNG 范围只有系统消息时不会生成图片")
+    func testPNGExportRejectsSystemOnlyScope() {
+        let system = ChatMessage(role: .system, content: "不可见的系统提示词")
+
+        #expect(throws: ChatTranscriptExportError.emptyMessages) {
+            try ChatTranscriptExportService().export(
+                session: nil,
+                messages: [system],
+                format: .png,
+                exportedAt: Date(timeIntervalSince1970: 1_700_000_275)
+            )
+        }
     }
 
     @Test("目标消息不存在时返回错误")

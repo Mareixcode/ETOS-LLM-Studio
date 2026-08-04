@@ -18,7 +18,7 @@ extension ContentView {
             isSending: viewModel.isSendingMessage
         )
         return List {
-            if viewModel.messages.isEmpty {
+            if viewModel.messages.isEmpty && continuationContext == nil {
                 Spacer().frame(height: emptyStateSpacerHeight).listRowInsets(EdgeInsets()).listRowBackground(Color.clear)
             }
 
@@ -57,6 +57,54 @@ extension ContentView {
                 .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 8, trailing: 8))
             }
 
+            if let continuationContext,
+               !continuationContext.isSourceSessionLinkHidden {
+                WatchConversationContinuationLinkRow(
+                    kind: .sourceSession,
+                    linkedSessionName: continuationSourceSessionName(for: continuationContext),
+                    linkedSessionAvailable: continuationSessionNamesByID[
+                        continuationContext.sourceSessionID
+                    ] != nil,
+                    onOpen: {
+                        _ = viewModel.setCurrentSessionIfExists(
+                            sessionID: continuationContext.sourceSessionID
+                        )
+                    },
+                    onDelete: {
+                        hideConversationContinuationLink(
+                            in: continuationContext,
+                            kind: .sourceSession
+                        )
+                    }
+                )
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+            }
+
+            if let continuationContext {
+                NavigationLink {
+                    WatchConversationContinuationDetailView(
+                        context: continuationContext,
+                        enableAdvancedRenderer: viewModel.enableAdvancedRenderer,
+                        onInsertText: { text in
+                            viewModel.applyToolInputDraftRequest(
+                                AppToolInputDraftRequest(text: text, mode: .append)
+                            )
+                        }
+                    )
+                } label: {
+                    WatchConversationContinuationCard(
+                        context: continuationContext,
+                        enableBackground: viewModel.enableBackground,
+                        enableLiquidGlass: isLiquidGlassEnabled,
+                        enableNoBubbleUI: viewModel.enableNoBubbleUI
+                    )
+                }
+                .buttonStyle(.plain)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 6, trailing: 8))
+            }
+
             ForEach(Array(displayedMessages.enumerated()), id: \.element.id) { index, state in
                 let message = state.message
                 let previousMessage = index > 0 ? displayedMessages[index - 1].message : nil
@@ -77,6 +125,11 @@ extension ContentView {
                     connectsTimelineToNext: connectsTimelineToNext,
                     isLiquidGlassEnabled: isLiquidGlassEnabled,
                     canRetry: retryableMessageIDs.contains(message.id),
+                    isSelectionMode: isMessageSelectionMode,
+                    isSelected: selectedMessageIDs.contains(message.id),
+                    onToggleSelection: {
+                        toggleMessageSelection(message.id)
+                    },
                     onOpenMore: {
                         messageActionsTarget = WatchMessageActionsNavigationTarget(id: message.id)
                     }
@@ -87,6 +140,77 @@ extension ContentView {
                         anchorMessageID: state.id,
                         isFirstDisplayedMessage: index == 0
                     )
+                }
+
+                if let contexts = outgoingContinuationContextsByMessageID[message.id] {
+                    ForEach(contexts) { context in
+                        outgoingContinuationLinkRow(context)
+                    }
+                }
+            }
+
+            ForEach(unanchoredOutgoingContinuationContexts) { context in
+                outgoingContinuationLinkRow(context)
+            }
+
+            if let progress = viewModel.attachmentImportProgress {
+                WatchAttachmentImportProgressRowView(progress: progress)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                    .listRowBackground(Color.clear)
+            }
+
+            ForEach(viewModel.pendingImageAttachments) { attachment in
+                WatchPendingAttachmentRowView(
+                    systemImage: "photo",
+                    title: NSLocalizedString("图片文件", comment: ""),
+                    fileName: attachment.fileName,
+                    tint: .green
+                )
+                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                .listRowBackground(Color.clear)
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        viewModel.removePendingImageAttachment(attachment)
+                    } label: {
+                        Label(NSLocalizedString("删除", comment: "Delete pending attachment action"), systemImage: "trash")
+                    }
+                }
+            }
+
+            if let audio = viewModel.pendingAudioAttachment {
+                WatchPendingAttachmentRowView(
+                    systemImage: "waveform",
+                    title: NSLocalizedString("语音文件", comment: ""),
+                    fileName: audio.fileName,
+                    tint: .blue
+                )
+                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                .listRowBackground(Color.clear)
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        viewModel.clearPendingAudioAttachment()
+                    } label: {
+                        Label(NSLocalizedString("删除", comment: "Delete pending attachment action"), systemImage: "trash")
+                    }
+                }
+            }
+
+            ForEach(viewModel.pendingFileAttachments) { attachment in
+                let isVideo = VideoAttachmentSupport.isVideo(attachment)
+                WatchPendingAttachmentRowView(
+                    systemImage: isVideo ? "video" : "doc",
+                    title: NSLocalizedString(isVideo ? "视频" : "文件", comment: ""),
+                    fileName: attachment.fileName,
+                    tint: .cyan
+                )
+                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                .listRowBackground(Color.clear)
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        viewModel.removePendingFileAttachment(attachment)
+                    } label: {
+                        Label(NSLocalizedString("删除", comment: "Delete pending attachment action"), systemImage: "trash")
+                    }
                 }
             }
 
@@ -99,11 +223,16 @@ extension ContentView {
                     inputStrokeColor: inputStrokeColor,
                     inputPlaceholderText: NSLocalizedString("输入...", comment: "Default input placeholder on watch"),
                     inputBubbleVerticalPadding: inputBubbleVerticalPadding,
-                    onOpenSessionHistory: {
-                        viewModel.activeSheet = nil
-                        isSettingsPresented = false
-                        settingsDestination = nil
-                        isSessionListPresented = true
+                    isContextCompressionAvailable: viewModel.currentSession?.isTemporary == false
+                        && (!viewModel.allMessagesForSession.isEmpty || continuationContext != nil),
+                    isTemporaryChatActivationAvailable: viewModel.allMessagesForSession.isEmpty
+                        && continuationContext == nil,
+                    onPerformQuickAction: { action in
+                        performWatchInputQuickAction(action)
+                    },
+                    onPerformSlashCommand: performWatchSlashCommand,
+                    onShowTransientNotice: { notice in
+                        showChatTransientNotice(notice)
                     },
                     onHandleInputAction: { state in
                         switch state {
@@ -180,14 +309,66 @@ extension ContentView {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(Color.clear)
+        .modifier(WatchChatScrollStateObserverModifier { distanceToBottom, isUserInteracting in
+            updateWatchScrollState(distanceToBottom: distanceToBottom, isUserInteracting: isUserInteracting)
+        })
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                Button {
-                    viewModel.activeSheet = nil
-                    isSettingsPresented = true
-                } label: {
-                    Image(systemName: "gearshape.fill")
+                if isMessageSelectionMode {
+                    Button {
+                        showMessageSelectionActions = true
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .accessibilityLabel(
+                                String(
+                                    format: NSLocalizedString("批量操作，已选择 %d 条消息", comment: "Selected messages batch menu accessibility label"),
+                                    selectedMessageIDs.count
+                                )
+                            )
+                    }
+                } else {
+                    Button {
+                        viewModel.activeSheet = nil
+                        isSettingsPresented = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                    }
                 }
+            }
+        }
+        .confirmationDialog(
+            String(
+                format: NSLocalizedString("批量操作，已选择 %d 条消息", comment: "Selected messages batch menu accessibility label"),
+                selectedMessageIDs.count
+            ),
+            isPresented: $showMessageSelectionActions,
+            titleVisibility: .visible
+        ) {
+            Button(NSLocalizedString("退出多选", comment: "Exit message selection mode")) {
+                exitMessageSelection()
+            }
+
+            Button(NSLocalizedString("反选", comment: "Invert message selection")) {
+                invertMessageSelection()
+            }
+
+            if !selectedMessageIDs.isEmpty {
+                Button(NSLocalizedString("导出所选", comment: "Export selected messages")) {
+                    selectedMessagesExportTarget = WatchSelectedMessagesExportNavigationTarget(
+                        messageIDs: selectedMessageIDs
+                    )
+                }
+
+                Button(NSLocalizedString("删除所选", comment: "Delete selected messages"), role: .destructive) {
+                    showSelectedMessagesDeleteConfirm = true
+                }
+            }
+
+            Button(NSLocalizedString("取消", comment: ""), role: .cancel) {}
+        }
+        .onChange(of: viewModel.currentSession?.id) { _, _ in
+            if isMessageSelectionMode {
+                exitMessageSelection()
             }
         }
         .onChange(of: viewModel.messages.count) {
@@ -199,7 +380,7 @@ extension ContentView {
                 suppressAutoScrollOnce = false
                 return
             }
-            let shouldScroll = isAtBottom || shouldForceScrollToBottom || (viewModel.isSendingMessage && shouldKeepBottomPinned)
+            let shouldScroll = shouldForceScrollToBottom || (shouldKeepBottomPinned && (isAtBottom || viewModel.isSendingMessage))
             shouldForceScrollToBottom = false
             guard shouldScroll else { return }
             scrollToBottom(proxy: proxy, animated: false)
@@ -209,7 +390,7 @@ extension ContentView {
             scrollToBottom(proxy: proxy, animated: false)
         }
         .onChange(of: toolPermissionCenter.activeRequest?.id) { _, newValue in
-            guard newValue != nil, isAtBottom else { return }
+            guard newValue != nil, isAtBottom, shouldKeepBottomPinned else { return }
             scrollToBottom(proxy: proxy, animated: false)
         }
         .onChange(of: pendingJumpRequest) { _, request in
@@ -265,6 +446,7 @@ extension ContentView {
             shouldRestorePendingJumpOnAppear = false
             shouldKeepBottomPinned = true
             showScrollToBottomButton = false
+            isAtBottom = true
 
             let shouldResetHistoryWindow = viewModel.usesManualHistoryLoading || viewModel.usesAutomaticHistoryWindow
             guard shouldResetHistoryWindow else {
@@ -351,6 +533,7 @@ extension ContentView {
     }
 
     func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        shouldKeepBottomPinned = true
         let action = {
             proxy.scrollTo(bottomAnchorID, anchor: .bottom)
         }
@@ -370,6 +553,7 @@ extension ContentView {
     ) {
         guard isFirstDisplayedMessage, viewModel.usesAutomaticHistoryWindow else { return }
         suppressAutoScrollOnce = true
+        shouldKeepBottomPinned = false
         let didLoad = viewModel.loadMoreAutomaticHistoryIfNeeded()
         guard didLoad else { return }
         DispatchQueue.main.async {
@@ -444,6 +628,7 @@ extension ContentView {
 
     func scheduleImmediateBottomSnap(proxy: ScrollViewProxy) {
         pendingBottomSnapTask?.cancel()
+        shouldKeepBottomPinned = true
         pendingBottomSnapTask = Task { @MainActor in
             for _ in 0..<4 {
                 guard !Task.isCancelled else { return }
@@ -458,6 +643,7 @@ extension ContentView {
 
     func scheduleDeferredBottomSnap(proxy: ScrollViewProxy) {
         pendingBottomSnapTask?.cancel()
+        shouldKeepBottomPinned = true
         pendingBottomSnapTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 50_000_000)
             for _ in 0..<3 {
@@ -490,5 +676,73 @@ extension ContentView {
 
     var inputStrokeColor: Color {
         colorScheme == .dark ? Color.white.opacity(0.35) : Color.black.opacity(0.12)
+    }
+
+    func updateWatchScrollState(distanceToBottom: CGFloat, isUserInteracting: Bool) {
+        let normalizedDistance = max(distanceToBottom, 0)
+        let isNearBottom = normalizedDistance < watchBottomPinnedDistanceThreshold
+
+        if isNearBottom {
+            bottomAnchorVisibilityWorkItem?.cancel()
+            bottomAnchorVisibilityWorkItem = nil
+            isAtBottom = true
+            shouldKeepBottomPinned = true
+            if showScrollToBottomButton {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    showScrollToBottomButton = false
+                }
+            }
+            return
+        }
+
+        isAtBottom = false
+        if isUserInteracting, !isWatchInputLayoutSettling {
+            shouldKeepBottomPinned = false
+            shouldForceScrollToBottom = false
+        }
+
+        let shouldShow = normalizedDistance > watchScrollToBottomButtonRevealDistance && !shouldKeepBottomPinned
+        if showScrollToBottomButton != shouldShow {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                showScrollToBottomButton = shouldShow
+            }
+        }
+    }
+}
+
+private struct WatchChatScrollStateObserverModifier: ViewModifier {
+    let onDistanceChange: (CGFloat, Bool) -> Void
+    @State private var isUserInteracting = false
+
+    func body(content: Content) -> some View {
+        if #available(watchOS 11.0, *) {
+            content
+                .onScrollPhaseChange { _, newPhase, context in
+                    isUserInteracting = Self.isUserInitiatedScrollPhase(newPhase)
+                    onDistanceChange(Self.distanceToBottom(from: context.geometry), isUserInteracting)
+                }
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    Self.distanceToBottom(from: geometry)
+                } action: { _, newDistance in
+                    onDistanceChange(newDistance, isUserInteracting)
+                }
+        } else {
+            content
+        }
+    }
+
+    @available(watchOS 11.0, *)
+    private static func distanceToBottom(from geometry: ScrollGeometry) -> CGFloat {
+        max(geometry.contentSize.height - geometry.visibleRect.maxY, 0)
+    }
+
+    @available(watchOS 11.0, *)
+    private static func isUserInitiatedScrollPhase(_ phase: ScrollPhase) -> Bool {
+        switch phase {
+        case .tracking, .interacting, .decelerating:
+            return true
+        case .idle, .animating:
+            return false
+        }
     }
 }

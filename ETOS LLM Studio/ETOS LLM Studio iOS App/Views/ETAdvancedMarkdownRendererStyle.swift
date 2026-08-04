@@ -14,10 +14,15 @@ extension View {
     @ViewBuilder
     func etChatMarkdownBaseStyle(
         textColor: Color,
+        emphasisTextColor: Color,
+        strongTextColor: Color,
+        codeTextColor: Color,
+        usesCustomCodeTextColor: Bool,
         isOutgoing: Bool,
         prefersDarkPalette: Bool,
         sampleText: String,
         fontScale: Double,
+        lineSpacing: CGFloat,
         codeHighlightLimit: Int = 12_000
     ) -> some View {
         let codeBlockBackground = isOutgoing
@@ -43,9 +48,10 @@ extension View {
             .markdownSoftBreakMode(.lineBreak)
             .markdownCodeSyntaxHighlighter(
                 ETCodeSyntaxHighlighter(
-                    baseColor: textColor,
+                    baseColor: codeTextColor,
                     isOutgoing: isOutgoing,
                     prefersDarkPalette: prefersDarkPalette,
+                    syntaxHighlightingEnabled: !usesCustomCodeTextColor,
                     maxHighlightedLength: codeHighlightLimit
                 )
             )
@@ -66,7 +72,7 @@ extension View {
                     FontFamily(.custom(emphasisFontName))
                 }
                 FontStyle(.italic)
-                ForegroundColor(textColor)
+                ForegroundColor(emphasisTextColor)
             }
             .markdownTextStyle(\.strong) {
                 if !usesCharacterFallback,
@@ -74,7 +80,8 @@ extension View {
                    !strongFontName.isEmpty {
                     FontFamily(.custom(strongFontName))
                 }
-                ForegroundColor(textColor)
+                FontWeight(.bold)
+                ForegroundColor(strongTextColor)
             }
             .markdownTextStyle(\.code) {
                 if !usesCharacterFallback,
@@ -84,7 +91,12 @@ extension View {
                 } else {
                     FontFamily(.system(.monospaced))
                 }
-                ForegroundColor(textColor)
+                ForegroundColor(codeTextColor)
+            }
+            .markdownBlockStyle(\.paragraph) { configuration in
+                configuration.label
+                    .fixedSize(horizontal: false, vertical: true)
+                    .markdownMargin(top: .zero, bottom: .em(1))
             }
             .markdownBlockStyle(\.blockquote) { configuration in
                 configuration.label
@@ -125,7 +137,6 @@ extension View {
                 } bodyContent: {
                     ScrollView(.horizontal, showsIndicators: false) {
                         configuration.label
-                            .relativeLineSpacing(.em(0.15))
                             .fixedSize(horizontal: true, vertical: true)
                             .markdownTextStyle {
                                 if !usesCharacterFallback,
@@ -136,7 +147,7 @@ extension View {
                                     FontFamily(.system(.monospaced))
                                 }
                                 FontSize(.em(0.9))
-                                ForegroundColor(textColor)
+                                ForegroundColor(codeTextColor)
                             }
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
@@ -151,6 +162,18 @@ extension View {
                 }
                 .markdownMargin(top: .zero, bottom: .em(1))
             }
+            .markdownBlockStyle(\.tableCell) { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        if configuration.row == 0 {
+                            FontWeight(.semibold)
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                    .relativePadding(.horizontal, length: .em(0.72))
+                    .relativePadding(.vertical, length: .em(0.35))
+            }
+            .lineSpacing(lineSpacing)
     }
 }
 

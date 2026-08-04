@@ -36,17 +36,47 @@ extension ChatBubble {
             || message.role == .error
             || (message.role == .assistant
                 && (message.content.hasPrefix(retryFailedPrefix) || message.content.hasPrefix("重试失败")))
-        ETAdvancedMarkdownRenderer(
-            content: content,
-            preparedContent: preparedMarkdownPayload,
-            enableMarkdown: enableMarkdown,
-            isOutgoing: shouldRenderAsOutgoing,
-            enableAdvancedRenderer: enableAdvancedRenderer,
-            enableMathRendering: enableMathRendering,
-            customTextColor: customTextColorOverride,
-            isStreaming: showsStreamingIndicators,
-            onCodeBlockHeaderTap: onCodeBlockHeaderTap
-        )
+        if let extraction = messageState.roleplayHTML,
+           let roleplaySessionID,
+           extraction.containsHTML {
+            VStack(alignment: .leading) {
+                if !extraction.remainingText.isEmpty {
+                    ETAdvancedMarkdownRenderer(
+                        content: extraction.remainingText,
+                        preparedContent: nil,
+                        enableMarkdown: enableMarkdown,
+                        isOutgoing: shouldRenderAsOutgoing,
+                        enableAdvancedRenderer: enableAdvancedRenderer,
+                        enableMathRendering: enableMathRendering,
+                        customTextColor: customTextColorOverride,
+                        customTextStyleColors: customTextStyleColors,
+                        isStreaming: showsStreamingIndicators,
+                        onCodeBlockHeaderTap: onCodeBlockHeaderTap
+                    )
+                }
+                WatchRoleplayHTMLCardView(
+                    extraction: extraction,
+                    sessionID: roleplaySessionID,
+                    messageID: message.id,
+                    versionIndex: message.getCurrentVersionIndex()
+                ) { item in
+                    webHTMLPageItem = item
+                }
+            }
+        } else {
+            ETAdvancedMarkdownRenderer(
+                content: content,
+                preparedContent: preparedMarkdownPayload,
+                enableMarkdown: enableMarkdown,
+                isOutgoing: shouldRenderAsOutgoing,
+                enableAdvancedRenderer: enableAdvancedRenderer,
+                enableMathRendering: enableMathRendering,
+                customTextColor: customTextColorOverride,
+                customTextStyleColors: customTextStyleColors,
+                isStreaming: showsStreamingIndicators,
+                onCodeBlockHeaderTap: onCodeBlockHeaderTap
+            )
+        }
     }
 
     @ViewBuilder
@@ -103,22 +133,44 @@ extension ChatBubble {
         return String(format: "%d:%02d", minutes, seconds)
     }
 
+    func openWidgetWebPage(payload: ToolWidgetPayload) {
+        let title = payload.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        webHTMLPageItem = WatchWebHTMLPageItem(
+            title: title?.isEmpty == false ? (title ?? "") : NSLocalizedString("可视化 Widget", comment: ""),
+            html: WatchWebHTMLDocumentFactory.widgetDocument(
+                payload: payload,
+                prefersDarkPalette: colorScheme == .dark
+            )
+        )
+    }
+
     @ViewBuilder
     func widgetInlineSummaryView(payload: ToolWidgetPayload) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(NSLocalizedString("可视化 Widget", comment: ""))
-                .etFont(.caption2.weight(.semibold))
-                .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.9))
-            if let title = payload.title,
-               !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text(title)
-                    .etFont(.caption2)
-                    .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.85))
+        Button {
+            openWidgetWebPage(payload: payload)
+        } label: {
+            HStack(alignment: .top, spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(NSLocalizedString("可视化 Widget", comment: ""))
+                        .etFont(.caption2.weight(.semibold))
+                        .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.9))
+                    if let title = payload.title,
+                       !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(title)
+                            .etFont(.caption2)
+                            .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.85))
+                    }
+                    Text(NSLocalizedString("点按在手表上查看完整渲染。", comment: ""))
+                        .etFont(.caption2)
+                        .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.forward")
+                    .etFont(.caption2.weight(.semibold))
+                    .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.75))
             }
-            Text(NSLocalizedString("已生成 HTML 卡片，请在 iPhone 端查看完整渲染。", comment: ""))
-                .etFont(.caption2)
-                .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
         }
+        .buttonStyle(.plain)
         .padding(.leading, 4)
     }
 
@@ -146,11 +198,10 @@ extension ChatBubble {
     func fileAttachmentsView(fileNames: [String], isOutgoing: Bool) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(fileNames, id: \.self) { fileName in
-                Button {
-                    loadFilePreview(fileName)
-                } label: {
+                let isVideo = VideoAttachmentSupport.isVideo(fileName: fileName)
+                if isVideo {
                     HStack(spacing: 6) {
-                        Image(systemName: "doc")
+                        Image(systemName: "video")
                             .etFont(.system(size: 13, weight: .semibold))
                             .foregroundStyle(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
 
@@ -160,10 +211,6 @@ extension ChatBubble {
                             .foregroundStyle(resolvedTextColor(default: .primary))
 
                         Spacer(minLength: 4)
-
-                        Image(systemName: "eye")
-                            .etFont(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
@@ -172,9 +219,37 @@ extension ChatBubble {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Color.secondary.opacity(0.15))
                     )
+                } else {
+                    Button {
+                        loadFilePreview(fileName)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "doc")
+                                .etFont(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
+
+                            Text(fileName)
+                                .etFont(.system(size: 11, weight: .medium))
+                                .lineLimit(1)
+                                .foregroundStyle(resolvedTextColor(default: .primary))
+
+                            Spacer(minLength: 4)
+
+                            Image(systemName: "eye")
+                                .etFont(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.8))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.secondary.opacity(0.15))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(NSLocalizedString("预览", comment: ""))
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(NSLocalizedString("预览", comment: ""))
             }
         }
         .frame(maxWidth: bubbleMaxWidth, alignment: isOutgoing ? .trailing : .leading)
@@ -242,6 +317,7 @@ extension ChatBubble {
                         enableAdvancedRenderer: enableAdvancedRenderer,
                         enableMathRendering: enableMathRendering,
                         textColor: contentColor,
+                        customTextStyleColors: customTextStyleColors,
                         font: .footnote,
                         onCodeBlockHeaderTap: onCodeBlockHeaderTap
                     )
@@ -539,19 +615,8 @@ extension ChatBubble {
             Text(label)
                 .etFont(.caption2.weight(.semibold))
                 .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.85))
-            VStack(alignment: .leading, spacing: 3) {
-                Text(NSLocalizedString("检测到可视化 Widget", comment: ""))
-                    .etFont(.caption2.weight(.medium))
-                if let title = payload.title,
-                   !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Text(String(format: NSLocalizedString("标题：%@", comment: ""), title))
-                        .etFont(.caption2)
-                }
-                Text(NSLocalizedString("请在 iPhone 端查看完整渲染效果。", comment: ""))
-                    .etFont(.caption2)
-            }
-            .foregroundColor(resolvedSecondaryTextColor(default: .secondary, customOpacity: 0.82))
-            .padding(.vertical, 2)
+            widgetInlineSummaryView(payload: payload)
+                .padding(.vertical, 2)
 
             if display.shouldShowRawSection {
                 toolResultSection(
@@ -679,6 +744,7 @@ struct WatchFileAttachmentPreviewSheet: View {
         NavigationStack {
             Group {
                 if let text = payload.text {
+                    let fullText = payload.fullText ?? text
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
                             VStack(alignment: .leading, spacing: 3) {
@@ -695,9 +761,11 @@ struct WatchFileAttachmentPreviewSheet: View {
                                     .foregroundStyle(.secondary)
                             }
 
-                            Text(text)
-                                .etFont(.system(size: 10, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            WatchToolCallLongTextPreview(
+                                title: payload.fileName,
+                                text: fullText,
+                                usesMonospacedFont: true
+                            )
                         }
                         .padding(.vertical, 4)
                     }

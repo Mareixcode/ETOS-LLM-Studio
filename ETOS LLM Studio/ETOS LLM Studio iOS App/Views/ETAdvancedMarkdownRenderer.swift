@@ -19,9 +19,12 @@ struct ETAdvancedMarkdownRenderer: View {
     let enableAdvancedRenderer: Bool
     let enableMathRendering: Bool
     let customTextColor: Color?
+    var customTextStyleColors: ChatAppearanceTextStyleColors? = nil
     var isStreaming: Bool = false
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var appConfig = AppConfigStore.shared
+    @State private var preparedRuleRequest: ChatAppearanceTextRuleRenderRequest?
+    @State private var ruleAttributedText: AttributedString?
 
     private var effectivePreparedContent: ETPreparedMarkdownRenderPayload? {
         guard let preparedContent, preparedContent.sourceText == content else {
@@ -33,44 +36,100 @@ struct ETAdvancedMarkdownRenderer: View {
     var body: some View {
         let textColor: Color = customTextColor ?? (isOutgoing ? .white : .primary)
         let fontScale = FontLibrary.effectiveFontScale(appConfig.fontCustomScale, isCustomFontEnabled: appConfig.fontUseCustomFonts)
-        if enableMarkdown {
-            if let streamingLineParts {
-                streamingLineMarkdownView(
-                    prefix: streamingLineParts.prefix,
-                    activeLine: streamingLineParts.activeLine,
-                    textColor: textColor,
-                    fontScale: fontScale
-                )
-            } else if let prepared = effectivePreparedContent {
-                if shouldUseWebRenderer(prepared) {
-                    ETMathWebMarkdownView(
-                        content: prepared.normalizedText,
-                        enableMarkdown: enableMarkdown,
-                        isOutgoing: isOutgoing,
-                        customTextHex: customTextColor.flatMap { ChatAppearanceColorCodec.hexRGBA(from: $0) },
-                        prefersDarkPalette: colorScheme == .dark,
-                        fontScale: fontScale
-                    )
-                } else {
-                    let markdownContent = resolvedMarkdownContent(for: prepared)
-                    markdownTextView(
-                        markdownContent: markdownContent,
-                        sampleText: prepared.sourceText,
+        let lineSpacingEm = FontLibrary.normalizedLineSpacingEm(
+            appConfig.fontLineSpacingEmIOS,
+            fallback: FontLibrary.defaultIOSLineSpacingEm
+        )
+        let lineSpacing = CGFloat(
+            FontLibrary.lineSpacingPoints(
+                basePointSize: 17,
+                lineSpacingEm: lineSpacingEm,
+                fontScale: appConfig.fontCustomScale,
+                isCustomFontEnabled: appConfig.fontUseCustomFonts,
+                fallbackLineSpacingEm: FontLibrary.defaultIOSLineSpacingEm
+            )
+        )
+        Group {
+            if preparedRuleRequest == ruleRenderRequest,
+               let ruleAttributedText {
+                Text(ruleAttributedText)
+                    .etFont(.body, sampleText: content)
+                    .lineSpacing(lineSpacing)
+                    .foregroundStyle(textColor)
+            } else if enableMarkdown {
+                if let streamingLineParts {
+                    streamingLineMarkdownView(
+                        prefix: streamingLineParts.prefix,
+                        activeLine: streamingLineParts.activeLine,
                         textColor: textColor,
-                        fontScale: fontScale
+                        fontScale: fontScale,
+                        lineSpacing: lineSpacing
+                    )
+                } else if let prepared = effectivePreparedContent {
+                    if shouldUseWebRenderer(prepared) {
+                        ETMathWebMarkdownView(
+                            content: prepared.mathRenderText,
+                            enableMarkdown: enableMarkdown,
+                            isOutgoing: isOutgoing,
+                            customTextHex: customTextColor.flatMap { ChatAppearanceColorCodec.hexRGBA(from: $0) },
+                            customEmphasisTextHex: enabledHex(customTextStyleColors?.emphasis),
+                            customStrongTextHex: enabledHex(customTextStyleColors?.strong),
+                            customCodeTextHex: enabledHex(customTextStyleColors?.code),
+                            prefersDarkPalette: colorScheme == .dark,
+                            fontScale: fontScale,
+                            lineSpacingEm: lineSpacingEm
+                        )
+                    } else {
+                        let markdownContent = resolvedMarkdownContent(for: prepared)
+                        markdownTextView(
+                            markdownContent: markdownContent,
+                            sampleText: prepared.sourceText,
+                            textColor: textColor,
+                            fontScale: fontScale,
+                            lineSpacing: lineSpacing
+                        )
+                    }
+                } else {
+                    markdownTextView(
+                        markdownContent: MarkdownContent(content),
+                        sampleText: content,
+                        textColor: textColor,
+                        fontScale: fontScale,
+                        lineSpacing: lineSpacing
                     )
                 }
             } else {
-                markdownTextView(
-                    markdownContent: MarkdownContent(content),
-                    sampleText: content,
-                    textColor: textColor,
-                    fontScale: fontScale
-                )
+                plainTextView(content, textColor: textColor, lineSpacing: lineSpacing)
             }
-        } else {
-            plainTextView(content, textColor: textColor)
         }
+        .task(id: ruleRenderRequest) {
+            guard let request = ruleRenderRequest else {
+                preparedRuleRequest = nil
+                ruleAttributedText = nil
+                return
+            }
+            let prepared = await ChatAppearanceTextRuleRenderer.shared.prepare(request: request)
+            guard !Task.isCancelled else { return }
+            preparedRuleRequest = request
+            ruleAttributedText = prepared
+        }
+    }
+
+    private var ruleRenderRequest: ChatAppearanceTextRuleRenderRequest? {
+        guard !isStreaming else { return nil }
+        let fontRules = FontLibrary.resolvedTextFontRules()
+        let resolvedStyleColors = customTextStyleColors
+            ?? ChatAppearanceTextStyleColors(defaultHex: "000000FF")
+        guard !resolvedStyleColors.customRules.isEmpty || !fontRules.isEmpty else { return nil }
+        return ChatAppearanceTextRuleRenderRequest(
+            source: content,
+            usesMarkdown: enableMarkdown,
+            styleColors: resolvedStyleColors,
+            fontRules: fontRules,
+            fontPointSize: 17,
+            fontScale: FontLibrary.customFontScale,
+            fontFallbackScope: FontLibrary.fallbackScope
+        )
     }
 
     // 流式期间只把短的最后一行作为活动文本，避免整泡切纯文本或扫过气泡背景。
@@ -118,9 +177,13 @@ struct ETAdvancedMarkdownRenderer: View {
         markdownContent: MarkdownContent,
         sampleText: String,
         textColor: Color,
-        fontScale: Double
+        fontScale: Double,
+        lineSpacing: CGFloat
     ) -> some View {
         let mathTextColor = ETIOSMathColorComponents(textColor)
+        let emphasisTextColor = resolvedStyleColor(customTextStyleColors?.emphasis, fallback: textColor)
+        let strongTextColor = resolvedStyleColor(customTextStyleColors?.strong, fallback: textColor)
+        let codeTextColor = resolvedStyleColor(customTextStyleColors?.code, fallback: textColor)
         Markdown(markdownContent)
             .markdownImageProvider(
                 ETIOSMarkdownImageProvider(textColor: mathTextColor, fontScale: fontScale)
@@ -130,10 +193,15 @@ struct ETAdvancedMarkdownRenderer: View {
             )
             .etChatMarkdownBaseStyle(
                 textColor: textColor,
+                emphasisTextColor: emphasisTextColor,
+                strongTextColor: strongTextColor,
+                codeTextColor: codeTextColor,
+                usesCustomCodeTextColor: customTextStyleColors?.usesAutomaticCodeSyntaxHighlighting == false,
                 isOutgoing: isOutgoing,
                 prefersDarkPalette: colorScheme == .dark,
                 sampleText: sampleText,
                 fontScale: fontScale,
+                lineSpacing: lineSpacing,
                 codeHighlightLimit: isStreaming ? 4_096 : 12_000
             )
     }
@@ -143,32 +211,44 @@ struct ETAdvancedMarkdownRenderer: View {
         prefix: String,
         activeLine: String,
         textColor: Color,
-        fontScale: Double
+        fontScale: Double,
+        lineSpacing: CGFloat
     ) -> some View {
-        let normalizedFontScale = CGFloat(FontLibrary.normalizedFontScale(fontScale))
         VStack(alignment: .leading, spacing: 0) {
             if !prefix.isEmpty {
                 markdownTextView(
                     markdownContent: MarkdownContent(prefix),
                     sampleText: prefix,
                     textColor: textColor,
-                    fontScale: fontScale
+                    fontScale: fontScale,
+                    lineSpacing: lineSpacing
                 )
             }
             ETStreamingActiveLineText(
                 text: activeLine,
                 textColor: textColor,
-                lineSpacing: 3 * normalizedFontScale
+                lineSpacing: lineSpacing
             )
-            .padding(.top, prefix.isEmpty ? 0 : 3 * normalizedFontScale)
+            .padding(.top, prefix.isEmpty ? 0 : lineSpacing)
         }
     }
 
     @ViewBuilder
-    private func plainTextView(_ text: String, textColor: Color) -> some View {
+    private func plainTextView(_ text: String, textColor: Color, lineSpacing: CGFloat) -> some View {
         Text(text)
             .etFont(.body, sampleText: text)
+            .lineSpacing(lineSpacing)
             .foregroundStyle(textColor)
+    }
+
+    private func resolvedStyleColor(_ slot: ChatAppearanceColorSlot?, fallback: Color) -> Color {
+        guard let slot, slot.isEnabled else { return fallback }
+        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: fallback)
+    }
+
+    private func enabledHex(_ slot: ChatAppearanceColorSlot?) -> String? {
+        guard let slot, slot.isEnabled else { return nil }
+        return slot.hex
     }
 
     private func containsUnclosedFence(in text: String) -> Bool {

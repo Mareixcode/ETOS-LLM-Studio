@@ -224,19 +224,29 @@ struct ChatAppearanceProfileEditor: View {
             supportsOpacity: true,
             opacityTitle: NSLocalizedString("助手气泡不透明度", comment: "Assistant bubble opacity title")
         )
-        colorSlotEditor(
-            title: NSLocalizedString("白天文字颜色", comment: "Light appearance text color title"),
-            toggleTitle: NSLocalizedString("自定义白天文字颜色", comment: "Custom light text color toggle"),
-            slot: lightTextBinding,
-            fallback: .init(.sRGB, red: 0.11, green: 0.11, blue: 0.12, opacity: 1),
-            supportsOpacity: false
+        textStyleColorsLink(
+            title: NSLocalizedString("用户白天文字样式", comment: "User light appearance text styles title"),
+            bodyColor: userLightTextBinding,
+            styleColors: userLightTextStylesBinding,
+            fallback: .white
         )
-        colorSlotEditor(
-            title: NSLocalizedString("夜览文字颜色", comment: "Dark appearance text color title"),
-            toggleTitle: NSLocalizedString("自定义夜览文字颜色", comment: "Custom dark text color toggle"),
-            slot: darkTextBinding,
-            fallback: .white,
-            supportsOpacity: false
+        textStyleColorsLink(
+            title: NSLocalizedString("用户夜览文字样式", comment: "User dark appearance text styles title"),
+            bodyColor: userDarkTextBinding,
+            styleColors: userDarkTextStylesBinding,
+            fallback: .white
+        )
+        textStyleColorsLink(
+            title: NSLocalizedString("助手白天文字样式", comment: "Assistant light appearance text styles title"),
+            bodyColor: assistantLightTextBinding,
+            styleColors: assistantLightTextStylesBinding,
+            fallback: .init(.sRGB, red: 0.11, green: 0.11, blue: 0.12, opacity: 1)
+        )
+        textStyleColorsLink(
+            title: NSLocalizedString("助手夜览文字样式", comment: "Assistant dark appearance text styles title"),
+            bodyColor: assistantDarkTextBinding,
+            styleColors: assistantDarkTextStylesBinding,
+            fallback: .white
         )
     }
 
@@ -259,12 +269,36 @@ struct ChatAppearanceProfileEditor: View {
         slotBinding(\.assistantBubble)
     }
 
-    private var lightTextBinding: Binding<ChatAppearanceColorSlot> {
-        slotBinding(\.lightText)
+    private var userLightTextBinding: Binding<ChatAppearanceColorSlot> {
+        slotBinding(\.userLightText)
     }
 
-    private var darkTextBinding: Binding<ChatAppearanceColorSlot> {
-        slotBinding(\.darkText)
+    private var userDarkTextBinding: Binding<ChatAppearanceColorSlot> {
+        slotBinding(\.userDarkText)
+    }
+
+    private var assistantLightTextBinding: Binding<ChatAppearanceColorSlot> {
+        slotBinding(\.assistantLightText)
+    }
+
+    private var assistantDarkTextBinding: Binding<ChatAppearanceColorSlot> {
+        slotBinding(\.assistantDarkText)
+    }
+
+    private var userLightTextStylesBinding: Binding<ChatAppearanceTextStyleColors> {
+        textStylesBinding(\.userLightTextStyles)
+    }
+
+    private var userDarkTextStylesBinding: Binding<ChatAppearanceTextStyleColors> {
+        textStylesBinding(\.userDarkTextStyles)
+    }
+
+    private var assistantLightTextStylesBinding: Binding<ChatAppearanceTextStyleColors> {
+        textStylesBinding(\.assistantLightTextStyles)
+    }
+
+    private var assistantDarkTextStylesBinding: Binding<ChatAppearanceTextStyleColors> {
+        textStylesBinding(\.assistantDarkTextStyles)
     }
 
     private func slotBinding(_ keyPath: WritableKeyPath<ChatAppearanceProfile, ChatAppearanceColorSlot>) -> Binding<ChatAppearanceColorSlot> {
@@ -276,6 +310,38 @@ struct ChatAppearanceProfileEditor: View {
                 onChange(updated)
             }
         )
+    }
+
+    private func textStylesBinding(
+        _ keyPath: WritableKeyPath<ChatAppearanceProfile, ChatAppearanceTextStyleColors>
+    ) -> Binding<ChatAppearanceTextStyleColors> {
+        Binding(
+            get: { profile[keyPath: keyPath] },
+            set: { newValue in
+                var updated = profile
+                updated[keyPath: keyPath] = newValue
+                onChange(updated)
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func textStyleColorsLink(
+        title: String,
+        bodyColor: Binding<ChatAppearanceColorSlot>,
+        styleColors: Binding<ChatAppearanceTextStyleColors>,
+        fallback: Color
+    ) -> some View {
+        NavigationLink {
+            ChatTextStyleColorSettingsView(
+                title: title,
+                bodyColor: bodyColor,
+                styleColors: styleColors,
+                fallback: fallback
+            )
+        } label: {
+            Text(title)
+        }
     }
 
     @ViewBuilder

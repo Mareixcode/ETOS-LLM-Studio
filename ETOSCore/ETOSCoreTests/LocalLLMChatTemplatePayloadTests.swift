@@ -18,6 +18,13 @@ struct LocalLLMChatTemplatePayloadTests {
             messages: [
                 LocalLLMChatMessage(role: "system", content: "你是助手"),
                 LocalLLMChatMessage(
+                    role: "user",
+                    content: "\(LocalLLMChatMessage.mediaMarker)\n看图",
+                    mediaAttachments: [
+                        LocalLLMMediaAttachment(id: "media-1", data: Data([1, 2, 3]), mimeType: "image/png", fileName: "image.png")
+                    ]
+                ),
+                LocalLLMChatMessage(
                     role: "assistant",
                     content: "",
                     reasoningContent: "先查时间",
@@ -40,18 +47,33 @@ struct LocalLLMChatTemplatePayloadTests {
         )
 
         let messages = try decodedJSONArray(payload.messagesJSON)
-        #expect(messages.count == 3)
+        #expect(messages.count == 4)
         #expect(messages[0]["role"] as? String == "system")
-        #expect(messages[1]["reasoning_content"] as? String == "先查时间")
-        let toolCalls = try #require(messages[1]["tool_calls"] as? [[String: Any]])
+        #expect(messages[1]["etos_media_ids"] as? [String] == ["media-1"])
+        #expect(payload.mediaAttachments.map(\.id) == ["media-1"])
+        #expect(messages[2]["reasoning_content"] as? String == "先查时间")
+        let toolCalls = try #require(messages[2]["tool_calls"] as? [[String: Any]])
         #expect(toolCalls.first?["id"] as? String == "call_1")
-        #expect(messages[2]["tool_call_id"] as? String == "call_1")
+        #expect(messages[3]["tool_call_id"] as? String == "call_1")
 
         let tools = try decodedJSONArray(payload.toolsJSON)
         let function = try #require(tools.first?["function"] as? [String: Any])
         #expect(function["name"] as? String == "app_get_system_time")
         let parameters = try #require(function["parameters"] as? [String: Any])
         #expect(parameters["type"] as? String == "object")
+    }
+
+    @Test("本地 LLM 工具定义会按稳定顺序编码")
+    func toolDefinitionsUseStableOrdering() throws {
+        let alphaTool = stableLocalOrderingTool(name: "alpha_tool")
+        let zetaTool = stableLocalOrderingTool(name: "zeta_tool")
+
+        let tools = LocalLLMChatMessageBuilder.toolDefinitions(from: [zetaTool, alphaTool])
+
+        #expect(tools.map(\.name) == ["alpha_tool", "zeta_tool"])
+        let parametersData = try #require(tools.first?.parametersJSON.data(using: .utf8))
+        let parameters = try #require(JSONSerialization.jsonObject(with: parametersData) as? [String: Any])
+        #expect(parameters["required"] as? [String] == ["a", "b"])
     }
 
     @Test("无效工具调用历史 JSON 会在 Swift 边界失败")
@@ -70,8 +92,8 @@ struct LocalLLMChatTemplatePayloadTests {
         }
     }
 
-    @Test("本地模板消息会合并系统消息并从用户轮次开始")
-    func templateCompatibleMessagesStartFromUserTurn() throws {
+    @Test("本地模板消息从用户轮次开始并保留后置系统角色")
+    func templateCompatibleMessagesStartFromUserTurn() {
         let messages = LocalLLMChatMessageBuilder.templateCompatibleMessages([
             LocalLLMChatMessage(role: "assistant", content: "被截断后悬空的旧回复"),
             LocalLLMChatMessage(role: "system", content: "前置系统提示"),
@@ -79,13 +101,42 @@ struct LocalLLMChatTemplatePayloadTests {
             LocalLLMChatMessage(role: "system", content: "末尾注入提示")
         ])
 
-        #expect(messages.map(\.role) == ["system", "user"])
-        #expect(messages.first?.content == "前置系统提示\n\n末尾注入提示")
-        #expect(messages.last?.content == "继续聊")
+        #expect(messages.map(\.role) == ["system", "user", "system"])
+        #expect(messages.first?.content == "前置系统提示")
+        #expect(messages[1].content == "继续聊")
+        #expect(messages.last?.content == "末尾注入提示")
+    }
+
+    @Test("本地模板保留对话尾部的 system 角色")
+    func templateCompatibleMessagesKeepSystemRoleAtConversationTail() {
+        let messages = LocalLLMChatMessageBuilder.templateCompatibleMessages([
+            LocalLLMChatMessage(role: "system", content: "稳定系统提示"),
+            LocalLLMChatMessage(role: "user", content: "现在几点？"),
+            LocalLLMChatMessage(role: "system", content: "<time>当前系统时间</time>")
+        ])
+
+        #expect(messages.map(\.role) == ["system", "user", "system"])
+        #expect(messages.first?.content == "稳定系统提示")
+        #expect(messages.last?.content.hasSuffix("<time>当前系统时间</time>") == true)
     }
 }
 
 private func decodedJSONArray(_ json: String) throws -> [[String: Any]] {
     let data = try #require(json.data(using: .utf8))
     return try #require(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+}
+
+private func stableLocalOrderingTool(name: String) -> InternalToolDefinition {
+    InternalToolDefinition(
+        name: name,
+        description: "稳定排序测试工具",
+        parameters: .dictionary([
+            "required": .array([.string("b"), .string("a")]),
+            "properties": .dictionary([
+                "b": .dictionary(["type": .string("string")]),
+                "a": .dictionary(["type": .string("string")])
+            ]),
+            "type": .string("object")
+        ])
+    )
 }

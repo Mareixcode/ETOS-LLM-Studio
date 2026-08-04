@@ -11,7 +11,7 @@ import Foundation
 import SQLite3
 @testable import ETOSCore
 
-@Suite("Persistence Core Tests")
+@Suite("Persistence Core Tests", .serialized)
 struct PersistenceCoreTests {
     private struct LegacySessionRecord: Decodable {
         struct SessionMeta: Decodable {
@@ -53,7 +53,7 @@ struct PersistenceCoreTests {
     }
 
     private var memoryStoreSQLiteURL: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        StorageUtility.documentsDirectory
             .appendingPathComponent("Memory")
             .appendingPathComponent("memory-store.sqlite")
     }
@@ -106,6 +106,14 @@ struct PersistenceCoreTests {
         let session1 = ChatSession(id: UUID(), name: "Session 1", isTemporary: false)
         let session2 = ChatSession(id: UUID(), name: "Session 2", topicPrompt: "Test Topic", isTemporary: false)
         let sessionsToSave = [session1, session2]
+        let previousOverride = Persistence.grdbEnabledOverrideForTests
+        Persistence.grdbEnabledOverrideForTests = false
+        Persistence.resetGRDBStoreForTests()
+        defer {
+            cleanup(sessions: sessionsToSave)
+            Persistence.grdbEnabledOverrideForTests = previousOverride
+            Persistence.resetGRDBStoreForTests()
+        }
 
         Persistence.saveChatSessions(sessionsToSave)
         let loadedSessions = Persistence.loadChatSessions()
@@ -118,7 +126,6 @@ struct PersistenceCoreTests {
         #expect(FileManager.default.fileExists(atPath: currentSessionFileURL(session1.id).path))
         #expect(FileManager.default.fileExists(atPath: currentSessionFileURL(session2.id).path))
 
-        cleanup(sessions: sessionsToSave)
     }
 
     @Test("Save and Load Session Folders with Session Assignment")
@@ -153,6 +160,15 @@ struct PersistenceCoreTests {
             ChatMessage(role: .user, content: "Hello", requestedAt: requestedAt),
             ChatMessage(role: .assistant, content: "Hi there!")
         ]
+        let cleanupSession = ChatSession(id: sessionId, name: "cleanup", isTemporary: false)
+        let previousOverride = Persistence.grdbEnabledOverrideForTests
+        Persistence.grdbEnabledOverrideForTests = false
+        Persistence.resetGRDBStoreForTests()
+        defer {
+            cleanup(sessions: [cleanupSession])
+            Persistence.grdbEnabledOverrideForTests = previousOverride
+            Persistence.resetGRDBStoreForTests()
+        }
 
         Persistence.saveMessages(messagesToSave, for: sessionId)
         let loadedMessages = Persistence.loadMessages(for: sessionId)
@@ -174,7 +190,6 @@ struct PersistenceCoreTests {
             Issue.record("会话文件不存在或格式不正确。")
         }
 
-        cleanup(sessions: [ChatSession(id: sessionId, name: "cleanup", isTemporary: false)])
     }
 
     @Test("GRDB backend can count messages without loading full array")
@@ -227,6 +242,7 @@ struct PersistenceCoreTests {
             ChatMessage(
                 role: .assistant,
                 content: "第一次回复",
+                sentSystemPromptSnapshot: "第一次请求的系统提示词",
                 responseGroupID: groupID,
                 responseAttemptID: firstAttemptID,
                 responseAttemptIndex: 0
@@ -234,6 +250,7 @@ struct PersistenceCoreTests {
             ChatMessage(
                 role: .assistant,
                 content: "第二次回复",
+                sentSystemPromptSnapshot: "<long_term_memory>第二次请求的记忆</long_term_memory>",
                 responseGroupID: groupID,
                 responseAttemptID: secondAttemptID,
                 responseAttemptIndex: 1
@@ -250,9 +267,47 @@ struct PersistenceCoreTests {
         #expect(loadedMessages[1].responseGroupID == groupID)
         #expect(loadedMessages[1].responseAttemptID == firstAttemptID)
         #expect(loadedMessages[1].responseAttemptIndex == 0)
+        #expect(loadedMessages[1].sentSystemPromptSnapshot == "第一次请求的系统提示词")
         #expect(loadedMessages[2].responseGroupID == groupID)
         #expect(loadedMessages[2].responseAttemptID == secondAttemptID)
         #expect(loadedMessages[2].responseAttemptIndex == 1)
+        #expect(loadedMessages[2].sentSystemPromptSnapshot == "<long_term_memory>第二次请求的记忆</long_term_memory>")
+
+        cleanup(sessions: [session])
+    }
+
+    @Test("GRDB saveMessages 会保留视频解析结果")
+    func testGRDBSaveAndLoadVideoAnalysisResults() throws {
+        let previousOverride = Persistence.grdbEnabledOverrideForTests
+        Persistence.grdbEnabledOverrideForTests = true
+        Persistence.resetGRDBStoreForTests()
+        defer {
+            Persistence.grdbEnabledOverrideForTests = previousOverride
+            Persistence.resetGRDBStoreForTests()
+        }
+
+        let session = ChatSession(id: UUID(), name: "视频解析会话", isTemporary: false)
+        let generatedAt = Date(timeIntervalSince1970: 1_750_000_000)
+        let result = VideoAnalysisResult(
+            fileName: "sample.mp4",
+            content: "00:00 出现标题，00:03 人物挥手。",
+            modelIdentifier: "provider-gemini-video",
+            modelDisplayName: "Gemini Video | Provider",
+            generatedAt: generatedAt
+        )
+        let message = ChatMessage(
+            role: .user,
+            content: "这个视频讲了什么？",
+            fileFileNames: ["sample.mp4"],
+            videoAnalysisResults: [result]
+        )
+
+        Persistence.saveChatSessions([session])
+        Persistence.saveMessages([message], for: session.id)
+
+        let loadedMessage = try #require(Persistence.loadMessages(for: session.id).first)
+        #expect(loadedMessage.videoAnalysisResults == [result])
+        #expect(loadedMessage.videoAnalysisResult(for: "sample.mp4") == result)
 
         cleanup(sessions: [session])
     }
@@ -336,7 +391,16 @@ struct PersistenceCoreTests {
             id: memoryAID,
             content: "记忆-A",
             embedding: [0.1, 0.2],
-            createdAt: createdAt
+            createdAt: createdAt,
+            kind: .preference,
+            source: .userStatement,
+            importance: 0.8,
+            confidence: 0.9,
+            entities: ["SwiftUI"],
+            validFrom: createdAt,
+            sourceSessionID: UUID(),
+            accessCount: 3,
+            lastAccessedAt: createdAt
         )
         let memoryB = MemoryItem(
             id: memoryBID,
@@ -356,7 +420,16 @@ struct PersistenceCoreTests {
             content: "记忆-A-已更新",
             embedding: [0.9, 0.8],
             createdAt: createdAt,
-            updatedAt: createdAt.addingTimeInterval(10)
+            updatedAt: createdAt.addingTimeInterval(10),
+            kind: memoryA.kind,
+            source: memoryA.source,
+            importance: memoryA.importance,
+            confidence: memoryA.confidence,
+            entities: memoryA.entities,
+            validFrom: memoryA.validFrom,
+            sourceSessionID: memoryA.sourceSessionID,
+            accessCount: memoryA.accessCount,
+            lastAccessedAt: memoryA.lastAccessedAt
         )
         try store.saveMemories([updatedMemoryA, memoryB])
 
@@ -372,6 +445,12 @@ struct PersistenceCoreTests {
         let loaded = store.loadMemories()
         #expect(loaded.contains(where: { $0.id == memoryAID && $0.content == "记忆-A-已更新" }))
         #expect(loaded.contains(where: { $0.id == memoryBID && $0.content == "记忆-B" }))
+        let loadedMemoryA = try #require(loaded.first(where: { $0.id == memoryAID }))
+        #expect(loadedMemoryA.kind == .preference)
+        #expect(loadedMemoryA.source == .userStatement)
+        #expect(loadedMemoryA.importance == 0.8)
+        #expect(loadedMemoryA.entities == ["SwiftUI"])
+        #expect(loadedMemoryA.accessCount == 3)
     }
 
     @Test("GRDB 在仅收到临时会话快照时不会误删已有会话")

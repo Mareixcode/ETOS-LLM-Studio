@@ -37,9 +37,96 @@ extension PersistenceTests {
         }
     }
 
+    @Test("可选采样参数与思考摘要默认关闭")
+    func testOptionalGenerationSettingsDefaultToDisabled() {
+        #expect(AppConfigKey.aiTemperatureEnabled.defaultValue == .bool(false))
+        #expect(AppConfigKey.aiTopPEnabled.defaultValue == .bool(false))
+        #expect(AppConfigKey.enableReasoningSummary.defaultValue == .bool(false))
+    }
+
+    @Test("性能遥测默认开启且仅保存在本机")
+    func performanceTelemetryDefaultsToEnabledAndLocalOnly() {
+        #expect(AppConfigKey.performanceTelemetryEnabled.defaultValue == .bool(true))
+        #expect(AppConfigKey.performanceTelemetryEnabled.participatesInSync == false)
+        #expect(AppConfigKey.requestLogPlainMessageEnabled.defaultValue == .bool(false))
+    }
+
+    @Test("对话 KV 缓存默认关闭且仅保存在本机")
+    @MainActor
+    func localModelKVCacheDefaultsToDisabledAndLocalOnly() {
+        let key = AppConfigKey.localModelKVCacheEnabled
+        let previousSnapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+
+        defer {
+            AppConfigStore.shared.apply(snapshot: previousSnapshot)
+        }
+
+        #expect(key.defaultValue == .bool(false))
+        #expect(key.participatesInSync == false)
+
+        AppConfigStore.shared.apply(snapshot: [key.rawValue: true])
+
+        #expect(AppConfigStore.shared.localModelKVCacheEnabled)
+        #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Bool == true)
+    }
+
+    @Test("iOS 与 watchOS 默认使用按提供商选择模型")
+    func modelPickerDefaultsToProviderGrouping() {
+        #expect(AppConfigKey.iOSModelPickerGroupsByProvider.defaultValue == .bool(true))
+        #expect(AppConfigKey.watchModelPickerGroupsByProvider.defaultValue == .bool(true))
+    }
+
+    @Test("模型选择器功能快捷入口默认隐藏并支持配置快照")
+    @MainActor
+    func modelPickerFeatureShortcutsDefaultToHidden() {
+        let promptKey = AppConfigKey.modelPickerPromptShortcutEnabled
+        let worldbookKey = AppConfigKey.modelPickerWorldbookShortcutEnabled
+        let previousPromptValue = AppConfigStore.shared.modelPickerPromptShortcutEnabled
+        let previousWorldbookValue = AppConfigStore.shared.modelPickerWorldbookShortcutEnabled
+
+        defer {
+            AppConfigStore.shared.apply(snapshot: [
+                promptKey.rawValue: previousPromptValue,
+                worldbookKey.rawValue: previousWorldbookValue
+            ])
+        }
+
+        #expect(promptKey.defaultValue == .bool(false))
+        #expect(worldbookKey.defaultValue == .bool(false))
+
+        AppConfigStore.shared.apply(snapshot: [
+            promptKey.rawValue: true,
+            worldbookKey.rawValue: true
+        ])
+
+        #expect(AppConfigStore.shared.modelPickerPromptShortcutEnabled)
+        #expect(AppConfigStore.shared.modelPickerWorldbookShortcutEnabled)
+        let snapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+        #expect(snapshot[promptKey.rawValue] as? Bool == true)
+        #expect(snapshot[worldbookKey.rawValue] as? Bool == true)
+    }
+
+    @Test("模型分组文件夹首次默认收起且展开状态仅保存在本机")
+    func modelPickerFolderExpansionDefaultsToLocalEmptyState() {
+        #expect(AppConfigKey.iOSModelPickerExpandedGroupIDs.defaultValue == .text("[]"))
+        #expect(AppConfigKey.watchModelPickerExpandedGroupIDs.defaultValue == .text("[]"))
+        #expect(AppConfigKey.iOSModelPickerExpandedGroupIDs.participatesInSync == false)
+        #expect(AppConfigKey.watchModelPickerExpandedGroupIDs.participatesInSync == false)
+    }
+
+    @Test("液态玻璃底色默认兼顾透明感与复杂背景可读性")
+    func liquidGlassTintDefaultsAndClamps() {
+        #expect(AppConfigKey.liquidGlassTintOpacity.defaultValue == .real(0.3))
+        #expect(AppConfigKey.liquidGlassTintOpacity.participatesInSync)
+        #expect(LiquidGlassTintSetting.normalized(.nan) == LiquidGlassTintSetting.defaultOpacity)
+        #expect(LiquidGlassTintSetting.normalized(-1) == LiquidGlassTintSetting.minimumOpacity)
+        #expect(LiquidGlassTintSetting.normalized(1) == LiquidGlassTintSetting.maximumOpacity)
+    }
+
     @Test("AppConfig 迁移标记已存在时仍补写缺失的专用模型键")
     @MainActor
     func testAppConfigBootstrapBackfillsMissingSpecializedModelKey() async throws {
+        await AppConfigStore.shared.waitForPersistentStoreLoaded()
         let suiteName = "AppConfigBackfill-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         let key = AppConfigKey.titleGenerationModelIdentifier
@@ -82,6 +169,42 @@ extension PersistenceTests {
         #expect(Persistence.readAppConfigText(key: key.rawValue) == legacyIdentifier)
     }
 
+    @Test("延迟发送秒数默认立即发送且会归一化负值")
+    @MainActor
+    func testChatSendDelaySecondsDefaultAndNormalization() {
+        let key = AppConfigKey.chatSendDelaySeconds
+        let previousSnapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+
+        defer {
+            AppConfigStore.shared.apply(snapshot: previousSnapshot)
+        }
+
+        #expect(key.defaultValue == .real(0.0))
+
+        AppConfigStore.shared.apply(snapshot: [key.rawValue: -0.5])
+
+        #expect(AppConfigStore.shared.chatSendDelaySeconds == 0)
+        #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Double == 0)
+    }
+
+    @Test("OpenAI 尾部上下文默认使用 system 角色并支持配置快照")
+    @MainActor
+    func testOpenAITailContextSystemRoleDefaultAndPersistence() {
+        let key = AppConfigKey.openAITailContextUsesSystemRole
+        let previousSnapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+
+        defer {
+            AppConfigStore.shared.apply(snapshot: previousSnapshot)
+        }
+
+        #expect(key.defaultValue == .bool(true))
+
+        AppConfigStore.shared.apply(snapshot: [key.rawValue: false])
+
+        #expect(AppConfigStore.shared.openAITailContextUsesSystemRole == false)
+        #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Bool == false)
+    }
+
     private func restoreAppConfigValue(_ value: Any, for key: AppConfigKey) {
         switch key.defaultValue {
         case .bool:
@@ -100,7 +223,7 @@ extension PersistenceTests {
     }
 
     private var providersDirectory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        StorageUtility.documentsDirectory
             .appendingPathComponent("Providers")
     }
 
@@ -276,8 +399,9 @@ extension PersistenceTests {
                     Date().timeIntervalSince1970
                 ]
             )
+            return true
         }
-        #expect(inserted != nil)
+        #expect(inserted == true)
         defer {
             if let loaded = ConfigLoader.loadProviders().first(where: { $0.id == providerID }) {
                 ConfigLoader.deleteProvider(loaded)
@@ -316,6 +440,7 @@ extension PersistenceTests {
 
     @Test("加载旧版无 apiKeys 字段的 Provider 文件时会迁移到 SQLite")
     func testLoadProvidersMigratesLegacyCredentialStoreToSQLite() throws {
+        #expect(ConfigLoader.saveProvidersToSQLite([]))
         let provider = Provider(
             id: UUID(),
             name: "legacy-\(UUID().uuidString)",
@@ -344,6 +469,7 @@ extension PersistenceTests {
 
     @Test("加载提供商时会修复重复 ID 并规范化文件")
     func testLoadProvidersRepairDuplicateIDsAndNormalizeFiles() throws {
+        #expect(ConfigLoader.saveProvidersToSQLite([]))
         let token = "repair-\(UUID().uuidString)"
         let duplicateProviderID = UUID()
         let duplicateModelID = UUID()
@@ -370,6 +496,12 @@ extension PersistenceTests {
 
         let rawFileA = "\(token)-manual-a.json"
         let rawFileB = "\(token)-manual-b.json"
+        defer {
+            let createdProviders = ConfigLoader.loadProviders().filter { $0.name.hasPrefix(token) }
+            cleanup(providers: createdProviders)
+            try? FileManager.default.removeItem(at: providersDirectory.appendingPathComponent(rawFileA))
+            try? FileManager.default.removeItem(at: providersDirectory.appendingPathComponent(rawFileB))
+        }
 
         try writeLegacyProviderFile(providerA, fileName: rawFileA)
         try writeLegacyProviderFile(providerB, fileName: rawFileB)
@@ -393,8 +525,5 @@ extension PersistenceTests {
         #expect(secondLoad.count == 2)
         #expect(Set(secondLoad.map(\.id)).count == 2)
 
-        cleanup(providers: secondLoad)
-        try? FileManager.default.removeItem(at: providersDirectory.appendingPathComponent(rawFileA))
-        try? FileManager.default.removeItem(at: providersDirectory.appendingPathComponent(rawFileB))
     }
 }

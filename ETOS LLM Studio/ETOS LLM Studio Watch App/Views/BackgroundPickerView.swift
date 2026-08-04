@@ -311,7 +311,7 @@ private struct WatchBackgroundDownloadProgressView: View {
                 Text(NSLocalizedString("正在下载并导入...", comment: ""))
                 Spacer()
                 if let progress, progress.totalBytes > 0 {
-                    Text(String(format: "%.0f%%", progress.fractionCompleted * 100))
+                    Text(String(format: "%d%%", progress.displayPercentage))
                         .monospacedDigit()
                 } else {
                     ProgressView()
@@ -325,8 +325,8 @@ private struct WatchBackgroundDownloadProgressView: View {
                 Text(
                     String(
                         format: NSLocalizedString("已下载 %@ / %@", comment: ""),
-                        StorageUtility.formatSize(progress.bytesReceived),
-                        StorageUtility.formatSize(progress.totalBytes)
+                        StorageUtility.formatTransferSize(progress.bytesReceived),
+                        StorageUtility.formatTransferSize(progress.totalBytes)
                     )
                 )
                 .etFont(.caption2)

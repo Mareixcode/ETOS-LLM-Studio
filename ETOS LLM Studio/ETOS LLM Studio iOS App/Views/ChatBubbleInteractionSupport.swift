@@ -67,6 +67,7 @@ extension ChatBubble {
                     usesNoBubbleStyle: usesNoBubbleStyle,
                     isShimmering: shouldShimmerReasoningHeader,
                     customTextColor: customTextColorOverride,
+                    customTextStyleColors: customTextStyleColors,
                     previewMaxHeight: reasoningPreviewMaxHeight,
                     enableMarkdown: enableMarkdown,
                     enableAdvancedRenderer: enableAdvancedRenderer,
@@ -171,6 +172,7 @@ extension ChatBubble {
                             suppressContentRender: shouldSuppressReasoningContentRender,
                             isShimmering: shouldShimmerReasoningHeader,
                             customTextColor: customTextColorOverride,
+                            customTextStyleColors: customTextStyleColors,
                             previewMaxHeight: reasoningPreviewMaxHeight,
                             usesNoBubbleStyle: usesNoBubbleStyle,
                             enableMarkdown: enableMarkdown,
@@ -352,6 +354,9 @@ extension ChatBubble {
               let request = toolPermissionCenter.activeRequest else {
             return nil
         }
+        if let toolCallID = request.toolCallID {
+            return call.id == toolCallID ? request : nil
+        }
         let trimmedArgs = request.arguments.trimmingCharacters(in: .whitespacesAndNewlines)
         let callArgs = call.arguments.trimmingCharacters(in: .whitespacesAndNewlines)
         let isMatch = call.toolName == request.toolName && callArgs == trimmedArgs
@@ -364,7 +369,24 @@ extension ChatBubble {
         return "\(message.id.uuidString)#\(callIDs)#\(activeRequestID)"
     }
 
+    var chatBubbleLocalPresentationBlockerID: String {
+        "ios.chat.bubble-presentation.\(messageState.message.id.uuidString)"
+    }
+
+    var hasChatBubbleLocalPresentation: Bool {
+        imagePreview != nil || filePreview != nil || selectedToolCallDetailSheetItem != nil
+    }
+
+    func setChatBubbleLocalPresentationBlocked(_ blocked: Bool) {
+        toolPermissionCenter.setAutoPresentationBlocked(blocked, reason: chatBubbleLocalPresentationBlockerID)
+    }
+
+    func refreshChatBubbleLocalPresentationBlocker() {
+        setChatBubbleLocalPresentationBlocked(hasChatBubbleLocalPresentation)
+    }
+
     func autoPresentPendingToolCallIfNeeded() {
+        guard toolPermissionCenter.canAutoPresentRequestDetails else { return }
         guard selectedToolCallDetailSheetItem == nil else { return }
         guard let pendingCall = pendingToolCallForAutoPresentation else { return }
         markPendingToolCallAutoOpened(pendingCall.id)

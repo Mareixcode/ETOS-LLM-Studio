@@ -32,13 +32,47 @@ extension ChatService {
         periodicTimeLandmarkIntervalMinutes: Int,
         enableResponseSpeedMetrics: Bool,
         requestStartedAt: Date,
-        requestLogContext: RequestLogContext
+        requestLogContext: RequestLogContext,
+        responsesFullInputFallbackRequest: URLRequest? = nil
     ) async {
         var latestTokenUsage: MessageTokenUsage?
         var trailingUnparsedResponseBody = ""
         var trailingUnparsedHTTPStatusCode: Int?
         var messages = messagesSnapshot(for: currentSessionID)
         var streamingPublishCoalescer = StreamingUIPublishCoalescer.platformDefault()
+        let shouldRecordRequestLog = AppConfigStore.boolValue(for: .requestLogEnabled)
+        let shouldCaptureRawStreamingResponse = RequestLogCapturePolicy.shouldCaptureStreamingBody(
+            requestLogEnabled: shouldRecordRequestLog,
+            plainMessageEnabled: AppConfigStore.boolValue(for: .requestLogPlainMessageEnabled)
+        )
+        var rawStreamingResponseLines: [String]? = shouldCaptureRawStreamingResponse ? [] : nil
+        var streamingResponseByteCount = 0
+        var hasReceivedStreamingLine = false
+        let streamingSignpost = TelemetrySignpost.begin(
+            .streamingResponseProcessing,
+            correlatingWith: requestLogContext.requestID
+        )
+        defer {
+            TelemetrySignpost.end(streamingSignpost)
+        }
+
+        func rawStreamingResponseBody() -> String {
+            rawStreamingResponseLines?.joined(separator: "\n") ?? ""
+        }
+
+        func logCapturedStreamingResponse(isPartial: Bool = false, httpStatusCode: Int? = nil) {
+            guard shouldRecordRequestLog, streamingResponseByteCount > 0 else { return }
+            logResponseBodySnapshot(
+                context: requestLogContext,
+                request: request,
+                body: rawStreamingResponseBody(),
+                byteCount: streamingResponseByteCount,
+                httpStatusCode: httpStatusCode,
+                isPartial: isPartial,
+                hasCapturedStreamingBody: rawStreamingResponseLines != nil
+            )
+        }
+
         do {
             let bytes = try await streamData(for: request, provider: provider)
 
@@ -61,6 +95,17 @@ extension ChatService {
             var finalResponseCompletedAtForLog: Date?
 
             for try await line in bytes.lines {
+                if shouldRecordRequestLog {
+                    if hasReceivedStreamingLine {
+                        streamingResponseByteCount += 1
+                    }
+                    streamingResponseByteCount += line.lengthOfBytes(using: .utf8)
+                    hasReceivedStreamingLine = true
+                }
+                if shouldCaptureRawStreamingResponse {
+                    rawStreamingResponseLines?.append(line)
+                }
+
                 guard let part = adapter.parseStreamingResponse(line: line) else {
                     updateTrailingUnparsedStreamingResponse(
                         with: line,
@@ -148,6 +193,12 @@ extension ChatService {
                             incoming: reasoningProviderSpecificFields
                         )
                     }
+                    if let providerResponseMetadata = part.providerResponseMetadata {
+                        messages[index].providerResponseMetadata = mergeProviderResponseMetadata(
+                            existing: messages[index].providerResponseMetadata,
+                            incoming: providerResponseMetadata
+                        )
+                    }
                     if let toolDeltas = part.toolCallDeltas, !toolDeltas.isEmpty {
                         didReceiveGeneratedDelta = true
                         for delta in toolDeltas {
@@ -168,9 +219,16 @@ extension ChatService {
                             var builder = toolCallBuilders[resolvedIndex] ?? (id: nil, name: nil, arguments: "", providerSpecificFields: nil)
                             if let id = delta.id { builder.id = id }
                             if let nameFragment = delta.nameFragment, !nameFragment.isEmpty { builder.name = nameFragment }
-                            if let argsFragment = delta.argumentsFragment, !argsFragment.isEmpty { builder.arguments += argsFragment }
+                            if let argumentsReplacement = delta.argumentsReplacement {
+                                builder.arguments = argumentsReplacement
+                            } else if let argsFragment = delta.argumentsFragment, !argsFragment.isEmpty {
+                                builder.arguments += argsFragment
+                            }
                             if let providerSpecificFields = delta.providerSpecificFields, !providerSpecificFields.isEmpty {
-                                builder.providerSpecificFields = providerSpecificFields
+                                builder.providerSpecificFields = mergeProviderResponseMetadata(
+                                    existing: builder.providerSpecificFields,
+                                    incoming: providerSpecificFields
+                                )
                             }
                             toolCallBuilders[resolvedIndex] = builder
                             if !toolCallOrder.contains(resolvedIndex) {
@@ -256,6 +314,7 @@ extension ChatService {
                 body: trailingUnparsedResponseBody,
                 fallbackHTTPStatusCode: trailingUnparsedHTTPStatusCode
             ) {
+                logCapturedStreamingResponse(isPartial: true, httpStatusCode: unparsedError.httpStatusCode)
                 messages = flushPendingStreamingMessages(
                     messages,
                     loadingMessageID: loadingMessageID,
@@ -363,6 +422,12 @@ extension ChatService {
                         speedSamples: enableResponseSpeedMetrics && !speedSamples.isEmpty ? speedSamples : nil
                     )
                 }
+                finalizeResponsesGeneratedImages(in: &messages[index])
+                attachOpenAIResponsesRequestMetadata(
+                    to: &messages[index],
+                    request: request,
+                    messagesBeforeResponse: messages
+                )
                 attachCostEstimateIfPossible(to: &messages[index], using: requestLogContext)
                 finalAssistantMessage = messages[index]
                 messages = persistAndPublishStreamingMessages(
@@ -374,6 +439,7 @@ extension ChatService {
 
             if let finalAssistantMessage = finalAssistantMessage {
                 let finishedAt = finalResponseCompletedAtForLog ?? finalAssistantMessage.responseMetrics?.responseCompletedAt ?? Date()
+                logCapturedStreamingResponse()
                 persistRequestLog(
                     context: requestLogContext,
                     status: .success,
@@ -391,6 +457,7 @@ extension ChatService {
                     aiTopP: aiTopP,
                     systemPrompt: systemPrompt,
                     maxChatHistory: maxChatHistory,
+                    enableStreaming: true,
                     enableMemory: enableMemory,
                     enableMemoryWrite: enableMemoryWrite,
                     enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
@@ -400,6 +467,7 @@ extension ChatService {
                     periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes
                 )
             } else {
+                logCapturedStreamingResponse()
                 persistRequestLog(
                     context: requestLogContext,
                     status: .success,
@@ -410,6 +478,7 @@ extension ChatService {
             }
         } catch is CancellationError {
             logger.info("流式请求在处理中被取消。")
+            logCapturedStreamingResponse(isPartial: true)
             messages = flushPendingStreamingMessages(
                 messages,
                 loadingMessageID: loadingMessageID,
@@ -436,6 +505,42 @@ extension ChatService {
             } else {
                 bodySnippet = NSLocalizedString("响应体为空。", comment: "Empty response body")
             }
+            logResponseBodySnapshot(
+                context: requestLogContext,
+                request: request,
+                bodyData: bodyData,
+                httpStatusCode: code
+            )
+            if let fallbackRequest = responsesFullInputFallbackRequest,
+               isOpenAIResponsesPreviousResponseMissing(statusCode: code, bodyData: bodyData) {
+                logger.info("Responses previous_response_id 已失效，正在改用完整 input 重试。")
+                await handleStreamedResponse(
+                    request: fallbackRequest,
+                    provider: provider,
+                    adapter: adapter,
+                    loadingMessageID: loadingMessageID,
+                    currentSessionID: currentSessionID,
+                    userMessage: userMessage,
+                    wasTemporarySession: wasTemporarySession,
+                    aiTemperature: aiTemperature,
+                    aiTopP: aiTopP,
+                    systemPrompt: systemPrompt,
+                    maxChatHistory: maxChatHistory,
+                    availableTools: availableTools,
+                    enableMemory: enableMemory,
+                    enableMemoryWrite: enableMemoryWrite,
+                    enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
+                    includeSystemTime: includeSystemTime,
+                    systemTimeInjectionPosition: systemTimeInjectionPosition,
+                    enablePeriodicTimeLandmark: enablePeriodicTimeLandmark,
+                    periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
+                    enableResponseSpeedMetrics: enableResponseSpeedMetrics,
+                    requestStartedAt: requestStartedAt,
+                    requestLogContext: requestLogContext,
+                    responsesFullInputFallbackRequest: nil
+                )
+                return
+            }
             messages = flushPendingStreamingMessages(
                 messages,
                 loadingMessageID: loadingMessageID,
@@ -455,6 +560,7 @@ extension ChatService {
         } catch {
             if isCancellationError(error) {
                 logger.info("流式请求在处理中被取消 (URLError)。")
+                logCapturedStreamingResponse(isPartial: true)
                 messages = flushPendingStreamingMessages(
                     messages,
                     loadingMessageID: loadingMessageID,
@@ -474,6 +580,7 @@ extension ChatService {
                     body: trailingUnparsedResponseBody,
                     fallbackHTTPStatusCode: trailingUnparsedHTTPStatusCode
                 ) {
+                    logCapturedStreamingResponse(isPartial: true, httpStatusCode: unparsedError.httpStatusCode)
                     messages = flushPendingStreamingMessages(
                         messages,
                         loadingMessageID: loadingMessageID,
@@ -495,6 +602,7 @@ extension ChatService {
                         errorKind: "streaming_unparsed_error_response"
                     )
                 } else {
+                    logCapturedStreamingResponse(isPartial: true)
                     messages = flushPendingStreamingMessages(
                         messages,
                         loadingMessageID: loadingMessageID,
@@ -530,6 +638,7 @@ extension ChatService {
         aiTopP: Double,
         systemPrompt: String,
         maxChatHistory: Int,
+        enableStreaming: Bool = false,
         enableMemory: Bool,
         enableMemoryWrite: Bool,
         enableMemoryActiveRetrieval: Bool = false,
@@ -558,6 +667,10 @@ extension ChatService {
         }
         ensureReasoningTimingIfNeeded(for: &responseMessage)
 
+        if enableStreaming {
+            finalizeResponsesGeneratedImages(in: &responseMessage)
+        }
+
         let inlineImageExtraction = await extractInlineImagesFromMarkdown(responseMessage.content)
         if !inlineImageExtraction.imageFileNames.isEmpty {
             responseMessage.content = inlineImageExtraction.cleanedContent
@@ -582,6 +695,7 @@ extension ChatService {
             updateMessage(with: responseMessage, for: loadingMessageID, in: currentSessionID)
             scheduleReasoningSummaryIfNeeded(for: loadingMessageID, in: currentSessionID)
             scheduleConversationMemoryUpdateIfNeeded(for: currentSessionID, enableMemory: enableMemory)
+            scheduleLongTermMemoryConsolidationIfNeeded(for: currentSessionID, enableMemory: enableMemory)
             emitSessionRequestStatus(.finished, sessionID: currentSessionID)
             return
         }
@@ -613,7 +727,7 @@ extension ChatService {
         if !blockingCalls.isEmpty {
             logger.info("正在执行 \(blockingCalls.count) 个阻塞式工具，即将进入二次调用流程...")
             for toolCall in blockingCalls {
-                let outcome = await handleToolCall(toolCall)
+                let outcome = await handleToolCall(toolCall, sessionID: currentSessionID)
                 if let toolResult = outcome.toolResult {
                     await attachToolResult(toolResult, to: toolCall.id, toolName: toolCall.toolName, loadingMessageID: toolCallMessageID, sessionID: currentSessionID)
                 }
@@ -645,7 +759,7 @@ extension ChatService {
                 logger.info("在后台启动 \(nonBlockingCalls.count) 个非阻塞式工具...")
                 Task {
                     for toolCall in nonBlockingCalls {
-                        let outcome = await handleToolCall(toolCall)
+                        let outcome = await handleToolCall(toolCall, sessionID: currentSessionID)
                         if let toolResult = outcome.toolResult {
                             await attachToolResult(toolResult, to: toolCall.id, toolName: toolCall.toolName, loadingMessageID: toolCallMessageID, sessionID: currentSessionID)
                         }
@@ -664,7 +778,7 @@ extension ChatService {
             } else {
                 logger.info("非阻塞式工具返回但没有正文，将等待工具执行结果再发起二次调用。")
                 for toolCall in nonBlockingCalls {
-                    let outcome = await handleToolCall(toolCall)
+                    let outcome = await handleToolCall(toolCall, sessionID: currentSessionID)
                     if let toolResult = outcome.toolResult {
                         await attachToolResult(toolResult, to: toolCall.id, toolName: toolCall.toolName, loadingMessageID: toolCallMessageID, sessionID: currentSessionID)
                     }
@@ -715,7 +829,7 @@ extension ChatService {
                 messages: updatedMessages, loadingMessageID: followUpLoadingMessage.id, currentSessionID: currentSessionID,
                 userMessage: userMessage, wasTemporarySession: wasTemporarySession, aiTemperature: aiTemperature,
                 aiTopP: aiTopP, systemPrompt: systemPrompt, maxChatHistory: maxChatHistory,
-                enableStreaming: false, enhancedPrompt: nil, tools: availableTools, enableMemory: enableMemory, enableMemoryWrite: enableMemoryWrite,
+                enableStreaming: enableStreaming, enhancedPrompt: nil, tools: availableTools, enableMemory: enableMemory, enableMemoryWrite: enableMemoryWrite,
                 enableMemoryActiveRetrieval: enableMemoryActiveRetrieval,
                 includeSystemTime: includeSystemTime,
                 systemTimeInjectionPosition: systemTimeInjectionPosition,
@@ -723,10 +837,12 @@ extension ChatService {
                 periodicTimeLandmarkIntervalMinutes: periodicTimeLandmarkIntervalMinutes,
                 enableResponseSpeedMetrics: false,
                 currentAudioAttachment: nil,
+                currentImageAttachments: [],
                 currentFileAttachments: []
             )
         } else {
             scheduleConversationMemoryUpdateIfNeeded(for: currentSessionID, enableMemory: enableMemory)
+            scheduleLongTermMemoryConsolidationIfNeeded(for: currentSessionID, enableMemory: enableMemory)
             emitSessionRequestStatus(.finished, sessionID: currentSessionID)
         }
     }

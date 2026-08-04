@@ -219,10 +219,19 @@ public class AnthropicAdapter: APIAdapter {
                         "tool_use_id": toolCall.id,
                         "content": msg.content
                     ]
-                    anthropicMessages.append([
-                        "role": "user",
-                        "content": [toolResultBlock]
-                    ])
+                    // Anthropic 要求同一轮并行调用的所有结果位于紧随其后的同一条 user 消息中。
+                    if let lastIndex = anthropicMessages.indices.last,
+                       anthropicMessages[lastIndex]["role"] as? String == "user",
+                       var contentBlocks = anthropicMessages[lastIndex]["content"] as? [[String: Any]],
+                       contentBlocks.allSatisfy({ $0["type"] as? String == "tool_result" }) {
+                        contentBlocks.append(toolResultBlock)
+                        anthropicMessages[lastIndex]["content"] = contentBlocks
+                    } else {
+                        anthropicMessages.append([
+                            "role": "user",
+                            "content": [toolResultBlock]
+                        ])
+                    }
                 }
                 continue
             default:
@@ -362,24 +371,24 @@ public class AnthropicAdapter: APIAdapter {
         }
         
         if let tools = tools, !tools.isEmpty {
-            let anthropicTools = tools.map { tool -> [String: Any] in
+            let anthropicTools = stableToolDefinitions(tools) { self.sanitizedToolName($0) }.map { tool -> [String: Any] in
                 var toolDef: [String: Any] = [
                     "name": sanitizedToolName(tool.name),
                     "description": tool.description
                 ]
                 if let params = tool.parameters.toAny() as? [String: Any] {
-                    toolDef["input_schema"] = params
+                    toolDef["input_schema"] = stableJSONSchemaValueForTransport(params)
                 }
                 return toolDef
             }
             payload["tools"] = anthropicTools
         }
+
+        payload = mergedRequestPayload(payload, with: passthroughAnthropicRequestOverrides(overrides))
         
         do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
-            if let httpBody = request.httpBody, let jsonString = String(data: httpBody, encoding: .utf8) {
-                logger.debug("构建的 Anthropic 聊天请求体:\n---\n\(jsonString)\n---")
-            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            logger.debug("已构建 Anthropic 聊天请求体，共 \(request.httpBody?.count ?? 0) 字节。")
             logChatRequestSnapshot(adapterName: "Anthropic", request: request, payload: payload)
         } catch {
             logger.error("构建聊天请求失败: JSON 序列化错误 - \(error.localizedDescription)")
@@ -387,6 +396,10 @@ public class AnthropicAdapter: APIAdapter {
         }
         
         return request
+    }
+
+    private func passthroughAnthropicRequestOverrides(_ overrides: [String: Any]) -> [String: Any] {
+        overrides.filter { $0.key != "thinking_budget" }
     }
     
     public func buildModelListRequest(for provider: Provider) -> URLRequest? {
@@ -413,7 +426,14 @@ public class AnthropicAdapter: APIAdapter {
     public func parseModelListResponse(data: Data) throws -> [Model] {
         if let errorEnvelope = try? JSONDecoder().decode(AnthropicErrorEnvelope.self, from: data),
            let error = errorEnvelope.error {
-            throw NSError(domain: "AnthropicAPIError", code: -1, userInfo: [NSLocalizedDescriptionKey: error.message ?? "未知错误"])
+            throw NSError(
+                domain: "AnthropicAPIError",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: error.message
+                        ?? NSLocalizedString("未知错误", comment: "Generic unknown error")
+                ]
+            )
         }
 
         let response = try JSONDecoder().decode(AnthropicModelListResponse.self, from: data)
@@ -430,7 +450,14 @@ public class AnthropicAdapter: APIAdapter {
         let apiResponse = try JSONDecoder().decode(AnthropicResponse.self, from: data)
         
         if let error = apiResponse.error {
-            throw NSError(domain: "AnthropicAPIError", code: -1, userInfo: [NSLocalizedDescriptionKey: error.message ?? "未知错误"])
+            throw NSError(
+                domain: "AnthropicAPIError",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: error.message
+                        ?? NSLocalizedString("未知错误", comment: "Generic unknown error")
+                ]
+            )
         }
         
         guard let contentBlocks = apiResponse.content else {

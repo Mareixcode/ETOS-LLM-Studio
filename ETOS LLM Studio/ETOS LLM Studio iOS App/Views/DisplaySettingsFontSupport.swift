@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Foundation
+import Combine
 import ETOSCore
 import UniformTypeIdentifiers
 
@@ -36,6 +37,11 @@ struct FontSettingsView: View {
         nonmutating set { appConfig.fontCustomScale = newValue }
     }
 
+    private var lineSpacingEm: Double {
+        get { appConfig.fontLineSpacingEmIOS }
+        nonmutating set { appConfig.fontLineSpacingEmIOS = newValue }
+    }
+
     var body: some View {
         Form {
             Section {
@@ -56,10 +62,12 @@ struct FontSettingsView: View {
             }
 
             fontScaleSection
+            lineSpacingSection
             fallbackScopeSection
 
             fontFilesSection
             stylePrioritySection
+            textFontRulesSection
             previewSection
         }
         .navigationTitle(NSLocalizedString("字体设置", comment: ""))
@@ -68,14 +76,17 @@ struct FontSettingsView: View {
         }
         .onAppear {
             reloadData()
-            FontLibrary.registerAllFontsIfNeeded()
+            FontLibrary.preloadRuntimeCacheAsync(forceReload: true)
         }
-        .onReceive(NotificationCenter.default.publisher(for: .syncFontsUpdated)) { _ in
+        .onReceive(
+            NotificationCenter.default.publisher(for: .syncFontsUpdated)
+                .receive(on: DispatchQueue.main)
+        ) { _ in
             reloadData()
         }
         .onChange(of: isCustomFontEnabled) { _, isEnabled in
             if isEnabled {
-                FontLibrary.registerAllFontsIfNeeded()
+                FontLibrary.preloadRuntimeCacheAsync(forceReload: true)
             }
             NotificationCenter.default.post(name: .syncFontsUpdated, object: nil)
         }
@@ -194,6 +205,23 @@ struct FontSettingsView: View {
         )
     }
 
+    private var lineSpacingBinding: Binding<Double> {
+        Binding(
+            get: {
+                FontLibrary.normalizedLineSpacingEm(
+                    lineSpacingEm,
+                    fallback: FontLibrary.defaultIOSLineSpacingEm
+                )
+            },
+            set: {
+                lineSpacingEm = FontLibrary.normalizedLineSpacingEm(
+                    $0,
+                    fallback: FontLibrary.defaultIOSLineSpacingEm
+                )
+            }
+        )
+    }
+
     private var allFallbackScopes: [FontFallbackScope] {
         FontFallbackScope.allCases
     }
@@ -222,6 +250,40 @@ struct FontSettingsView: View {
             Text(NSLocalizedString("字体大小", comment: ""))
         } footer: {
             Text(NSLocalizedString("仅调整自定义字体的显示大小，范围为 50% 到 200%；系统动态字号仍会继续生效。", comment: ""))
+                .etFont(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var lineSpacingSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(NSLocalizedString("聊天正文行距", comment: ""))
+                    Spacer(minLength: 8)
+                    Text(
+                        String(
+                            format: NSLocalizedString("%.3f em", comment: "Chat text line spacing value"),
+                            lineSpacingBinding.wrappedValue
+                        )
+                    )
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Slider(
+                    value: lineSpacingBinding,
+                    in: FontLibrary.minimumLineSpacingEm...FontLibrary.maximumLineSpacingEm,
+                    step: FontLibrary.lineSpacingStepEm
+                )
+            }
+            Button(NSLocalizedString("恢复默认行距", comment: "")) {
+                lineSpacingBinding.wrappedValue = FontLibrary.defaultIOSLineSpacingEm
+            }
+            .disabled(abs(lineSpacingBinding.wrappedValue - FontLibrary.defaultIOSLineSpacingEm) < 0.001)
+        } header: {
+            Text(NSLocalizedString("行距", comment: ""))
+        } footer: {
+            Text(NSLocalizedString("控制聊天正文多行文字的额外行距，范围为 0.00 em 到 1.00 em；默认 0.20 em。", comment: ""))
                 .etFont(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -340,10 +402,13 @@ struct FontSettingsView: View {
 
     private var previewSection: some View {
         Section(NSLocalizedString("预览", comment: "")) {
-            Text(NSLocalizedString("The quick brown fox jumps over the lazy dog.", comment: "Font preview sample"))
-                .font(FontRoutePreview.font(for: .body, sample: "The quick brown fox"))
-            Text(NSLocalizedString("中文：风来疏竹，风过而竹不留声。", comment: ""))
-                .font(FontRoutePreview.font(for: .body, sample: "风来疏竹，风过而竹不留声。"))
+            (
+                Text(NSLocalizedString("The quick brown fox jumps over the lazy dog.", comment: "Font preview sample"))
+                    + Text(verbatim: "\n")
+                    + Text(NSLocalizedString("中文：风来疏竹，风过而竹不留声。", comment: ""))
+            )
+                .font(FontRoutePreview.font(for: .body, sample: "The quick brown fox 风来疏竹"))
+                .lineSpacing(previewLineSpacing)
             Text(NSLocalizedString("斜体预览 / Emphasis", comment: ""))
                 .font(FontRoutePreview.font(for: .emphasis, sample: "斜体预览 Emphasis"))
                 .italic()
@@ -353,6 +418,49 @@ struct FontSettingsView: View {
             Text(NSLocalizedString("let message = \"Code Preview\"", comment: "Font preview code sample"))
                 .font(FontRoutePreview.font(for: .code, sample: "let message = \"Code Preview\""))
         }
+    }
+
+    private var textFontRulesSection: some View {
+        Section {
+            ForEach(routes.customTextRules) { rule in
+                NavigationLink {
+                    ChatTextFontRuleEditorView(
+                        initialRule: rule,
+                        assets: assets,
+                        onSave: saveTextFontRule
+                    )
+                } label: {
+                    ChatTextFontRuleRow(rule: rule, assets: assets)
+                }
+            }
+            .onDelete(perform: deleteTextFontRules)
+            .onMove(perform: moveTextFontRules)
+
+            Button {
+                addTextFontRule()
+            } label: {
+                Label(NSLocalizedString("添加字体规则", comment: ""), systemImage: "plus")
+            }
+            .disabled(assets.isEmpty)
+        } header: {
+            Text(NSLocalizedString("指定内容字体", comment: ""))
+        } footer: {
+            Text(NSLocalizedString("规则按从上到下的顺序匹配；靠前规则优先。命中内容使用规则内部的字体优先级，其他内容继续使用外层全局字体。", comment: ""))
+                .etFont(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var previewLineSpacing: CGFloat {
+        CGFloat(
+            FontLibrary.lineSpacingPoints(
+                basePointSize: 17,
+                lineSpacingEm: lineSpacingBinding.wrappedValue,
+                fontScale: customFontScale,
+                isCustomFontEnabled: isCustomFontEnabled,
+                fallbackLineSpacingEm: FontLibrary.defaultIOSLineSpacingEm
+            )
+        )
     }
 
     private var supportedFontTypes: [UTType] {
@@ -420,6 +528,43 @@ struct FontSettingsView: View {
         routes.setChain(chain, for: selectedRole)
         FontLibrary.updateChain(chain, for: selectedRole)
         NotificationCenter.default.post(name: .syncFontsUpdated, object: nil)
+    }
+
+    private func addTextFontRule() {
+        let assetIDs = Set(assets.map(\.id))
+        let inheritedChain = routes.body.filter { assetIDs.contains($0) }
+        routes.customTextRules.append(
+            ChatAppearanceTextFontRule(
+                fontAssetIDs: inheritedChain.isEmpty ? assets.map(\.id) : inheritedChain
+            )
+        )
+        persistTextFontRules()
+    }
+
+    private func saveTextFontRule(_ rule: ChatAppearanceTextFontRule) {
+        guard let index = routes.customTextRules.firstIndex(where: { $0.id == rule.id }) else {
+            return
+        }
+        routes.customTextRules[index] = rule
+        persistTextFontRules()
+    }
+
+    private func deleteTextFontRules(at offsets: IndexSet) {
+        routes.customTextRules.remove(atOffsets: offsets)
+        persistTextFontRules()
+    }
+
+    private func moveTextFontRules(from source: IndexSet, to destination: Int) {
+        routes.customTextRules.move(fromOffsets: source, toOffset: destination)
+        persistTextFontRules()
+    }
+
+    private func persistTextFontRules() {
+        let rules = routes.customTextRules
+        Task {
+            await FontLibrary.updateCustomTextRulesInBackground(rules)
+            NotificationCenter.default.post(name: .syncFontsUpdated, object: nil)
+        }
     }
 
     private func deleteAssets(at offsets: IndexSet) {

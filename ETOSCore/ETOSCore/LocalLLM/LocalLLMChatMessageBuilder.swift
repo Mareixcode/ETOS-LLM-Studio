@@ -9,12 +9,15 @@
 import Foundation
 
 public struct LocalLLMChatMessage: Hashable, Sendable {
+    public static let mediaMarker = "<__media__>"
+
     public var role: String
     public var content: String
     public var reasoningContent: String?
     public var name: String?
     public var toolCallID: String?
     public var toolCallsJSON: String?
+    public var mediaAttachments: [LocalLLMMediaAttachment]
 
     public init(
         role: String,
@@ -22,7 +25,8 @@ public struct LocalLLMChatMessage: Hashable, Sendable {
         reasoningContent: String? = nil,
         name: String? = nil,
         toolCallID: String? = nil,
-        toolCallsJSON: String? = nil
+        toolCallsJSON: String? = nil,
+        mediaAttachments: [LocalLLMMediaAttachment] = []
     ) {
         self.role = role
         self.content = content
@@ -30,6 +34,7 @@ public struct LocalLLMChatMessage: Hashable, Sendable {
         self.name = name
         self.toolCallID = toolCallID
         self.toolCallsJSON = toolCallsJSON
+        self.mediaAttachments = mediaAttachments
     }
 }
 
@@ -46,72 +51,90 @@ public struct LocalLLMToolDefinition: Hashable, Sendable {
 }
 
 public enum LocalLLMChatMessageBuilder {
-    public static func messages(from messages: [ChatMessage]) -> [LocalLLMChatMessage] {
+    public static func messages(
+        from messages: [ChatMessage],
+        imageAttachments: [UUID: [ImageAttachment]] = [:]
+    ) -> [LocalLLMChatMessage] {
         messages.compactMap { message in
             let role = roleName(for: message.role)
-            let content = content(for: message).trimmingCharacters(in: .whitespacesAndNewlines)
+            let localMediaAttachments = mediaAttachmentsForMessage(message, imageAttachments: imageAttachments)
+            let content = contentWithMediaMarkers(
+                content(for: message).trimmingCharacters(in: .whitespacesAndNewlines),
+                mediaCount: localMediaAttachments.count
+            )
             let reasoningContent = message.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines)
             let toolCallsJSON = toolCallsJSON(for: message)
-            guard !content.isEmpty || reasoningContent?.isEmpty == false || toolCallsJSON != nil else { return nil }
+            guard !content.isEmpty || reasoningContent?.isEmpty == false || toolCallsJSON != nil || !localMediaAttachments.isEmpty else { return nil }
             return LocalLLMChatMessage(
                 role: role,
                 content: content,
                 reasoningContent: reasoningContent,
                 name: toolName(for: message),
                 toolCallID: toolCallID(for: message),
-                toolCallsJSON: toolCallsJSON
+                toolCallsJSON: toolCallsJSON,
+                mediaAttachments: localMediaAttachments
             )
         }
     }
 
-    public static func templateCompatibleMessages(from messages: [ChatMessage]) -> [LocalLLMChatMessage] {
-        templateCompatibleMessages(Self.messages(from: messages))
+    public static func templateCompatibleMessages(
+        from messages: [ChatMessage],
+        imageAttachments: [UUID: [ImageAttachment]] = [:]
+    ) -> [LocalLLMChatMessage] {
+        templateCompatibleMessages(Self.messages(from: messages, imageAttachments: imageAttachments))
     }
 
     public static func templateCompatibleMessages(_ messages: [LocalLLMChatMessage]) -> [LocalLLMChatMessage] {
         guard !messages.isEmpty else { return [] }
 
-        var systemContents: [String] = []
-        var conversationMessages: [LocalLLMChatMessage] = []
-        conversationMessages.reserveCapacity(messages.count)
-
-        for message in messages {
-            if message.role == "system" {
-                let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !content.isEmpty {
-                    systemContents.append(content)
-                }
-            } else {
-                conversationMessages.append(message)
-            }
+        guard let firstUserIndex = messages.firstIndex(where: { $0.role == "user" }) else {
+            let systemContents = messages
+                .filter { $0.role == "system" }
+                .map(\.content)
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            guard !systemContents.isEmpty else { return [] }
+            return [LocalLLMChatMessage(role: "system", content: systemContents.joined(separator: "\n\n"))]
         }
 
-        // 多数 GGUF chat template 只接受开头 system，且第一条非 system 消息必须是 user。
-        while let first = conversationMessages.first, first.role != "user" {
-            conversationMessages.removeFirst()
-        }
+        let leadingSystemContents = messages[..<firstUserIndex]
+            .filter { $0.role == "system" }
+            .map(\.content)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        var conversationMessages = Array(messages[firstUserIndex...])
 
-        if !systemContents.isEmpty {
+        // 仅归并首轮 user 之前的系统提示；对话中的 system 保留原位，由 GGUF chat template 生成角色 token。
+        if !leadingSystemContents.isEmpty {
             conversationMessages.insert(
-                LocalLLMChatMessage(role: "system", content: systemContents.joined(separator: "\n\n")),
+                LocalLLMChatMessage(role: "system", content: leadingSystemContents.joined(separator: "\n\n")),
                 at: 0
             )
         }
-
         return conversationMessages
     }
 
     public static func toolDefinitions(from tools: [InternalToolDefinition]?) -> [LocalLLMToolDefinition] {
         guard let tools else { return [] }
-        return tools.compactMap { tool in
+        return stableToolDefinitions(tools) { name in
+            name.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.compactMap { tool in
             let name = tool.name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return nil }
             return LocalLLMToolDefinition(
                 name: name,
                 description: tool.description,
-                parametersJSON: tool.parameters.prettyPrintedCompact()
+                parametersJSON: stableParametersJSON(for: tool.parameters)
             )
         }
+    }
+
+    private static func stableParametersJSON(for parameters: JSONValue) -> String {
+        let stableParameters = stableJSONSchemaValueForTransport(parameters.toAny())
+        if JSONSerialization.isValidJSONObject(stableParameters),
+           let data = try? JSONSerialization.data(withJSONObject: stableParameters, options: [.sortedKeys]),
+           let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return parameters.prettyPrintedCompact()
     }
 
     private static func roleName(for role: MessageRole) -> String {
@@ -135,6 +158,28 @@ public enum LocalLLMChatMessageBuilder {
             return ""
         default:
             return message.content
+        }
+    }
+
+    private static func contentWithMediaMarkers(_ content: String, mediaCount: Int) -> String {
+        guard mediaCount > 0 else { return content }
+        let markers = Array(repeating: LocalLLMChatMessage.mediaMarker, count: mediaCount).joined()
+        guard !content.isEmpty else { return markers }
+        return "\(markers)\n\(content)"
+    }
+
+    private static func mediaAttachmentsForMessage(
+        _ message: ChatMessage,
+        imageAttachments: [UUID: [ImageAttachment]]
+    ) -> [LocalLLMMediaAttachment] {
+        guard message.role == .user else { return [] }
+        return (imageAttachments[message.id] ?? []).enumerated().map { index, attachment in
+            LocalLLMMediaAttachment(
+                id: "\(message.id.uuidString.lowercased())-\(attachment.id.uuidString.lowercased())-\(index)",
+                data: attachment.data,
+                mimeType: attachment.mimeType,
+                fileName: attachment.fileName
+            )
         }
     }
 

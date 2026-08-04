@@ -108,6 +108,35 @@ public enum ParameterExpressionParser {
             .map { "\($0.key)=\(serializeValue($0.value))" }
     }
 
+    /// 生成只保留键与容器结构的输入草稿，标量值留空等待用户填写。
+    public static func serializeTemplate(parameters: [String: JSONValue]) -> [String] {
+        parameters
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key)=\(serializeTemplateValue($0.value))" }
+    }
+
+    /// 将单个值转换为仅保留容器层级的空白输入草稿。
+    public static func serializeTemplateValue(_ value: JSONValue) -> String {
+        switch value {
+        case .dictionary(let dictionary):
+            let pairs = dictionary
+                .sorted(by: { $0.key < $1.key })
+                .map { "\($0.key)=\(serializeTemplateValue($0.value))" }
+                .joined(separator: ", ")
+            return "{\(pairs)}"
+        case .array(let array):
+            let items = array.map(serializeTemplateValue).joined(separator: ", ")
+            return "[\(items)]"
+        case .string, .int, .double, .bool, .null:
+            return ""
+        }
+    }
+
+    /// 原始 JSON 无法表达空白值，因此以 null 保留待填写的嵌套结构。
+    public static func serializeRawJSONTemplate(parameters: [String: JSONValue]) -> String {
+        serializeRawJSONObject(parameters: parameters.mapValues(templateJSONValue))
+    }
+
     /// 解析用户输入的原始 JSON 对象（顶层必须是对象）。
     public static func parseRawJSONObject(_ rawJSON: String) throws -> [String: JSONValue] {
         let cleaned = rawJSON.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -187,7 +216,9 @@ public enum ParameterExpressionParser {
             skipSeparators(text, index: &index)
             
             guard index < text.endIndex, text[index] == "=" else {
-                throw ParserError.invalidValue("缺少“=”")
+                throw ParserError.invalidValue(
+                    NSLocalizedString("缺少“=”", comment: "Parameter expression missing equals sign")
+                )
             }
             index = text.index(after: index)
             
@@ -202,7 +233,9 @@ public enum ParameterExpressionParser {
             }
         }
         
-        throw ParserError.invalidValue("缺少“}”")
+        throw ParserError.invalidValue(
+            NSLocalizedString("缺少“}”", comment: "Parameter expression missing closing brace")
+        )
     }
     
     private static func parseArray(_ text: Substring, index: inout Substring.Index) throws -> JSONValue {
@@ -227,7 +260,9 @@ public enum ParameterExpressionParser {
             }
         }
         
-        throw ParserError.invalidValue("缺少“]”")
+        throw ParserError.invalidValue(
+            NSLocalizedString("缺少“]”", comment: "Parameter expression missing closing bracket")
+        )
     }
     
     private static func parseScalar(_ text: Substring, index: inout Substring.Index) throws -> JSONValue {
@@ -287,7 +322,9 @@ public enum ParameterExpressionParser {
             index = text.index(after: index)
         }
         
-        throw ParserError.invalidValue("字符串缺少结束引号")
+        throw ParserError.invalidValue(
+            NSLocalizedString("字符串缺少结束引号", comment: "Parameter expression unterminated string")
+        )
     }
     
     private static func parseKey(_ text: Substring, index: inout Substring.Index) throws -> String {
@@ -333,6 +370,17 @@ public enum ParameterExpressionParser {
         default:
             // 标量直接覆盖
             return rhs
+        }
+    }
+
+    private static func templateJSONValue(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .dictionary(let dictionary):
+            return .dictionary(dictionary.mapValues(templateJSONValue))
+        case .array(let array):
+            return .array(array.map(templateJSONValue))
+        case .string, .int, .double, .bool, .null:
+            return .null
         }
     }
     

@@ -24,6 +24,8 @@ public extension Notification.Name {
     static let requestOpenFeedback = Notification.Name("com.ETOS.feedback.requestOpen")
     /// 请求当前设备直接打开指定聊天会话。
     static let requestOpenChatSession = Notification.Name("com.ETOS.chat.requestOpenSession")
+    /// 请求当前设备打开指定会话并启动上下文压缩。
+    static let requestContextCompression = Notification.Name("com.ETOS.chat.requestContextCompression")
     /// 请求当前设备直接打开隐藏日记页面。
     static let requestOpenAchievementJournal = Notification.Name("com.ETOS.achievementJournal.requestOpen")
     /// 请求当前设备直接打开检查更新页面。
@@ -34,6 +36,7 @@ public enum AppLocalNotificationRoute: String, Sendable {
     case dailyPulse
     case feedback
     case chatSession
+    case contextCompression
     case achievementJournal
     case updateTimeline
 }
@@ -45,6 +48,16 @@ public struct AppLocalNotificationDailyPulseContinuation: Sendable, Equatable {
     public init(sessionID: UUID, prompt: String) {
         self.sessionID = sessionID
         self.prompt = prompt
+    }
+}
+
+public struct AppLocalNotificationDailyPulseSelection: Sendable, Equatable {
+    public let runID: UUID
+    public let cardID: UUID
+
+    public init(runID: UUID, cardID: UUID) {
+        self.runID = runID
+        self.cardID = cardID
     }
 }
 
@@ -106,10 +119,15 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
     @Published public private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published public private(set) var pendingRoute: AppLocalNotificationRoute?
     @Published public private(set) var pendingDailyPulseContinuation: AppLocalNotificationDailyPulseContinuation?
+    @Published public private(set) var pendingDailyPulseSelection: AppLocalNotificationDailyPulseSelection?
     @Published public private(set) var pendingFeedbackIssueNumber: Int?
     @Published public private(set) var pendingChatSessionID: UUID?
+    @Published public private(set) var pendingContextCompressionSessionID: UUID?
 
     private var didConfigure = false
+    private nonisolated static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
 
     private override init() {
         super.init()
@@ -118,6 +136,7 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
     public func configureIfNeeded() {
         guard !didConfigure else { return }
         didConfigure = true
+        guard !Self.isRunningUnitTests else { return }
         UNUserNotificationCenter.current().delegate = self
         registerNotificationCategories()
         Task {
@@ -127,6 +146,10 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
 
     @discardableResult
     public func refreshAuthorizationStatus() async -> UNAuthorizationStatus {
+        guard !Self.isRunningUnitTests else {
+            authorizationStatus = .denied
+            return .denied
+        }
         configureIfNeeded()
         let settings = await currentNotificationSettings()
         authorizationStatus = settings.authorizationStatus
@@ -137,6 +160,7 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
     public func requestAuthorizationIfNeeded(
         options: UNAuthorizationOptions = [.alert, .sound, .badge]
     ) async -> Bool {
+        guard !Self.isRunningUnitTests else { return false }
         configureIfNeeded()
         let status = await refreshAuthorizationStatus()
         switch status {
@@ -159,6 +183,7 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
 
     @discardableResult
     public func addNotificationRequest(_ request: UNNotificationRequest) async -> Bool {
+        guard !Self.isRunningUnitTests else { return false }
         configureIfNeeded()
         return await withCheckedContinuation { continuation in
             UNUserNotificationCenter.current().add(request) { error in
@@ -167,13 +192,47 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
         }
     }
 
+    /// 投递达到阈值的上下文压缩提醒；通知标识稳定，避免同一阈值堆积多条待处理通知。
+    @discardableResult
+    public func postContextCompressionReminder(
+        sessionID: UUID,
+        sessionName: String,
+        estimatedTokens: Int,
+        tokenThreshold: Int
+    ) async -> Bool {
+        guard await requestAuthorizationIfNeeded() else { return false }
+
+        let content = UNMutableNotificationContent()
+        content.title = NSLocalizedString(
+            "建议压缩上下文",
+            comment: "Context compression notification title"
+        )
+        content.body = String(
+            format: NSLocalizedString(
+                "会话“%@”约有 %@ Token，已达到 %@ Token 的提醒阈值。点击即可压缩为续聊。",
+                comment: "Context compression notification body"
+            ),
+            sessionName,
+            estimatedTokens.formatted(.number),
+            tokenThreshold.formatted(.number)
+        )
+        content.sound = .default
+        content.threadIdentifier = "chat.contextCompression"
+        content.userInfo = Self.contextCompressionUserInfo(sessionID: sessionID)
+
+        let identifier = "chat.contextCompression.\(sessionID.uuidString).\(tokenThreshold)"
+        return await addNotificationRequest(
+            UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        )
+    }
+
     public func removePendingRequests(withIdentifiers identifiers: [String]) {
-        guard !identifiers.isEmpty else { return }
+        guard !Self.isRunningUnitTests, !identifiers.isEmpty else { return }
         UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: identifiers)
     }
 
     public func removeDeliveredRequests(withIdentifiers identifiers: [String]) {
-        guard !identifiers.isEmpty else { return }
+        guard !Self.isRunningUnitTests, !identifiers.isEmpty else { return }
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: identifiers)
     }
 
@@ -214,6 +273,13 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
         return route == AppLocalNotificationRoute.chatSession.rawValue
     }
 
+    public nonisolated static func notificationTargetsContextCompression(
+        userInfo: [AnyHashable: Any]
+    ) -> Bool {
+        guard let route = userInfo[appLocalNotificationRouteUserInfoKey] as? String else { return false }
+        return route == AppLocalNotificationRoute.contextCompression.rawValue
+    }
+
     public nonisolated static func notificationTargetsAchievementJournal(userInfo: [AnyHashable: Any]) -> Bool {
         guard let route = userInfo[appLocalNotificationRouteUserInfoKey] as? String else { return false }
         return route == AppLocalNotificationRoute.achievementJournal.rawValue
@@ -230,6 +296,13 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
         ]
     }
 
+    public nonisolated static func contextCompressionUserInfo(sessionID: UUID) -> [AnyHashable: Any] {
+        [
+            appLocalNotificationRouteUserInfoKey: AppLocalNotificationRoute.contextCompression.rawValue,
+            appLocalNotificationSessionIDUserInfoKey: sessionID.uuidString
+        ]
+    }
+
     public nonisolated static func achievementJournalUserInfo(achievementID: String? = nil) -> [AnyHashable: Any] {
         var info: [AnyHashable: Any] = [
             appLocalNotificationRouteUserInfoKey: AppLocalNotificationRoute.achievementJournal.rawValue
@@ -241,9 +314,9 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
     }
 
     public nonisolated static func dailyPulseCategoryIdentifier(kind: String) -> String {
-        kind == "ready"
-            ? appLocalNotificationDailyPulseReadyCategoryIdentifier
-            : appLocalNotificationDailyPulseReminderCategoryIdentifier
+        kind == "reminder"
+            ? appLocalNotificationDailyPulseReminderCategoryIdentifier
+            : appLocalNotificationDailyPulseReadyCategoryIdentifier
     }
 
     public func consumePendingRoute() -> AppLocalNotificationRoute? {
@@ -258,6 +331,12 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
         return continuation
     }
 
+    public func consumePendingDailyPulseSelection() -> AppLocalNotificationDailyPulseSelection? {
+        let selection = pendingDailyPulseSelection
+        pendingDailyPulseSelection = nil
+        return selection
+    }
+
     public func consumePendingFeedbackIssueNumber() -> Int? {
         let issueNumber = pendingFeedbackIssueNumber
         pendingFeedbackIssueNumber = nil
@@ -267,6 +346,12 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
     public func consumePendingChatSessionID() -> UUID? {
         let sessionID = pendingChatSessionID
         pendingChatSessionID = nil
+        return sessionID
+    }
+
+    public func consumePendingContextCompressionSessionID() -> UUID? {
+        let sessionID = pendingContextCompressionSessionID
+        pendingContextCompressionSessionID = nil
         return sessionID
     }
 
@@ -321,8 +406,14 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
         )
     }
 
-    private func openDailyPulseFromNotification() {
+    private func openDailyPulseFromNotification(payload: AppLocalNotificationPayload? = nil) {
         pendingRoute = .dailyPulse
+        if let runID = payload?.runID, let cardID = payload?.cardID {
+            pendingDailyPulseSelection = AppLocalNotificationDailyPulseSelection(
+                runID: runID,
+                cardID: cardID
+            )
+        }
         NotificationCenter.default.post(name: .requestOpenDailyPulse, object: nil)
     }
 
@@ -336,6 +427,12 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
         pendingRoute = .chatSession
         pendingChatSessionID = payload.sessionID
         NotificationCenter.default.post(name: .requestOpenChatSession, object: nil)
+    }
+
+    private func openContextCompressionFromNotification(payload: AppLocalNotificationPayload) {
+        pendingRoute = .contextCompression
+        pendingContextCompressionSessionID = payload.sessionID
+        NotificationCenter.default.post(name: .requestContextCompression, object: nil)
     }
 
     private func openAchievementJournalFromNotification() {
@@ -384,6 +481,8 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
             openFeedbackFromNotification(payload: payload)
         } else if payload.route == .chatSession {
             openChatSessionFromNotification(payload: payload)
+        } else if payload.route == .contextCompression {
+            openContextCompressionFromNotification(payload: payload)
         } else if payload.route == .achievementJournal {
             openAchievementJournalFromNotification()
         } else if payload.route == .updateTimeline {
@@ -397,7 +496,7 @@ public final class AppLocalNotificationCenter: NSObject, ObservableObject {
     ) {
         switch actionIdentifier {
         case UNNotificationDefaultActionIdentifier, appLocalNotificationDailyPulseOpenActionIdentifier:
-            openDailyPulseFromNotification()
+            openDailyPulseFromNotification(payload: payload)
         case appLocalNotificationDailyPulseLikeActionIdentifier:
             guard let target = dailyPulseTarget(from: payload) else { return }
             DailyPulseManager.shared.applyFeedback(.liked, cardID: target.card.id, runID: target.runID)
@@ -464,6 +563,7 @@ public extension Notification.Name {
     static let requestOpenDailyPulse = Notification.Name("com.ETOS.dailyPulse.requestOpen")
     static let requestOpenFeedback = Notification.Name("com.ETOS.feedback.requestOpen")
     static let requestOpenChatSession = Notification.Name("com.ETOS.chat.requestOpenSession")
+    static let requestContextCompression = Notification.Name("com.ETOS.chat.requestContextCompression")
     static let requestOpenAchievementJournal = Notification.Name("com.ETOS.achievementJournal.requestOpen")
     static let requestOpenUpdateTimeline = Notification.Name("com.ETOS.updateTimeline.requestOpen")
 }

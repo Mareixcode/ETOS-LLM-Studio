@@ -123,7 +123,9 @@ extension ChatService {
 
     public func reloadCurrentSessionMessagesFromPersistence() {
         guard let currentSession = currentSessionSubject.value else { return }
+        Persistence.flushPendingMessageWritesForSyncSnapshot()
         let reloadedMessages = Persistence.loadMessages(for: currentSession.id)
+        storeRuntimeMessagesSnapshot(reloadedMessages, for: currentSession.id)
         publishMessages(reloadedMessages)
         logger.info("已从持久化层刷新当前会话消息: \(currentSession.id.uuidString)")
     }
@@ -146,6 +148,9 @@ extension ChatService {
         let resolvedCurrentSession = mergedSessions.first(where: { $0.id == previousCurrentSessionID })
             ?? persistedSessions.first
             ?? existingTemporary
+        if previousCurrentSessionID != resolvedCurrentSession.id {
+            clearLocalLLMKVCache(for: previousCurrentSessionID)
+        }
 
         chatSessionsSubject.send(mergedSessions)
         sessionFoldersSubject.send(persistedFolders)
@@ -155,6 +160,7 @@ extension ChatService {
         let resolvedMessages = resolvedCurrentSession.isTemporary
             ? []
             : Persistence.loadMessages(for: resolvedCurrentSession.id)
+        storeRuntimeMessagesSnapshot(resolvedMessages, for: resolvedCurrentSession.id)
         publishMessages(resolvedMessages)
 
         logger.info("JSON→SQLite 迁移后已刷新会话状态: sessions=\(persistedSessions.count), folders=\(persistedFolders.count), tags=\(persistedTags.count)")
@@ -175,23 +181,24 @@ extension ChatService {
             }
 
             logger.info("已更新当前会话元数据: \(session.name)")
-            AppLog.userOperation(
-                category: NSLocalizedString("会话", comment: "App log category"),
-                action: NSLocalizedString("更新当前会话", comment: "App log action"),
-                payload: ["sessionID": session.id.uuidString]
-            )
             return
         }
 
+        clearLocalLLMKVCache(for: currentSession?.id)
         currentSessionSubject.send(session)
-        let messages = session != nil ? Persistence.loadMessages(for: session!.id) : []
+        let messages = session.map { messagesForSessionActivation($0.id) } ?? []
+        if let session {
+            storeRuntimeMessagesSnapshot(messages, for: session.id)
+        }
         publishMessages(messages)
         logger.info("已切换到会话: \(session?.name ?? "无")")
-        AppLog.userOperation(
-            category: NSLocalizedString("会话", comment: "App log category"),
-            action: NSLocalizedString("切换会话", comment: "App log action"),
-            payload: ["sessionID": session?.id.uuidString ?? NSLocalizedString("无", comment: "App log empty value")]
-        )
+    }
+
+    func clearLocalLLMKVCache(for sessionID: UUID?) {
+        guard let sessionID else { return }
+        Task.detached(priority: .utility) {
+            LocalLLMEngine.shared.clearKVCache(for: sessionID.uuidString)
+        }
     }
 
     func promoteSessionToTopIfNeeded(sessionID: UUID) {

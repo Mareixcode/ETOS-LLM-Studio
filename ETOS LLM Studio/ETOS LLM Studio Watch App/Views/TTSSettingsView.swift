@@ -5,6 +5,7 @@ import ETOSCore
 struct TTSSettingsView: View {
     @EnvironmentObject private var viewModel: ChatViewModel
     @ObservedObject private var settingsStore = TTSSettingsStore.shared
+    @ObservedObject private var appConfig = AppConfigStore.shared
     @State private var showCustomCloudParameters: Bool = false
 
     private static let customPickerTag = "__custom__"
@@ -30,7 +31,7 @@ struct TTSSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section(NSLocalizedString("专用模型", comment: "")) {
+            Section(NSLocalizedString("语音模型", comment: "")) {
                 if viewModel.ttsModels.isEmpty {
                     Text(NSLocalizedString("暂无可用 TTS 模型", comment: ""))
                         .foregroundStyle(.secondary)
@@ -124,9 +125,20 @@ struct TTSSettingsView: View {
                 }
             }
 
-            Section(NSLocalizedString("朗读行为", comment: "")) {
+            Section {
+                Toggle(
+                    NSLocalizedString("后台继续朗读", comment: "watchOS TTS 后台继续播放开关"),
+                    isOn: $appConfig.continueTTSPlaybackInBackground
+                )
                 Toggle(NSLocalizedString("自动朗读回复", comment: ""), isOn: $settingsStore.autoPlayAfterAssistantResponse)
                 Toggle(NSLocalizedString("仅朗读引号", comment: ""), isOn: $settingsStore.onlyReadQuotedContent)
+            } header: {
+                Text(NSLocalizedString("朗读行为", comment: ""))
+            } footer: {
+                Text(NSLocalizedString(
+                    "开启后，正在播放的朗读会在切换到其他 App 后继续，全部内容读完后自动停止；此选项不会自动开始朗读。",
+                    comment: "watchOS TTS 后台继续播放说明"
+                ))
             }
 
             Section(NSLocalizedString("watchOS 兼容", comment: "")) {

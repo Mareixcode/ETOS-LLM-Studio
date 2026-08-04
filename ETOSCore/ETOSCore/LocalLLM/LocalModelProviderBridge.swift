@@ -37,7 +37,9 @@ public enum LocalModelProviderBridge {
     }
 
     public static func runnableModels(from records: [LocalModelRecord]) -> [RunnableModel] {
-        records.map(runnableModel(for:))
+        records
+            .filter { !$0.isSpeechAuxiliaryModel }
+            .map(runnableModel(for:))
     }
 
     public static func localRecordID(from runnableModelID: String) -> UUID? {
@@ -66,10 +68,10 @@ public enum LocalModelProviderBridge {
         writeOverride("presence_penalty", value: record.presencePenalty.map(JSONValue.double), to: &overrideParameters, preferRecordBasics: preferRecordBasics)
         writeOverride("grammar", value: record.grammar.map(JSONValue.string), to: &overrideParameters, preferRecordBasics: preferRecordBasics)
         writeOverride("ignore_eos", value: record.ignoreEOS.map(JSONValue.bool), to: &overrideParameters, preferRecordBasics: preferRecordBasics)
+        writeOverride("image_min_tokens", value: record.imageMinTokens.map(JSONValue.int), to: &overrideParameters, preferRecordBasics: preferRecordBasics)
+        writeOverride("image_max_tokens", value: record.imageMaxTokens.map(JSONValue.int), to: &overrideParameters, preferRecordBasics: preferRecordBasics)
         writeOverride("sampler_seq", value: record.samplerKinds.map { .string(LocalLLMSamplerKind.chainString($0)) }, to: &overrideParameters, preferRecordBasics: preferRecordBasics)
         writeOverride("llama_cli_args", value: record.advancedArguments.nilIfEmpty.map(JSONValue.string), to: &overrideParameters, preferRecordBasics: preferRecordBasics)
-
-        let capabilities = Model.orderedCapabilities((existingModel?.capabilities ?? []) + [.streaming])
 
         return Model(
             id: record.id,
@@ -77,12 +79,17 @@ public enum LocalModelProviderBridge {
             displayName: preferRecordBasics
                 ? record.sanitizedDisplayName
                 : (sanitized(existingModel?.displayName).nilIfEmpty ?? record.sanitizedDisplayName),
+            pickerGroupName: existingModel?.pickerGroupName,
             isActivated: preferRecordBasics ? record.isActivated : (existingModel?.isActivated ?? record.isActivated),
             overrideParameters: overrideParameters,
             kind: existingModel?.kind ?? .chat,
-            inputModalities: existingModel?.inputModalities ?? [.text],
+            inputModalities: resolvedInputModalities(
+                for: record,
+                existingModel: existingModel,
+                preferRecordBasics: preferRecordBasics
+            ),
             outputModalities: existingModel?.outputModalities ?? [.text],
-            capabilities: capabilities,
+            capabilities: Model.orderedCapabilities((existingModel?.capabilities ?? []) + [.streaming]),
             requestBodyOverrideMode: existingModel?.requestBodyOverrideMode ?? .keyValue,
             rawRequestBodyJSON: existingModel?.rawRequestBodyJSON,
             requestBodyControls: existingModel?.requestBodyControls ?? [],
@@ -99,7 +106,7 @@ public enum LocalModelProviderBridge {
             baseURL: sanitized(existingProvider?.baseURL).nilIfEmpty ?? defaultBaseURL,
             apiKeys: existingProvider?.apiKeys ?? [],
             apiFormat: apiFormat,
-            models: records.map { record in
+            models: records.filter { !$0.isSpeechAuxiliaryModel }.map { record in
                 model(
                     for: record,
                     preserving: existingModelsByID[record.id],
@@ -145,6 +152,21 @@ public enum LocalModelProviderBridge {
         } else if preferRecordBasics {
             overrideParameters.removeValue(forKey: key)
         }
+    }
+
+    private static func resolvedInputModalities(
+        for record: LocalModelRecord,
+        existingModel: Model?,
+        preferRecordBasics: Bool
+    ) -> [ModelModality] {
+        let baseModalities = existingModel?.inputModalities ?? [.text]
+        if record.hasMultimodalProjector {
+            return Model.orderedModalities(baseModalities + [.text, .image])
+        }
+        if preferRecordBasics {
+            return [.text]
+        }
+        return Model.orderedModalities(baseModalities)
     }
 }
 

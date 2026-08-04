@@ -70,7 +70,11 @@ extension SyncEngine {
         let resolvedBaseName = baseName.isEmpty ? session.name : baseName
         let platform = normalizedSessionForkPlatform(sourcePlatform)
             ?? inferredSessionForkPlatform(from: session.name)
-        let firstName = "\(resolvedBaseName) [\(platform) 分支]"
+        let firstName = String(
+            format: NSLocalizedString("%@ [%@ 分支]", comment: "Cross-platform sync conflict session name"),
+            resolvedBaseName,
+            platform
+        )
         guard existingNames.contains(firstName) else { return firstName }
 
         var index = 2
@@ -200,6 +204,7 @@ extension SyncEngine {
         let canonicalAPIFormat = canonicalProviderAPIFormat(provider.apiFormat)
         hasher.combine(provider.baseNameWithoutSyncSuffix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         hasher.combine(normalizeProviderBaseURL(provider.baseURL, apiFormat: canonicalAPIFormat))
+        hasher.combine(provider.normalizedChatEndpointPath)
         hasher.combine(canonicalAPIFormat)
         for (key, value) in provider.headerOverrides.sorted(by: { $0.key < $1.key }) {
             hasher.combine(key)
@@ -218,6 +223,7 @@ extension SyncEngine {
         for model in provider.models.sorted(by: { normalizedModelIdentity($0) < normalizedModelIdentity($1) }) {
             hasher.combine(model.modelName)
             hasher.combine(model.displayName)
+            hasher.combine(Model.normalizedPickerGroupName(model.pickerGroupName) ?? "")
             hasher.combine(model.isActivated)
             hasher.combine(model.kind.rawValue)
             for modality in model.inputModalities.sorted(by: { $0.rawValue < $1.rawValue }) {
@@ -269,6 +275,9 @@ extension SyncEngine {
         hasher.combine(pricing.outputPerMillionTokens ?? -1)
         hasher.combine(pricing.cacheWritePerMillionTokens ?? -1)
         hasher.combine(pricing.cacheReadPerMillionTokens ?? -1)
+        hasher.combine(pricing.billingMode.rawValue)
+        hasher.combine(pricing.perRequestPrice ?? -1)
+        hasher.combine(pricing.timeOverridesEnabled)
         for tier in pricing.tiers {
             hasher.combine(tier.id.uuidString)
             hasher.combine(tier.minimumTokens)
@@ -276,6 +285,15 @@ extension SyncEngine {
             hasher.combine(tier.outputPerMillionTokens ?? -1)
             hasher.combine(tier.cacheWritePerMillionTokens ?? -1)
             hasher.combine(tier.cacheReadPerMillionTokens ?? -1)
+        }
+        for timeOverride in pricing.timeOverrides {
+            hasher.combine(timeOverride.id.uuidString)
+            hasher.combine(timeOverride.startMinuteOfDay)
+            hasher.combine(timeOverride.endMinuteOfDay)
+            hasher.combine(timeOverride.inputPerMillionTokens ?? -1)
+            hasher.combine(timeOverride.outputPerMillionTokens ?? -1)
+            hasher.combine(timeOverride.cacheWritePerMillionTokens ?? -1)
+            hasher.combine(timeOverride.cacheReadPerMillionTokens ?? -1)
         }
     }
 
@@ -381,6 +399,9 @@ extension SyncEngine {
         hasher.combine(message.costEstimate?.totalCost ?? -1)
         hasher.combine(message.costEstimate?.tierBasisTokens ?? -1)
         hasher.combine(message.costEstimate?.tierMinimumTokens ?? -1)
+        hasher.combine(message.costEstimate?.timeOverrideID?.uuidString ?? "")
+        hasher.combine(message.costEstimate?.timeOverrideStartMinuteOfDay ?? -1)
+        hasher.combine(message.costEstimate?.timeOverrideEndMinuteOfDay ?? -1)
         hasher.combine(message.costEstimate?.isEstimatedFromCurrentPricing ?? false)
         for component in message.costEstimate?.components ?? [] {
             hasher.combine(component.kind.rawValue)

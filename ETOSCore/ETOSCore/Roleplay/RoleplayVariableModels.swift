@@ -1,0 +1,406 @@
+// ============================================================================
+// RoleplayVariableModels.swift
+// ============================================================================
+// ETOS LLM Studio
+//
+// 定义酒馆/MVU 变量作用域、消息版本快照与路径访问行为。
+// ============================================================================
+
+import Foundation
+
+public enum RoleplayVariableScope: String, Codable, CaseIterable, Hashable, Sendable {
+    case global
+    case preset
+    case character
+    case persona
+    case chat
+    case message
+    case script
+}
+
+public struct RoleplayVariableSnapshot: Codable, Hashable, Sendable {
+    private static let customMacrosKey = "__etos_custom_macros"
+    private static let scriptScopesKey = "__etos_script_scopes"
+    private static let promptTemplateInitialKey = "__etos_prompt_template_initial"
+    private static let displayedHTMLKey = "__etos_displayed_html"
+
+    public var global: [String: JSONValue]
+    public var preset: [String: JSONValue]
+    public var character: [String: JSONValue]
+    public var persona: [String: JSONValue]
+    public var chat: [String: JSONValue]
+    public var messageVersions: [String: [String: JSONValue]]
+    public var script: [String: JSONValue]
+    public var extensionScopes: [String: [String: JSONValue]]?
+
+    public init(
+        global: [String: JSONValue] = [:],
+        preset: [String: JSONValue] = [:],
+        character: [String: JSONValue] = [:],
+        persona: [String: JSONValue] = [:],
+        chat: [String: JSONValue] = [:],
+        messageVersions: [String: [String: JSONValue]] = [:],
+        script: [String: JSONValue] = [:],
+        extensionScopes: [String: [String: JSONValue]]? = nil
+    ) {
+        self.global = global
+        self.preset = preset
+        self.character = character
+        self.persona = persona
+        self.chat = chat
+        self.messageVersions = messageVersions
+        self.script = script
+        self.extensionScopes = extensionScopes
+    }
+
+    public static func messageVersionKey(messageID: UUID, versionIndex: Int) -> String {
+        "\(messageID.uuidString):\(max(0, versionIndex))"
+    }
+
+    public func mergedVariables(messageID: UUID? = nil, versionIndex: Int = 0) -> [String: JSONValue] {
+        var merged = global
+        var visibleScriptVariables = script
+        visibleScriptVariables.removeValue(forKey: Self.customMacrosKey)
+        visibleScriptVariables.removeValue(forKey: Self.scriptScopesKey)
+        visibleScriptVariables.removeValue(forKey: Self.promptTemplateInitialKey)
+        for layer in [preset, character, persona, visibleScriptVariables, chat] {
+            merged.merge(layer) { _, new in new }
+        }
+        if let messageID {
+            let key = Self.messageVersionKey(messageID: messageID, versionIndex: versionIndex)
+            var visibleMessageVariables = messageVersions[key] ?? [:]
+            visibleMessageVariables.removeValue(forKey: Self.displayedHTMLKey)
+            merged.merge(visibleMessageVariables) { _, new in new }
+        }
+        return merged
+    }
+
+    public func messageVariables(messageID: UUID, versionIndex: Int) -> [String: JSONValue] {
+        var result = messageVersions[Self.messageVersionKey(messageID: messageID, versionIndex: versionIndex)] ?? [:]
+        result.removeValue(forKey: Self.displayedHTMLKey)
+        return result
+    }
+
+    public func scopedVariables(
+        _ scope: RoleplayVariableScope,
+        messageID: UUID? = nil,
+        versionIndex: Int = 0
+    ) -> [String: JSONValue] {
+        var result = variables(scope: scope, messageID: messageID, versionIndex: versionIndex)
+        if scope == .script {
+            result.removeValue(forKey: Self.customMacrosKey)
+            result.removeValue(forKey: Self.scriptScopesKey)
+            result.removeValue(forKey: Self.promptTemplateInitialKey)
+        } else if scope == .message {
+            result.removeValue(forKey: Self.displayedHTMLKey)
+        }
+        return result
+    }
+
+    public func scriptVariables(scriptID: UUID) -> [String: JSONValue] {
+        guard case .dictionary(let scopes) = script[Self.scriptScopesKey],
+              case .dictionary(let values) = scopes[scriptID.uuidString] else { return [:] }
+        return values
+    }
+
+    public var allScriptVariables: [String: [String: JSONValue]] {
+        guard case .dictionary(let scopes) = script[Self.scriptScopesKey] else { return [:] }
+        return scopes.reduce(into: [:]) { result, item in
+            guard case .dictionary(let values) = item.value else { return }
+            result[item.key] = values
+        }
+    }
+
+    public mutating func replaceScriptVariables(_ variables: [String: JSONValue], scriptID: UUID) {
+        var scopes: [String: JSONValue]
+        if case .dictionary(let stored) = script[Self.scriptScopesKey] {
+            scopes = stored
+        } else {
+            scopes = [:]
+        }
+        scopes[scriptID.uuidString] = .dictionary(variables)
+        script[Self.scriptScopesKey] = .dictionary(scopes)
+    }
+
+    public func extensionVariables(extensionID: String) -> [String: JSONValue] {
+        extensionScopes?[extensionID] ?? [:]
+    }
+
+    public mutating func replaceExtensionVariables(
+        _ variables: [String: JSONValue],
+        extensionID: String
+    ) {
+        var scopes = extensionScopes ?? [:]
+        scopes[extensionID] = variables
+        extensionScopes = scopes
+    }
+
+    public var promptTemplateInitialVariables: [String: JSONValue] {
+        guard case .dictionary(let values) = script[Self.promptTemplateInitialKey] else { return [:] }
+        return values
+    }
+
+    public mutating func replacePromptTemplateInitialVariables(_ variables: [String: JSONValue]) {
+        if variables.isEmpty {
+            script.removeValue(forKey: Self.promptTemplateInitialKey)
+        } else {
+            script[Self.promptTemplateInitialKey] = .dictionary(variables)
+        }
+    }
+
+    public mutating func replaceVariables(
+        _ variables: [String: JSONValue],
+        scope: RoleplayVariableScope,
+        messageID: UUID? = nil,
+        versionIndex: Int = 0
+    ) {
+        var replacement = variables
+        if scope == .script {
+            for key in [Self.customMacrosKey, Self.scriptScopesKey, Self.promptTemplateInitialKey] {
+                if let internalValue = script[key] {
+                    replacement[key] = internalValue
+                }
+            }
+        } else if scope == .message,
+                  let messageID,
+                  let displayedHTML = messageVersions[Self.messageVersionKey(
+                    messageID: messageID,
+                    versionIndex: versionIndex
+                  )]?[Self.displayedHTMLKey] {
+            replacement[Self.displayedHTMLKey] = displayedHTML
+        }
+        assign(replacement, scope: scope, messageID: messageID, versionIndex: versionIndex)
+    }
+
+    public var customMacros: [String: String] {
+        guard case .dictionary(let stored) = script[Self.customMacrosKey] else { return [:] }
+        return stored.reduce(into: [:]) { result, item in
+            guard case .string(let value) = item.value else { return }
+            result[item.key] = value
+        }
+    }
+
+    public mutating func replaceCustomMacros(_ macros: [String: String]) {
+        let normalized = macros.reduce(into: [String: JSONValue]()) { result, item in
+            let key = item.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return }
+            result[key] = .string(item.value)
+        }
+        if normalized.isEmpty {
+            script.removeValue(forKey: Self.customMacrosKey)
+        } else {
+            script[Self.customMacrosKey] = .dictionary(normalized)
+        }
+    }
+
+    public mutating func replaceMessageVariables(
+        _ variables: [String: JSONValue],
+        messageID: UUID,
+        versionIndex: Int
+    ) {
+        replaceMessageVariables(
+            variables,
+            versionKey: Self.messageVersionKey(messageID: messageID, versionIndex: versionIndex)
+        )
+    }
+
+    mutating func replaceMessageVariables(
+        _ variables: [String: JSONValue],
+        versionKey key: String
+    ) {
+        var replacement = variables
+        if let displayedHTML = messageVersions[key]?[Self.displayedHTMLKey] {
+            replacement[Self.displayedHTMLKey] = displayedHTML
+        }
+        messageVersions[key] = replacement
+    }
+
+    public mutating func removeMessageVariables(messageID: UUID) {
+        let prefix = "\(messageID.uuidString):"
+        messageVersions = messageVersions.filter { !$0.key.hasPrefix(prefix) }
+    }
+
+    public func value(
+        scope: RoleplayVariableScope,
+        path: String,
+        messageID: UUID? = nil,
+        versionIndex: Int = 0
+    ) -> JSONValue? {
+        let root = variables(scope: scope, messageID: messageID, versionIndex: versionIndex)
+        return Self.value(at: path, in: root)
+    }
+
+    public mutating func setValue(
+        _ value: JSONValue,
+        scope: RoleplayVariableScope,
+        path: String,
+        messageID: UUID? = nil,
+        versionIndex: Int = 0
+    ) {
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        var root = variables(scope: scope, messageID: messageID, versionIndex: versionIndex)
+        Self.setValue(value, at: path, in: &root)
+        assign(root, scope: scope, messageID: messageID, versionIndex: versionIndex)
+    }
+
+    public mutating func removeValue(
+        scope: RoleplayVariableScope,
+        path: String,
+        messageID: UUID? = nil,
+        versionIndex: Int = 0
+    ) {
+        var root = variables(scope: scope, messageID: messageID, versionIndex: versionIndex)
+        Self.removeValue(at: path, in: &root)
+        assign(root, scope: scope, messageID: messageID, versionIndex: versionIndex)
+    }
+
+    private func variables(
+        scope: RoleplayVariableScope,
+        messageID: UUID?,
+        versionIndex: Int
+    ) -> [String: JSONValue] {
+        switch scope {
+        case .global: return global
+        case .preset: return preset
+        case .character: return character
+        case .persona: return persona
+        case .chat: return chat
+        case .script: return script
+        case .message:
+            guard let messageID else { return [:] }
+            return messageVersions[Self.messageVersionKey(messageID: messageID, versionIndex: versionIndex)] ?? [:]
+        }
+    }
+
+    private mutating func assign(
+        _ value: [String: JSONValue],
+        scope: RoleplayVariableScope,
+        messageID: UUID?,
+        versionIndex: Int
+    ) {
+        switch scope {
+        case .global: global = value
+        case .preset: preset = value
+        case .character: character = value
+        case .persona: persona = value
+        case .chat: chat = value
+        case .script: script = value
+        case .message:
+            guard let messageID else { return }
+            messageVersions[Self.messageVersionKey(messageID: messageID, versionIndex: versionIndex)] = value
+        }
+    }
+
+    private static func pathComponents(_ path: String) -> [String] {
+        RoleplayVariablePath.components(path)
+    }
+
+    private static func value(at path: String, in root: [String: JSONValue]) -> JSONValue? {
+        let components = pathComponents(path)
+        guard let first = components.first, var current = root[first] else { return nil }
+        for component in components.dropFirst() {
+            switch current {
+            case .dictionary(let dictionary):
+                guard let next = dictionary[component] else { return nil }
+                current = next
+            case .array(let array):
+                guard let index = Int(component), array.indices.contains(index) else { return nil }
+                current = array[index]
+            default:
+                return nil
+            }
+        }
+        return current
+    }
+
+    private static func setValue(_ value: JSONValue, at path: String, in root: inout [String: JSONValue]) {
+        let components = pathComponents(path)
+        guard let first = components.first else { return }
+        if components.count == 1 {
+            root[first] = value
+            return
+        }
+        var nested = root[first] ?? .dictionary([:])
+        setNestedValue(value, components: Array(components.dropFirst()), current: &nested)
+        root[first] = nested
+    }
+
+    private static func setNestedValue(_ value: JSONValue, components: [String], current: inout JSONValue) {
+        guard let first = components.first else {
+            current = value
+            return
+        }
+        if let index = Int(first) {
+            var array: [JSONValue]
+            if case .array(let existing) = current { array = existing } else { array = [] }
+            while array.count <= index { array.append(.null) }
+            if components.count == 1 {
+                array[index] = value
+            } else {
+                var child = array[index]
+                setNestedValue(value, components: Array(components.dropFirst()), current: &child)
+                array[index] = child
+            }
+            current = .array(array)
+            return
+        }
+        var dictionary: [String: JSONValue]
+        if case .dictionary(let existing) = current { dictionary = existing } else { dictionary = [:] }
+        if components.count == 1 {
+            dictionary[first] = value
+        } else {
+            var child = dictionary[first] ?? .dictionary([:])
+            setNestedValue(value, components: Array(components.dropFirst()), current: &child)
+            dictionary[first] = child
+        }
+        current = .dictionary(dictionary)
+    }
+
+    private static func removeValue(at path: String, in root: inout [String: JSONValue]) {
+        let components = pathComponents(path)
+        guard let first = components.first else { return }
+        if components.count == 1 {
+            root.removeValue(forKey: first)
+            return
+        }
+        guard var nested = root[first] else { return }
+        removeNestedValue(components: Array(components.dropFirst()), current: &nested)
+        root[first] = nested
+    }
+
+    private static func removeNestedValue(components: [String], current: inout JSONValue) {
+        guard let first = components.first else { return }
+        switch current {
+        case .dictionary(var dictionary):
+            if components.count == 1 {
+                dictionary.removeValue(forKey: first)
+            } else if var child = dictionary[first] {
+                removeNestedValue(components: Array(components.dropFirst()), current: &child)
+                dictionary[first] = child
+            }
+            current = .dictionary(dictionary)
+        case .array(var array):
+            guard let index = Int(first), array.indices.contains(index) else { return }
+            if components.count == 1 {
+                array.remove(at: index)
+            } else {
+                var child = array[index]
+                removeNestedValue(components: Array(components.dropFirst()), current: &child)
+                array[index] = child
+            }
+            current = .array(array)
+        default:
+            return
+        }
+    }
+}
+
+struct RoleplaySharedVariableSnapshot: Codable, Sendable {
+    var global: [String: JSONValue] = [:]
+    var preset: [String: JSONValue] = [:]
+    var characters: [UUID: [String: JSONValue]] = [:]
+    var personas: [UUID: [String: JSONValue]] = [:]
+    var extensions: [String: [String: JSONValue]]?
+    var globalInitialized: Bool?
+    var presetInitialized: Bool?
+}

@@ -19,11 +19,14 @@ struct ETAdvancedMarkdownRenderer: View {
     let enableAdvancedRenderer: Bool
     let enableMathRendering: Bool
     let customTextColor: Color?
+    let customTextStyleColors: ChatAppearanceTextStyleColors?
     let isStreaming: Bool
     let onCodeBlockHeaderTap: ((String) -> Void)?
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var appConfig = AppConfigStore.shared
     @State private var imagePreviewItem: ETWatchMarkdownImagePreviewItem?
+    @State private var preparedRuleRequest: ChatAppearanceTextRuleRenderRequest?
+    @State private var ruleAttributedText: AttributedString?
 
     init(
         content: String,
@@ -33,6 +36,7 @@ struct ETAdvancedMarkdownRenderer: View {
         enableAdvancedRenderer: Bool,
         enableMathRendering: Bool,
         customTextColor: Color? = nil,
+        customTextStyleColors: ChatAppearanceTextStyleColors? = nil,
         isStreaming: Bool = false,
         onCodeBlockHeaderTap: ((String) -> Void)? = nil
     ) {
@@ -43,6 +47,7 @@ struct ETAdvancedMarkdownRenderer: View {
         self.enableAdvancedRenderer = enableAdvancedRenderer
         self.enableMathRendering = enableMathRendering
         self.customTextColor = customTextColor
+        self.customTextStyleColors = customTextStyleColors
         self.isStreaming = isStreaming
         self.onCodeBlockHeaderTap = onCodeBlockHeaderTap
     }
@@ -57,41 +62,84 @@ struct ETAdvancedMarkdownRenderer: View {
     var body: some View {
         let textColor: Color = customTextColor ?? (isOutgoing ? .white : .primary)
         let fontScale = FontLibrary.effectiveFontScale(appConfig.fontCustomScale, isCustomFontEnabled: appConfig.fontUseCustomFonts)
-        if enableMarkdown {
-            if let streamingLineParts {
-                streamingLineMarkdownView(
-                    prefix: streamingLineParts.prefix,
-                    activeLine: streamingLineParts.activeLine,
-                    textColor: textColor,
-                    fontScale: fontScale
-                )
-            } else if let prepared = effectivePreparedContent {
-                if shouldUseMathEngine(prepared) {
-                    ETMathAwareMarkdownView(
-                        preparedContent: prepared,
-                        isOutgoing: isOutgoing,
-                        customTextColor: customTextColor,
-                        fontScale: fontScale
+        let lineSpacingEm = FontLibrary.normalizedLineSpacingEm(
+            appConfig.fontLineSpacingEmWatchOS,
+            fallback: FontLibrary.defaultWatchLineSpacingEm
+        )
+        let lineSpacing = CGFloat(
+            FontLibrary.lineSpacingPoints(
+                basePointSize: 16,
+                lineSpacingEm: lineSpacingEm,
+                fontScale: appConfig.fontCustomScale,
+                isCustomFontEnabled: appConfig.fontUseCustomFonts,
+                fallbackLineSpacingEm: FontLibrary.defaultWatchLineSpacingEm
+            )
+        )
+        Group {
+            if preparedRuleRequest == ruleRenderRequest,
+               let ruleAttributedText {
+                Text(ruleAttributedText)
+                    .etFont(.body, sampleText: content)
+                    .lineSpacing(lineSpacing)
+                    .foregroundStyle(textColor)
+            } else if enableMarkdown {
+                if let streamingLineParts {
+                    streamingLineMarkdownView(
+                        prefix: streamingLineParts.prefix,
+                        activeLine: streamingLineParts.activeLine,
+                        textColor: textColor,
+                        fontScale: fontScale,
+                        lineSpacing: lineSpacing
                     )
-                } else {
+                } else if let prepared = effectivePreparedContent {
                     markdownTextView(
                         markdownContent: prepared.markdownContent,
                         sampleText: prepared.sourceText,
                         textColor: textColor,
-                        fontScale: fontScale
+                        fontScale: fontScale,
+                        lineSpacing: lineSpacing
+                    )
+                } else {
+                    markdownTextView(
+                        markdownContent: MarkdownContent(content),
+                        sampleText: content,
+                        textColor: textColor,
+                        fontScale: fontScale,
+                        lineSpacing: lineSpacing
                     )
                 }
             } else {
-                markdownTextView(
-                    markdownContent: MarkdownContent(content),
-                    sampleText: content,
-                    textColor: textColor,
-                    fontScale: fontScale
-                )
+                plainTextView(content, textColor: textColor, lineSpacing: lineSpacing)
             }
-        } else {
-            plainTextView(content, textColor: textColor)
         }
+        .task(id: ruleRenderRequest) {
+            guard let request = ruleRenderRequest else {
+                preparedRuleRequest = nil
+                ruleAttributedText = nil
+                return
+            }
+            let prepared = await ChatAppearanceTextRuleRenderer.shared.prepare(request: request)
+            guard !Task.isCancelled else { return }
+            preparedRuleRequest = request
+            ruleAttributedText = prepared
+        }
+    }
+
+    private var ruleRenderRequest: ChatAppearanceTextRuleRenderRequest? {
+        guard !isStreaming else { return nil }
+        let fontRules = FontLibrary.resolvedTextFontRules()
+        let resolvedStyleColors = customTextStyleColors
+            ?? ChatAppearanceTextStyleColors(defaultHex: "000000FF")
+        guard !resolvedStyleColors.customRules.isEmpty || !fontRules.isEmpty else { return nil }
+        return ChatAppearanceTextRuleRenderRequest(
+            source: content,
+            usesMarkdown: enableMarkdown,
+            styleColors: resolvedStyleColors,
+            fontRules: fontRules,
+            fontPointSize: 15,
+            fontScale: FontLibrary.customFontScale,
+            fontFallbackScope: FontLibrary.fallbackScope
+        )
     }
 
     // 流式期间只把短的最后一行作为活动文本，避免整泡切纯文本或扫过气泡背景。
@@ -117,17 +165,17 @@ struct ETAdvancedMarkdownRenderer: View {
         return (prefix, activeLine)
     }
 
-    private func shouldUseMathEngine(_ prepared: ETPreparedMarkdownRenderPayload) -> Bool {
-        enableAdvancedRenderer && enableMathRendering && prepared.containsMathContent
-    }
-
     @ViewBuilder
     private func markdownTextView(
         markdownContent: MarkdownContent,
         sampleText: String,
         textColor: Color,
-        fontScale: Double
+        fontScale: Double,
+        lineSpacing: CGFloat
     ) -> some View {
+        let emphasisTextColor = resolvedStyleColor(customTextStyleColors?.emphasis, fallback: textColor)
+        let strongTextColor = resolvedStyleColor(customTextStyleColors?.strong, fallback: textColor)
+        let codeTextColor = resolvedStyleColor(customTextStyleColors?.code, fallback: textColor)
         Markdown(markdownContent)
             .markdownImageProvider(
                 ETWatchMarkdownImageProvider { item in
@@ -136,10 +184,15 @@ struct ETAdvancedMarkdownRenderer: View {
             )
             .etChatMarkdownBaseStyle(
                 textColor: textColor,
+                emphasisTextColor: emphasisTextColor,
+                strongTextColor: strongTextColor,
+                codeTextColor: codeTextColor,
+                usesCustomCodeTextColor: customTextStyleColors?.usesAutomaticCodeSyntaxHighlighting == false,
                 isOutgoing: isOutgoing,
                 prefersDarkPalette: colorScheme == .dark,
                 sampleText: sampleText,
                 fontScale: fontScale,
+                lineSpacing: lineSpacing,
                 codeHighlightLimit: isStreaming ? 4_096 : 12_000,
                 onCodeBlockHeaderTap: onCodeBlockHeaderTap
             )
@@ -153,32 +206,39 @@ struct ETAdvancedMarkdownRenderer: View {
         prefix: String,
         activeLine: String,
         textColor: Color,
-        fontScale: Double
+        fontScale: Double,
+        lineSpacing: CGFloat
     ) -> some View {
-        let normalizedFontScale = CGFloat(FontLibrary.normalizedFontScale(fontScale))
         VStack(alignment: .leading, spacing: 0) {
             if !prefix.isEmpty {
                 markdownTextView(
                     markdownContent: MarkdownContent(prefix),
                     sampleText: prefix,
                     textColor: textColor,
-                    fontScale: fontScale
+                    fontScale: fontScale,
+                    lineSpacing: lineSpacing
                 )
             }
             ETStreamingActiveLineText(
                 text: activeLine,
                 textColor: textColor,
-                lineSpacing: 2 * normalizedFontScale
+                lineSpacing: lineSpacing
             )
-            .padding(.top, prefix.isEmpty ? 0 : 2 * normalizedFontScale)
+            .padding(.top, prefix.isEmpty ? 0 : lineSpacing)
         }
     }
 
     @ViewBuilder
-    private func plainTextView(_ text: String, textColor: Color) -> some View {
+    private func plainTextView(_ text: String, textColor: Color, lineSpacing: CGFloat) -> some View {
         Text(text)
             .etFont(.body, sampleText: text)
+            .lineSpacing(lineSpacing)
             .foregroundStyle(textColor)
+    }
+
+    private func resolvedStyleColor(_ slot: ChatAppearanceColorSlot?, fallback: Color) -> Color {
+        guard let slot, slot.isEnabled else { return fallback }
+        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: fallback)
     }
 
     private func containsUnclosedFence(in text: String) -> Bool {
@@ -280,94 +340,19 @@ private struct ETStreamingActiveLineText: View {
     }
 }
 
-// TODO: 后续评估让 watchOS 直接消费 iPhone 侧预渲染的高质量公式/图表资源，避免手表端继续背实时渲染依赖。
-private struct ETMathAwareMarkdownView: View {
-    let preparedContent: ETPreparedMarkdownRenderPayload
-    let isOutgoing: Bool
-    let customTextColor: Color?
-    let fontScale: Double
-
-    private var textColor: Color {
-        customTextColor ?? (isOutgoing ? .white : .primary)
-    }
-
-    private var inlineMathFontSize: CGFloat {
-        17 * CGFloat(FontLibrary.normalizedFontScale(fontScale))
-    }
-
-    private var blockMathFontSize: CGFloat {
-        20 * CGFloat(FontLibrary.normalizedFontScale(fontScale))
-    }
-
-    private var blocks: [ETMathRenderBlock] {
-        ETMathRenderBlock.build(from: preparedContent.mathSegments)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                switch block {
-                case .emptyLine:
-                    Color.clear.frame(height: 6)
-                case .blockMath(let latex):
-                    ScrollView(.horizontal) {
-                        ETMathView(
-                            latex: latex,
-                            displayMode: .block,
-                            style: ETMathStyle(fontSize: blockMathFontSize, textColor: textColor)
-                        )
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 2)
-                    }
-                    .padding(.vertical, 2)
-                case .line(let parts):
-                    renderLine(parts)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    @ViewBuilder
-    private func renderLine(_ parts: [ETInlineRenderPart]) -> some View {
-        if parts.contains(where: \.isMath) {
-            let tokens = ETInlineRenderToken.tokens(from: parts)
-            ETInlineMathFlowLayout(itemSpacing: 0, lineSpacing: 4) {
-                ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
-                    switch token {
-                    case .text(let text):
-                        Text(verbatim: text)
-                            .etFont(.body, sampleText: text)
-                            .foregroundStyle(textColor)
-                            .fixedSize(horizontal: true, vertical: true)
-                    case .math(let latex):
-                        ETMathView(
-                            latex: latex,
-                            displayMode: .inline,
-                            style: ETMathStyle(fontSize: inlineMathFontSize, textColor: textColor)
-                        )
-                        .fixedSize(horizontal: true, vertical: true)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            let text = parts.compactMap(\.textValue).joined()
-            Text(verbatim: text)
-                .etFont(.body, sampleText: text)
-                .foregroundStyle(textColor)
-        }
-    }
-}
-
 private extension View {
     @ViewBuilder
     func etChatMarkdownBaseStyle(
         textColor: Color,
+        emphasisTextColor: Color,
+        strongTextColor: Color,
+        codeTextColor: Color,
+        usesCustomCodeTextColor: Bool,
         isOutgoing: Bool,
         prefersDarkPalette: Bool,
         sampleText: String,
         fontScale: Double,
+        lineSpacing: CGFloat,
         codeHighlightLimit: Int = 12_000,
         onCodeBlockHeaderTap: ((String) -> Void)? = nil
     ) -> some View {
@@ -394,9 +379,10 @@ private extension View {
             .markdownSoftBreakMode(.lineBreak)
             .markdownCodeSyntaxHighlighter(
                 ETCodeSyntaxHighlighter(
-                    baseColor: textColor,
+                    baseColor: codeTextColor,
                     isOutgoing: isOutgoing,
                     prefersDarkPalette: prefersDarkPalette,
+                    syntaxHighlightingEnabled: !usesCustomCodeTextColor,
                     maxHighlightedLength: codeHighlightLimit
                 )
             )
@@ -417,7 +403,7 @@ private extension View {
                     FontFamily(.custom(emphasisFontName))
                 }
                 FontStyle(.italic)
-                ForegroundColor(textColor)
+                ForegroundColor(emphasisTextColor)
             }
             .markdownTextStyle(\.strong) {
                 if !usesCharacterFallback,
@@ -425,7 +411,8 @@ private extension View {
                    !strongFontName.isEmpty {
                     FontFamily(.custom(strongFontName))
                 }
-                ForegroundColor(textColor)
+                FontWeight(.bold)
+                ForegroundColor(strongTextColor)
             }
             .markdownTextStyle(\.code) {
                 if !usesCharacterFallback,
@@ -435,7 +422,12 @@ private extension View {
                 } else {
                     FontFamily(.system(.monospaced))
                 }
-                ForegroundColor(textColor)
+                ForegroundColor(codeTextColor)
+            }
+            .markdownBlockStyle(\.paragraph) { configuration in
+                configuration.label
+                    .fixedSize(horizontal: false, vertical: true)
+                    .markdownMargin(top: .zero, bottom: .em(1))
             }
             .markdownBlockStyle(\.blockquote) { configuration in
                 configuration.label
@@ -477,7 +469,6 @@ private extension View {
                 } bodyContent: {
                     ScrollView(.horizontal, showsIndicators: false) {
                         configuration.label
-                            .relativeLineSpacing(.em(0.12))
                             .fixedSize(horizontal: true, vertical: true)
                             .markdownTextStyle {
                                 if !usesCharacterFallback,
@@ -488,7 +479,7 @@ private extension View {
                                     FontFamily(.system(.monospaced))
                                 }
                                 FontSize(.em(0.88))
-                                ForegroundColor(textColor)
+                                ForegroundColor(codeTextColor)
                             }
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
@@ -503,5 +494,17 @@ private extension View {
                 }
                 .markdownMargin(top: .zero, bottom: .em(1))
             }
+            .markdownBlockStyle(\.tableCell) { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        if configuration.row == 0 {
+                            FontWeight(.semibold)
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                    .relativePadding(.horizontal, length: .em(0.72))
+                    .relativePadding(.vertical, length: .em(0.35))
+            }
+            .lineSpacing(lineSpacing)
     }
 }

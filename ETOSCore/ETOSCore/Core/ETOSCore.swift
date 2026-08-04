@@ -13,10 +13,6 @@ import Combine
 import ObjectiveC
 #endif
 
-public enum SettingsIconAppearancePreference {
-    public static let storageKey = "ui.settingsColorfulIconsEnabled"
-}
-
 public enum AppLanguagePreference: String, CaseIterable, Identifiable {
     case system = "system"
     case simplifiedChinese = "zh-Hans"
@@ -68,7 +64,7 @@ public enum AppLanguagePreference: String, CaseIterable, Identifiable {
     public var nativeDisplayName: String {
         switch self {
         case .system:
-            return "跟随系统"
+            return NSLocalizedString("跟随系统", comment: "Follow system language option")
         case .simplifiedChinese:
             return "简体中文"
         case .traditionalChinese:
@@ -158,12 +154,23 @@ public struct ToolPermissionRequest: Identifiable, Equatable {
     public let toolName: String
     public let displayName: String?
     public let arguments: String
+    public let sourceSessionID: UUID?
+    public let toolCallID: String?
     
-    public init(id: UUID = UUID(), toolName: String, displayName: String?, arguments: String) {
+    public init(
+        id: UUID = UUID(),
+        toolName: String,
+        displayName: String?,
+        arguments: String,
+        sourceSessionID: UUID? = nil,
+        toolCallID: String? = nil
+    ) {
         self.id = id
         self.toolName = toolName
         self.displayName = displayName
         self.arguments = arguments
+        self.sourceSessionID = sourceSessionID
+        self.toolCallID = toolCallID
     }
 }
 
@@ -188,6 +195,7 @@ public final class ToolPermissionCenter: ObservableObject {
     @Published public private(set) var autoApproveCountdownSeconds: Int
     @Published public private(set) var autoApproveRemainingSeconds: Int?
     @Published public private(set) var disabledAutoApproveTools: [String]
+    @Published public private(set) var autoPresentationBlockerIDs: Set<String> = []
     
     private var allowAll = false
     private var allowedTools: Set<String> = []
@@ -206,6 +214,10 @@ public final class ToolPermissionCenter: ObservableObject {
     private let autoApproveCountdownMin = 1
     private let autoApproveCountdownMax = 30
 
+    public var canAutoPresentRequestDetails: Bool {
+        autoPresentationBlockerIDs.isEmpty
+    }
+
     private init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         autoApproveEnabled = Self.boolValue(forKey: DefaultsKey.autoApproveEnabled, defaults: defaults, defaultValue: false)
@@ -220,13 +232,25 @@ public final class ToolPermissionCenter: ObservableObject {
         disabledAutoApproveTools = disabledAutoApproveToolSet.sorted()
     }
     
-    public func requestPermission(toolName: String, displayName: String?, arguments: String) async -> ToolPermissionDecision {
+    public func requestPermission(
+        toolName: String,
+        displayName: String?,
+        arguments: String,
+        sourceSessionID: UUID? = nil,
+        toolCallID: String? = nil
+    ) async -> ToolPermissionDecision {
         if allowAll || allowedTools.contains(toolName) {
             return .allowOnce
         }
         
         return await withCheckedContinuation { continuation in
-            let request = ToolPermissionRequest(toolName: toolName, displayName: displayName, arguments: arguments)
+            let request = ToolPermissionRequest(
+                toolName: toolName,
+                displayName: displayName,
+                arguments: arguments,
+                sourceSessionID: sourceSessionID,
+                toolCallID: toolCallID
+            )
             if activeRequest == nil {
                 activeRequest = request
                 activeContinuation = continuation
@@ -311,6 +335,25 @@ public final class ToolPermissionCenter: ObservableObject {
     public func autoApproveRemainingSeconds(for request: ToolPermissionRequest) -> Int? {
         guard activeRequest?.id == request.id else { return nil }
         return autoApproveRemainingSeconds
+    }
+
+    public func setAutoPresentationBlocked(_ blocked: Bool, reason: String) {
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedReason.isEmpty else { return }
+
+        var updatedBlockers = autoPresentationBlockerIDs
+        if blocked {
+            updatedBlockers.insert(normalizedReason)
+        } else {
+            updatedBlockers.remove(normalizedReason)
+        }
+
+        guard updatedBlockers != autoPresentationBlockerIDs else { return }
+        autoPresentationBlockerIDs = updatedBlockers
+    }
+
+    public func hasAutoPresentationBlockers(excluding excludedIDs: Set<String> = []) -> Bool {
+        !autoPresentationBlockerIDs.subtracting(excludedIDs).isEmpty
     }
     
     private func advanceQueueIfNeeded() {
@@ -458,115 +501,4 @@ public final class ToolPermissionCenter: ObservableObject {
 private struct QueuedRequest {
     let request: ToolPermissionRequest
     let continuation: CheckedContinuation<ToolPermissionDecision, Never>
-}
-
-public enum ModelPromptLanguage: Equatable, Sendable {
-    case simplifiedChinese
-    case traditionalChinese
-    case english
-    case japanese
-    case russian
-    case french
-    case spanish
-    case arabic
-
-    public static var current: ModelPromptLanguage {
-        let appLanguage = AppLanguagePreference.storedPreference
-        if let identifier = appLanguage.localizationIdentifier,
-           let language = resolve(identifier: identifier) {
-            return language
-        }
-
-        let identifiers = Bundle.main.preferredLocalizations + Locale.preferredLanguages
-        return resolve(identifiers: identifiers)
-    }
-
-    public static func resolve(identifiers: [String]) -> ModelPromptLanguage {
-        identifiers.lazy.compactMap { resolve(identifier: $0) }.first ?? .english
-    }
-
-    public static func resolve(identifier: String) -> ModelPromptLanguage? {
-        let normalized = identifier.replacingOccurrences(of: "_", with: "-").lowercased()
-        if normalized.hasPrefix("zh-hant") || normalized.hasPrefix("zh-hk") || normalized.hasPrefix("zh-tw") {
-            return .traditionalChinese
-        }
-        if normalized.hasPrefix("zh") {
-            return .simplifiedChinese
-        }
-        if normalized.hasPrefix("en") {
-            return .english
-        }
-        if normalized.hasPrefix("ja") {
-            return .japanese
-        }
-        if normalized.hasPrefix("ru") {
-            return .russian
-        }
-        if normalized.hasPrefix("fr") {
-            return .french
-        }
-        if normalized.hasPrefix("es") {
-            return .spanish
-        }
-        if normalized.hasPrefix("ar") {
-            return .arabic
-        }
-        return nil
-    }
-
-    public var outputInstruction: String {
-        switch self {
-        case .simplifiedChinese:
-            return "输出语言：简体中文。除非用户明确要求其它语言，所有由内置提示词生成的用户可见文本都使用简体中文。"
-        case .traditionalChinese:
-            return "輸出語言：繁體中文。除非使用者明確要求其他語言，所有由內建提示詞產生的使用者可見文字都使用繁體中文。"
-        case .english:
-            return "Output language: English. Unless the user explicitly asks for another language, use English for all user-visible text generated by built-in prompts."
-        case .japanese:
-            return "出力言語：日本語。ユーザーが別の言語を明示しない限り、組み込みプロンプトが生成するユーザー向けテキストは日本語で書いてください。"
-        case .russian:
-            return "Язык вывода: русский. Если пользователь явно не попросил другой язык, весь видимый пользователю текст, созданный встроенными подсказками, пишите по-русски."
-        case .french:
-            return "Langue de sortie : français. Sauf demande explicite d'une autre langue par l'utilisateur, rédigez en français tout texte visible par l'utilisateur généré par les invites intégrées."
-        case .spanish:
-            return "Idioma de salida: español. Salvo que el usuario pida explícitamente otro idioma, escribe en español todo texto visible para el usuario generado por indicaciones integradas."
-        case .arabic:
-            return "لغة الإخراج: العربية. ما لم يطلب المستخدم صراحة لغة أخرى، اكتب بالعربية كل نص ظاهر للمستخدم تولده التعليمات المدمجة."
-        }
-    }
-
-    public var toolArgumentInstruction: String {
-        switch self {
-        case .simplifiedChinese:
-            return "生成工具参数中的标题、问题、选项、说明、记忆内容等用户可见文本时，请使用简体中文，除非用户明确指定其它语言。"
-        case .traditionalChinese:
-            return "產生工具參數中的標題、問題、選項、說明、記憶內容等使用者可見文字時，請使用繁體中文，除非使用者明確指定其他語言。"
-        case .english:
-            return "When creating user-visible tool arguments such as titles, questions, options, descriptions, or memory content, use English unless the user explicitly specifies another language."
-        case .japanese:
-            return "タイトル、質問、選択肢、説明、記憶内容など、ユーザーに見えるツール引数を作るときは、ユーザーが別の言語を明示しない限り日本語を使用してください。"
-        case .russian:
-            return "Создавая видимые пользователю аргументы инструмента, например заголовки, вопросы, варианты, описания или содержимое памяти, используйте русский, если пользователь явно не указал другой язык."
-        case .french:
-            return "Pour les arguments d'outil visibles par l'utilisateur, comme les titres, questions, options, descriptions ou contenus de mémoire, utilisez le français sauf indication contraire explicite de l'utilisateur."
-        case .spanish:
-            return "Al crear argumentos de herramienta visibles para el usuario, como títulos, preguntas, opciones, descripciones o contenido de memoria, usa español salvo que el usuario indique explícitamente otro idioma."
-        case .arabic:
-            return "عند إنشاء وسائط أدوات ظاهرة للمستخدم، مثل العناوين أو الأسئلة أو الخيارات أو الأوصاف أو محتوى الذاكرة، استخدم العربية ما لم يحدد المستخدم لغة أخرى صراحة."
-        }
-    }
-
-    public static func appendingOutputInstruction(to prompt: String, language: ModelPromptLanguage = .current) -> String {
-        append(language.outputInstruction, to: prompt)
-    }
-
-    public static func appendingToolArgumentInstruction(to description: String, language: ModelPromptLanguage = .current) -> String {
-        append(language.toolArgumentInstruction, to: description)
-    }
-
-    private static func append(_ instruction: String, to text: String) -> String {
-        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedText.isEmpty else { return instruction }
-        return "\(trimmedText)\n\n\(instruction)"
-    }
 }

@@ -75,11 +75,27 @@ public final class LocalModelStore: ObservableObject {
         fileManager.fileExists(atPath: fileURL(for: record).path)
     }
 
-    public func importModel(from sourceURL: URL, displayName: String? = nil) throws -> LocalModelRecord {
+    public func mmprojURL(for record: LocalModelRecord) -> URL? {
+        guard let relativePath = record.mmprojRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
+            return nil
+        }
+        return directoryURL.appendingPathComponent(relativePath)
+    }
+
+    public func mmprojFileExists(for record: LocalModelRecord) -> Bool {
+        guard let url = mmprojURL(for: record) else { return false }
+        return fileManager.fileExists(atPath: url.path)
+    }
+
+    public func importModel(from sourceURL: URL, displayName: String? = nil, mmprojURL: URL? = nil) throws -> LocalModelRecord {
         let didStartSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+        let didStartProjectorSecurityScope = mmprojURL?.startAccessingSecurityScopedResource() ?? false
         defer {
             if didStartSecurityScope {
                 sourceURL.stopAccessingSecurityScopedResource()
+            }
+            if didStartProjectorSecurityScope {
+                mmprojURL?.stopAccessingSecurityScopedResource()
             }
         }
 
@@ -87,9 +103,11 @@ public final class LocalModelStore: ObservableObject {
         let destinationFileName = uniqueFileName(for: sourceFileName)
         let destinationURL = directoryURL.appendingPathComponent(destinationFileName)
         try fileManager.copyItem(at: sourceURL, to: destinationURL)
+        let importedProjector = try mmprojURL.map { try copyProjectorFile(from: $0) }
         return try registerImportedFile(
             fileName: destinationFileName,
-            displayName: displayName ?? sourceURL.deletingPathExtension().lastPathComponent
+            displayName: displayName ?? sourceURL.deletingPathExtension().lastPathComponent,
+            importedProjector: importedProjector
         )
     }
 
@@ -110,7 +128,9 @@ public final class LocalModelStore: ObservableObject {
         updated.updatedAt = Date()
 
         if let index = models.firstIndex(where: { $0.id == updated.id }) {
+            let oldRecord = models[index]
             models[index] = updated
+            removeProjectorFileIfUnreferenced(from: oldRecord, replacingWith: updated)
         } else {
             models.append(updated)
         }
@@ -151,6 +171,8 @@ public final class LocalModelStore: ObservableObject {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         }
         record.ignoreEOS = model.overrideParameters.localBoolValue(for: "ignore_eos")
+        record.imageMinTokens = model.overrideParameters.localIntValue(for: "image_min_tokens")
+        record.imageMaxTokens = model.overrideParameters.localIntValue(for: "image_max_tokens")
         if let samplerSequence = model.overrideParameters.localStringValue(for: "sampler_seq") {
             let samplerKinds = LocalLLMSamplerKind.parse(samplerSequence)
             record.samplerKinds = samplerKinds.isEmpty ? nil : samplerKinds
@@ -165,8 +187,20 @@ public final class LocalModelStore: ObservableObject {
 
     public func delete(_ record: LocalModelRecord, deleteFile: Bool = true) {
         models.removeAll { $0.id == record.id }
+        for index in models.indices {
+            if models[index].speechDecoderModelID == record.id {
+                models[index].speechDecoderModelID = nil
+            }
+            if models[index].speechVADModelID == record.id {
+                models[index].speechVADModelID = nil
+            }
+        }
         if deleteFile {
             try? fileManager.removeItem(at: fileURL(for: record))
+            if let mmprojRelativePath = record.mmprojRelativePath,
+               !models.contains(where: { $0.mmprojRelativePath == mmprojRelativePath }) {
+                deleteProjectorFile(relativePath: mmprojRelativePath)
+            }
         }
         persistModels()
         NotificationCenter.default.post(name: .localModelStoreDidChange, object: nil)
@@ -176,21 +210,53 @@ public final class LocalModelStore: ObservableObject {
         models.filter { $0.isActivated && fileExists(for: $0) }
     }
 
-    private func registerImportedFile(fileName: String, displayName: String) throws -> LocalModelRecord {
+    @discardableResult
+    public func copyMultimodalProjector(from sourceURL: URL, into record: inout LocalModelRecord) throws -> LocalModelRecord {
+        let didStartSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if didStartSecurityScope {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+        let importedProjector = try copyProjectorFile(from: sourceURL)
+        record.mmprojFileName = importedProjector.fileName
+        record.mmprojRelativePath = importedProjector.relativePath
+        record.mmprojFileSize = importedProjector.fileSize
+        record.normalizeGenerationParameters()
+        return record
+    }
+
+    public func deleteProjectorFile(relativePath: String) {
+        let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? fileManager.removeItem(at: directoryURL.appendingPathComponent(trimmed))
+    }
+
+    private func registerImportedFile(
+        fileName: String,
+        displayName: String,
+        importedProjector: ImportedProjectorFile? = nil
+    ) throws -> LocalModelRecord {
         let destinationURL = directoryURL.appendingPathComponent(fileName)
         let attributes = try fileManager.attributesOfItem(atPath: destinationURL.path)
         let size = attributes[.size] as? Int64 ?? 0
         let now = Date()
-        let record = LocalModelRecord(
+        var record = LocalModelRecord(
             displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 ?? URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent,
             fileName: fileName,
             relativePath: fileName,
             fileSize: size,
+            mmprojFileName: importedProjector?.fileName,
+            mmprojRelativePath: importedProjector?.relativePath,
+            mmprojFileSize: importedProjector?.fileSize,
+            ggufArchitecture: LocalGGUFMetadata.architecture(at: destinationURL),
             createdAt: now,
             updatedAt: now
         )
+        autoLinkSpeechCompanions(to: &record)
         models.append(record)
+        linkNewSpeechCompanion(record)
         persistModels()
         if !isProviderEnabled {
             setProviderEnabled(true)
@@ -199,14 +265,104 @@ public final class LocalModelStore: ObservableObject {
         return record
     }
 
+    private func autoLinkSpeechCompanions(to record: inout LocalModelRecord) {
+        guard let architecture = record.speechArchitecture else { return }
+        if architecture.requiresDecoderModel {
+            record.speechDecoderModelID = models.first {
+                $0.ggufArchitecture == "qwen3" && fileExists(for: $0)
+            }?.id
+        }
+        if architecture.isTranscriptionModel {
+            record.speechVADModelID = models.first {
+                $0.speechArchitecture == .fsmnVAD && fileExists(for: $0)
+            }?.id
+        }
+    }
+
+    private func linkNewSpeechCompanion(_ record: LocalModelRecord) {
+        if record.ggufArchitecture == "qwen3" {
+            for index in models.indices where
+                models[index].speechArchitecture == .funASRNanoEncoder
+                    && models[index].speechDecoderModelID == nil {
+                models[index].speechDecoderModelID = record.id
+            }
+        }
+        if record.speechArchitecture == .fsmnVAD {
+            for index in models.indices where
+                models[index].isSpeechTranscriptionModel
+                    && models[index].speechVADModelID == nil {
+                models[index].speechVADModelID = record.id
+            }
+        }
+    }
+
+    private struct ImportedProjectorFile {
+        var fileName: String
+        var relativePath: String
+        var fileSize: Int64
+    }
+
+    private func copyProjectorFile(from sourceURL: URL) throws -> ImportedProjectorFile {
+        let sourceFileName = sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "mmproj.gguf"
+        let destinationFileName = uniqueFileName(for: sourceFileName)
+        let destinationURL = directoryURL.appendingPathComponent(destinationFileName)
+        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+        let attributes = try fileManager.attributesOfItem(atPath: destinationURL.path)
+        return ImportedProjectorFile(
+            fileName: destinationFileName,
+            relativePath: destinationFileName,
+            fileSize: attributes[.size] as? Int64 ?? 0
+        )
+    }
+
+    private func removeProjectorFileIfUnreferenced(from oldRecord: LocalModelRecord, replacingWith newRecord: LocalModelRecord) {
+        guard let oldRelativePath = oldRecord.mmprojRelativePath,
+              !oldRelativePath.isEmpty,
+              oldRelativePath != newRecord.mmprojRelativePath else {
+            return
+        }
+        let isStillReferenced = models.contains { record in
+            record.id != oldRecord.id && record.mmprojRelativePath == oldRelativePath
+        }
+        if !isStillReferenced {
+            deleteProjectorFile(relativePath: oldRelativePath)
+        }
+    }
+
     private func loadModels() -> [LocalModelRecord] {
         let metadataURL = metadataURL()
         guard let data = try? Data(contentsOf: metadataURL) else { return [] }
         do {
             let snapshot = try JSONDecoder.localModelDecoder.decode(LocalModelStoreSnapshot.self, from: data)
-            let models = snapshot.schemaVersion < 2
+            var models = snapshot.schemaVersion < 2
                 ? snapshot.models.map { $0.removingLegacyForcedDefaultOverrides() }
                 : snapshot.models
+            for index in models.indices where models[index].ggufArchitecture == nil {
+                let url = directoryURL.appendingPathComponent(models[index].relativePath)
+                models[index].ggufArchitecture = LocalGGUFMetadata.architecture(at: url)
+            }
+            let qwenDecoderID = models.first {
+                $0.ggufArchitecture == "qwen3"
+                    && fileManager.fileExists(
+                        atPath: directoryURL.appendingPathComponent($0.relativePath).path
+                    )
+            }?.id
+            let vadModelID = models.first {
+                $0.speechArchitecture == .fsmnVAD
+                    && fileManager.fileExists(
+                        atPath: directoryURL.appendingPathComponent($0.relativePath).path
+                    )
+            }?.id
+            for index in models.indices {
+                if models[index].speechArchitecture == .funASRNanoEncoder,
+                   models[index].speechDecoderModelID == nil {
+                    models[index].speechDecoderModelID = qwenDecoderID
+                }
+                if models[index].isSpeechTranscriptionModel,
+                   models[index].speechVADModelID == nil {
+                    models[index].speechVADModelID = vadModelID
+                }
+            }
             return models.sorted { lhs, rhs in
                 if lhs.createdAt == rhs.createdAt {
                     return lhs.id.uuidString < rhs.id.uuidString

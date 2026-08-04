@@ -138,6 +138,8 @@ bool emit_text_chunk(
 
 local_generation_params generation_params_from_config(const etos_local_llm_generation_config & config) {
     local_generation_params params;
+    params.mmproj_path = config.mmproj_path ? config.mmproj_path : "";
+    params.kv_cache_key = config.kv_cache_key ? config.kv_cache_key : "";
     params.context_size = std::max<int32_t>(1, config.context_size);
     params.max_output_tokens = std::max<int32_t>(1, config.max_output_tokens);
     params.gpu_layers = config.gpu_layers;
@@ -155,6 +157,7 @@ local_generation_params generation_params_from_config(const etos_local_llm_gener
         break;
     }
     params.use_model_cache = config.use_model_cache != 0;
+    params.reuse_kv_cache = config.reuse_kv_cache != 0;
     params.seed = config.seed;
     params.min_keep = config.min_keep;
     params.top_k = config.top_k;
@@ -193,6 +196,8 @@ local_generation_params generation_params_from_config(const etos_local_llm_gener
     }
     params.grammar = config.grammar ? config.grammar : "";
     params.ignore_eos = config.ignore_eos != 0;
+    params.image_min_tokens = config.image_min_tokens;
+    params.image_max_tokens = config.image_max_tokens;
     params.chat_template_kwargs.clear();
     for (int32_t index = 0;
          config.chat_template_kwarg_keys
@@ -203,6 +208,24 @@ local_generation_params generation_params_from_config(const etos_local_llm_gener
         const char * value = config.chat_template_kwarg_values[index];
         if (key && key[0] != '\0' && value) {
             params.chat_template_kwargs[key] = value;
+        }
+    }
+    params.media_attachments.clear();
+    for (int32_t index = 0;
+         config.media_data
+            && config.media_data_sizes
+            && config.media_ids
+            && index < config.media_count;
+         ++index) {
+        const unsigned char * data = config.media_data[index];
+        const int64_t size = config.media_data_sizes[index];
+        const char * id = config.media_ids[index];
+        if (data && size > 0 && id && id[0] != '\0') {
+            params.media_attachments.push_back({
+                id,
+                data,
+                static_cast<size_t>(size),
+            });
         }
     }
     return params;
@@ -231,7 +254,31 @@ std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string &
 }
 
 std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab, const std::string & prompt) {
-    return tokenize(vocab, prompt, true);
+    std::vector<llama_token> tokens = tokenize(vocab, prompt, true);
+    if (tokens.empty()) {
+        return tokens;
+    }
+
+    // GGUF 记录了是否由 tokenizer 自动补 BOS/EOS；模板里已经展开时只折叠重复项。
+    const llama_token bos = llama_vocab_bos(vocab);
+    if (llama_vocab_get_add_bos(vocab)
+        && bos != LLAMA_TOKEN_NULL
+        && tokens.size() >= 2
+        && tokens[0] == bos
+        && tokens[1] == bos) {
+        tokens.erase(tokens.begin());
+    }
+
+    const llama_token eos = llama_vocab_eos(vocab);
+    if (llama_vocab_get_add_eos(vocab)
+        && eos != LLAMA_TOKEN_NULL
+        && tokens.size() >= 2
+        && tokens[tokens.size() - 1] == eos
+        && tokens[tokens.size() - 2] == eos) {
+        tokens.pop_back();
+    }
+
+    return tokens;
 }
 
 std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
@@ -267,9 +314,10 @@ llama_sampler_handle create_sampler(
         return {};
     }
 
-    if (params.ignore_eos) {
+    const llama_token eos_token = llama_vocab_eos(vocab);
+    if (params.ignore_eos && eos_token != LLAMA_TOKEN_NULL) {
         llama_logit_bias eos_bias = {
-            llama_vocab_eos(vocab),
+            eos_token,
             -INFINITY
         };
         llama_sampler_chain_add(sampler.get(), llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), 1, &eos_bias));

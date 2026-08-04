@@ -276,14 +276,36 @@ extension ChatBubble {
     }
 
     var customTextColorOverride: Color? {
-        if colorScheme == .dark {
-            let slot = activeAppearanceProfile.darkText
-            guard slot.isEnabled else { return nil }
-            return ChatAppearanceColorCodec.color(from: slot.hex, fallback: .white)
+        let slot: ChatAppearanceColorSlot
+        let fallback: Color
+        if isOutgoing {
+            if colorScheme == .dark {
+                slot = activeAppearanceProfile.userDarkText
+                fallback = .white
+            } else {
+                slot = activeAppearanceProfile.userLightText
+                fallback = .white
+            }
+        } else if colorScheme == .dark {
+            slot = activeAppearanceProfile.assistantDarkText
+            fallback = .white
+        } else {
+            slot = activeAppearanceProfile.assistantLightText
+            fallback = .primary
         }
-        let slot = activeAppearanceProfile.lightText
         guard slot.isEnabled else { return nil }
-        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: .primary)
+        return ChatAppearanceColorCodec.color(from: slot.hex, fallback: fallback)
+    }
+
+    var customTextStyleColors: ChatAppearanceTextStyleColors {
+        if isOutgoing {
+            return colorScheme == .dark
+                ? activeAppearanceProfile.userDarkTextStyles
+                : activeAppearanceProfile.userLightTextStyles
+        }
+        return colorScheme == .dark
+            ? activeAppearanceProfile.assistantDarkTextStyles
+            : activeAppearanceProfile.assistantLightTextStyles
     }
 
     var isOutgoing: Bool {
@@ -427,7 +449,7 @@ extension ChatBubble {
         let availableBubbleWidth = max(1, baseWidth - rowChromeWidth)
         let widthRatio: CGFloat
         if usesNoBubbleStyle {
-            widthRatio = 0.92
+            widthRatio = 0.96
         } else if isOutgoing {
             widthRatio = 0.88
         } else {
@@ -577,7 +599,7 @@ extension ChatBubble {
     }
 
     func resolvedTextColor(default defaultColor: Color) -> Color {
-        customTextColorOverride ?? defaultColor
+        return customTextColorOverride ?? defaultColor
     }
 
     func resolvedSecondaryTextColor(default defaultColor: Color, customOpacity: Double = 0.78) -> Color {

@@ -16,6 +16,10 @@ extension ChatViewModel {
         chatService.deleteMessage(message)
     }
 
+    func deleteMessages(withIDs messageIDs: Set<UUID>) {
+        chatService.deleteMessages(withIDs: messageIDs)
+    }
+
     func deleteSession(at offsets: IndexSet) {
         let sessionsToDelete = offsets.map { chatSessions[$0] }
         chatService.deleteSessions(sessionsToDelete)
@@ -28,6 +32,9 @@ extension ChatViewModel {
     func messageCount(for session: ChatSession) -> Int {
         if session.id == currentSession?.id {
             return allMessagesForSession.count
+        }
+        if let temporaryCount = chatService.temporaryChatMessageCount(for: session.id) {
+            return temporaryCount
         }
         return Persistence.loadMessageCount(for: session.id)
     }
@@ -59,6 +66,29 @@ extension ChatViewModel {
         chatService.createNewSession()
     }
 
+    func isTemporaryChatEnabled(for sessionID: UUID?) -> Bool {
+        chatService.isTemporaryChatEnabled(for: sessionID)
+    }
+
+    func temporaryChatMemoryMode(for sessionID: UUID?) -> TemporaryChatMemoryMode? {
+        chatService.temporaryChatMemoryMode(for: sessionID)
+    }
+
+    func performTemporaryChatTap(
+        preferredMemoryMode: TemporaryChatMemoryMode,
+        canEnable: Bool
+    ) -> TemporaryChatTapOutcome {
+        chatService.performTemporaryChatTap(
+            preferredMemoryMode: preferredMemoryMode,
+            canEnable: canEnable
+        )
+    }
+
+    @discardableResult
+    func saveCurrentTemporarySession() -> Bool {
+        chatService.saveCurrentTemporaryChat()
+    }
+
     func reloadPersistedDataAfterLegacyJSONMigration() {
         chatService.reloadSessionStateFromPersistenceAfterMigration()
     }
@@ -71,8 +101,7 @@ extension ChatViewModel {
         let coordinator = DailyPulseDeliveryCoordinator.shared
         await DailyPulseManager.shared.generateForScheduledDeliveryIfNeeded(
             reminderEnabled: coordinator.reminderEnabled,
-            reminderHour: coordinator.reminderHour,
-            reminderMinute: coordinator.reminderMinute,
+            deliveryTimes: coordinator.deliveryTimes,
             referenceDate: referenceDate
         )
     }
@@ -203,10 +232,22 @@ extension ChatViewModel {
         }
     }
 
+    func retryVideoAnalysis(
+        _ message: ChatMessage,
+        fileName: String
+    ) async throws -> VideoAnalysisResult {
+        try await chatService.retryVideoAnalysis(
+            messageID: message.id,
+            fileName: fileName,
+            sessionID: currentSession?.id
+        )
+    }
+
     func rewriteMessage(
         _ message: ChatMessage,
         instruction: String,
-        referenceVersions: [MessageRewriteReferenceVersion] = []
+        referenceVersions: [MessageRewriteReferenceVersion] = [],
+        selectionTarget: MessageRewriteSelectionTarget? = nil
     ) {
         let sessionID = currentSession?.id
         Task {
@@ -216,7 +257,8 @@ extension ChatViewModel {
                     instruction: instruction,
                     aiTemperature: aiTemperature,
                     sessionID: sessionID,
-                    referenceVersions: referenceVersions
+                    referenceVersions: referenceVersions,
+                    selectionTarget: selectionTarget
                 )
             } catch is CancellationError {
             } catch {

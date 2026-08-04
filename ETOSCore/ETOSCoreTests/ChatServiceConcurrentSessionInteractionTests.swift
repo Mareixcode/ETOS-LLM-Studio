@@ -15,6 +15,71 @@ import Combine
 struct ChatServiceConcurrentSessionInteractionTests {
 
     @MainActor
+    @Test("切回后台运行会话时优先使用运行期消息快照")
+    func testActivatingRunningBackgroundSessionUsesRuntimeMessageSnapshot() {
+        let service = ChatService(memoryManager: MemoryManager())
+        let sessionA = service.createSavedSession(name: "后台工具会话")
+        let sessionB = service.createSavedSession(name: "当前会话")
+        defer {
+            service.deleteSessions([sessionA, sessionB])
+        }
+
+        let toolCall = InternalToolCall(
+            id: "call_widget",
+            toolName: "app_show_widget",
+            arguments: #"{"widget_code":"<div>hi</div>"}"#
+        )
+        let staleAssistant = ChatMessage(
+            role: .assistant,
+            content: "",
+            toolCalls: [toolCall],
+            responseGroupID: sessionA.id,
+            responseAttemptID: UUID(),
+            responseAttemptIndex: 0
+        )
+        Persistence.saveMessages([staleAssistant], for: sessionA.id)
+
+        var resolvedCall = toolCall
+        resolvedCall.result = "OK"
+        let freshAssistant = ChatMessage(
+            id: staleAssistant.id,
+            role: .assistant,
+            content: "",
+            toolCalls: [resolvedCall],
+            responseGroupID: staleAssistant.responseGroupID,
+            responseAttemptID: staleAssistant.responseAttemptID,
+            responseAttemptIndex: staleAssistant.responseAttemptIndex
+        )
+        let followUpLoading = ChatMessage(
+            role: .assistant,
+            content: "",
+            responseGroupID: staleAssistant.responseGroupID,
+            responseAttemptID: staleAssistant.responseAttemptID,
+            responseAttemptIndex: staleAssistant.responseAttemptIndex
+        )
+        let runtimeMessages = [freshAssistant, followUpLoading]
+        let token = UUID()
+        service.setRequestContext(
+            ChatService.RequestExecutionContext(
+                token: token,
+                task: nil,
+                loadingMessageID: followUpLoading.id,
+                imageGenerationContext: nil
+            ),
+            for: sessionA.id
+        )
+        service.storeRuntimeMessagesSnapshot(runtimeMessages, for: sessionA.id)
+
+        service.setCurrentSession(sessionB)
+        let activatedMessages = service.messagesForSessionActivation(sessionA.id)
+
+        #expect(activatedMessages.map(\.id) == runtimeMessages.map(\.id))
+        #expect(activatedMessages.first?.toolCalls?.first?.result == "OK")
+
+        service.clearRequestContextIfNeeded(for: sessionA.id, token: token)
+    }
+
+    @MainActor
     @Test("cancelRequest(for:) 仅取消目标会话，不影响其他会话请求")
     func testCancelRequestOnlyAffectsTargetSession() async throws {
         let originalProviders = ConfigLoader.loadProviders()
@@ -95,8 +160,18 @@ struct ChatServiceConcurrentSessionInteractionTests {
             ControlledSessionURLProtocol.hasStarted(marker: "B")
         }
 
+        var runningAtCancelEvent: Set<UUID>?
+        let statusCancellable = service.sessionRequestStatusSubject.sink { event in
+            guard event.sessionID == sessionA.id, event.status == .cancelled else { return }
+            runningAtCancelEvent = service.runningSessionIDsSubject.value
+        }
+
         await service.cancelRequest(for: sessionA.id)
+        statusCancellable.cancel()
         let runningAfterCancelA = service.runningSessionIDsSubject.value
+        let runningAtCancelledEvent = try #require(runningAtCancelEvent)
+        #expect(!runningAtCancelledEvent.contains(sessionA.id))
+        #expect(runningAtCancelledEvent.contains(sessionB.id))
         #expect(!runningAfterCancelA.contains(sessionA.id))
         #expect(runningAfterCancelA.contains(sessionB.id))
 
@@ -178,12 +253,12 @@ struct ChatServiceConcurrentSessionInteractionTests {
         )
 
         let storedMessages = Persistence.loadMessages(for: testSession.id)
+        let assistantMessage = storedMessages.first { $0.role == .assistant }
+        let errorMessage = storedMessages.first { $0.role == .error }
         #expect(storedMessages.count == 3)
-        #expect(storedMessages[0].role == .user)
-        #expect(storedMessages[1].role == .assistant)
-        #expect(storedMessages[1].content == "第一段回复")
-        #expect(storedMessages[2].role == .error)
-        #expect(storedMessages[2].content.contains("网络连接已经断开。"))
+        #expect(storedMessages.map(\.role) == [.user, .assistant, .error])
+        #expect(assistantMessage?.content == "第一段回复")
+        #expect(errorMessage?.content.contains("网络连接已经断开。") == true)
     }
 
     @MainActor
@@ -249,9 +324,10 @@ struct ChatServiceConcurrentSessionInteractionTests {
         )
 
         let storedMessages = Persistence.loadMessages(for: testSession.id)
+        let assistantMessage = storedMessages.first { $0.role == .assistant }
         #expect(storedMessages.count == 3)
-        #expect(storedMessages[1].role == .assistant)
-        #expect(storedMessages[1].content == "第一段回复")
+        #expect(storedMessages.map(\.role) == [.user, .assistant, .error])
+        #expect(assistantMessage?.content == "第一段回复")
 
         let errorMessage = try #require(storedMessages.last)
         #expect(errorMessage.role == .error)
@@ -656,7 +732,7 @@ private final class ControlledStreamingURLProtocol: URLProtocol {
                 url: requestURL,
                 statusCode: 200,
                 httpVersion: nil,
-                headerFields: ["Content-Type": "text/plain; charset=utf-8"]
+                headerFields: ["Content-Type": "text/event-stream; charset=utf-8"]
             )!
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
 
@@ -879,7 +955,7 @@ private final class StreamingFailureURLProtocol: URLProtocol {
                 url: requestURL,
                 statusCode: 200,
                 httpVersion: nil,
-                headerFields: ["Content-Type": "text/plain; charset=utf-8"]
+                headerFields: ["Content-Type": "text/event-stream; charset=utf-8"]
             )!
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
 

@@ -1,0 +1,120 @@
+// ============================================================================
+// RoleplayStoreThreadingTests.swift
+// ============================================================================
+// ETOS LLM Studio
+//
+// 验证角色扮演存储的线程约束与角色卡内容持久化。
+// ============================================================================
+
+import Foundation
+import Testing
+@testable import ETOSCore
+
+@Suite("角色扮演存储", .serialized)
+struct RoleplayStoreThreadingTests {
+    @Test("后台保存完成后在主线程发布变更通知")
+    func postsChangeNotificationOnMainThread() async {
+        let store = RoleplayStore.shared
+        let character = RoleplayCharacter(name: "线程回归测试")
+        let observer = NotificationObserverToken()
+
+        let wasDeliveredOnMainThread = await withCheckedContinuation { continuation in
+            let token = NotificationCenter.default.addObserver(
+                forName: RoleplayStore.didChangeNotification,
+                object: store,
+                queue: nil
+            ) { notification in
+                let changeKind = notification.userInfo?[RoleplayStore.changeKindUserInfoKey] as? String
+                guard changeKind == RoleplayStore.libraryChangeKind else { return }
+                continuation.resume(returning: Thread.isMainThread)
+            }
+            observer.store(token)
+
+            DispatchQueue.global(qos: .utility).async {
+                store.upsertCharacter(character)
+            }
+        }
+
+        observer.remove()
+        store.deleteCharacter(id: character.id)
+        #expect(wasDeliveredOnMainThread)
+    }
+
+    @Test("角色卡内容编辑后保留扩展字段")
+    func persistsEditableCharacterContentWithoutDroppingExtensions() {
+        let store = RoleplayStore.shared
+        var character = RoleplayCharacter(
+            name: "内容编辑回归测试",
+            description: "旧描述",
+            firstMessage: "旧开场白",
+            alternateGreetings: ["旧候选开场白"],
+            regexRules: [RoleplayRegexRule(scriptName: "旧正则", findRegex: "old")],
+            helperScripts: [RoleplayHelperScript(name: "旧脚本", content: "old")],
+            initialVariables: ["score": .int(1)],
+            extensions: ["vendor": .string("preserved")]
+        )
+        defer { store.deleteCharacter(id: character.id) }
+        store.upsertCharacter(character)
+
+        character.description = "新描述"
+        character.firstMessage = "新开场白"
+        character.alternateGreetings = ["新候选开场白一", "新候选开场白二"]
+        character.systemPrompt = "新系统提示词"
+        character.regexRules = [RoleplayRegexRule(scriptName: "新正则", findRegex: "new")]
+        character.helperScripts = [RoleplayHelperScript(name: "新脚本", content: "new")]
+        character.initialVariables = ["score": .int(2)]
+        store.upsertCharacter(character)
+
+        let saved = store.character(id: character.id)
+        #expect(saved?.description == "新描述")
+        #expect(saved?.firstMessage == "新开场白")
+        #expect(saved?.alternateGreetings.count == 2)
+        #expect(saved?.systemPrompt == "新系统提示词")
+        #expect(saved?.regexRules.first?.scriptName == "新正则")
+        #expect(saved?.helperScripts.first?.content == "new")
+        #expect(saved?.initialVariables["score"] == .int(2))
+        #expect(saved?.extensions["vendor"] == .string("preserved"))
+    }
+
+    @Test("未绑定角色卡时仍可保存用户身份")
+    func persistsPersonaWithoutCharacterBinding() {
+        let store = RoleplayStore.shared
+        let sessionID = UUID()
+        let persona = PersonaProfile(name: "独立用户身份")
+        defer {
+            store.removeBinding(sessionID: sessionID)
+            store.deletePersona(id: persona.id)
+        }
+        store.upsertPersona(persona)
+        store.upsertBinding(SessionRoleplayBinding(
+            sessionID: sessionID,
+            characterIDs: [],
+            personaID: persona.id
+        ))
+
+        let binding = store.binding(sessionID: sessionID)
+        #expect(binding?.characterIDs.isEmpty == true)
+        #expect(binding?.personaID == persona.id)
+    }
+}
+
+private final class NotificationObserverToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var token: NSObjectProtocol?
+
+    func store(_ token: NSObjectProtocol) {
+        lock.lock()
+        self.token = token
+        lock.unlock()
+    }
+
+    func remove() {
+        lock.lock()
+        let current = token
+        token = nil
+        lock.unlock()
+        if let current {
+            NotificationCenter.default.removeObserver(current)
+        }
+    }
+}

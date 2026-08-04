@@ -38,11 +38,15 @@ extension ChatView {
                         viewModel.userInput = newValue
                     }
                 ),
-                isSending: viewModel.isSendingMessage,
+                isRequestControlsExpanded: $isComposerRequestControlsExpanded,
+                isSending: viewModel.isSendingMessage || viewModel.isSendDelayPending,
                 sendAction: {
                     guard viewModel.canSendMessage else { return }
+                    shouldKeepBottomPinned = true
+                    showScrollToBottom = false
                     let outgoingText = draftText
-                    if AppConfigStore.shared.chatSendAnimationEnabled {
+                    if AppConfigStore.shared.chatSendAnimationEnabled,
+                       AppConfigStore.shared.chatSendDelaySeconds <= 0 {
                         // 启动「输入框 → 气泡」Overlay 飞行（内部已调用 viewModel.sendMessage()）
                         beginSendFlight(text: outgoingText)
                     } else {
@@ -53,6 +57,7 @@ extension ChatView {
                 stopAction: {
                     viewModel.cancelSending()
                 },
+                slashCommandAction: performSlashCommand,
                 focus: $composerFocused
             )
             .onReceive(viewModel.$userInput) { newValue in
@@ -67,6 +72,18 @@ extension ChatView {
                 }
             }
             .padding(.bottom, -tabBarCompensation)
+        }
+    }
+
+    /// 收起键盘和输入栏临时面板；外部点击只改变输入状态，不触发消息内容。
+    func dismissComposerInput() {
+        composerFocused = false
+        guard isComposerRequestControlsExpanded else { return }
+        let animation: Animation = accessibilityReduceMotion
+            ? .easeOut(duration: 0.16)
+            : .spring(response: 0.34, dampingFraction: 0.94)
+        withAnimation(animation) {
+            isComposerRequestControlsExpanded = false
         }
     }
 }

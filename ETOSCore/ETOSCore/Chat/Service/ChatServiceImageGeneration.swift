@@ -66,10 +66,6 @@ extension ChatService {
             return
         }
 
-        logger.info(
-            "开始生图流程: session=\(currentSession.id.uuidString), provider=\(runnableModel.provider.name), model=\(runnableModel.model.displayName), promptLength=\(trimmedPrompt.count), referenceCount=\(imageAttachments.count), runtimeOverrideCount=\(runtimeOverrideParameters.count)"
-        )
-
         guard let adapter = adapters[runnableModel.provider.apiFormat] else {
             let reason = String(
                 format: NSLocalizedString("错误: 找不到适用于 '%@' 格式的 API 适配器。", comment: "Missing API adapter error"),
@@ -89,8 +85,8 @@ extension ChatService {
             return
         }
 
-        guard runnableModel.model.supportsImageGeneration else {
-            let reason = NSLocalizedString("当前模型不可用于生图，请在模型设置中将用途设为图片生成，或在模型能力中开启可生成图片。", comment: "模型没有生图能力提示")
+        guard runnableModel.model.usesDedicatedImageGenerationEndpoint else {
+            let reason = NSLocalizedString("当前模型不可用于独立生图，请在模型设置中将模型类型设为图像。", comment: "模型不是图像类型提示")
             addErrorMessage(reason, sessionID: currentSession.id)
             requestStatusSubject.send(.error)
             imageGenerationStatusSubject.send(
@@ -104,6 +100,19 @@ extension ChatService {
             )
             return
         }
+
+        let existingMessages = messagesSnapshot(for: currentSession.id)
+        let effectiveReferenceImages: [ImageAttachment]
+        if imageAttachments.isEmpty, runnableModel.model.supportsVisionInput {
+            effectiveReferenceImages = latestAssistantImageReference(in: existingMessages).map { [$0] } ?? []
+        } else {
+            effectiveReferenceImages = imageAttachments
+        }
+        let reusedAssistantImage = imageAttachments.isEmpty && !effectiveReferenceImages.isEmpty
+
+        logger.info(
+            "开始生图流程: session=\(currentSession.id.uuidString), provider=\(runnableModel.provider.name), model=\(runnableModel.model.displayName), promptLength=\(trimmedPrompt.count), explicitReferenceCount=\(imageAttachments.count), effectiveReferenceCount=\(effectiveReferenceImages.count), reusedAssistantImage=\(reusedAssistantImage), runtimeOverrideCount=\(runtimeOverrideParameters.count)"
+        )
 
         var savedImageFileNames: [String] = []
         for imageAttachment in imageAttachments {
@@ -137,7 +146,7 @@ extension ChatService {
             requestedAt: Date()
         )
 
-        var messages = messagesSnapshot(for: currentSession.id)
+        var messages = existingMessages
         messages.append(userMessage)
         messages.append(loadingMessage)
         persistAndPublishMessages(messages, for: currentSession.id)
@@ -149,7 +158,7 @@ extension ChatService {
         )
         logger.info("生图占位消息已创建: loadingMessageID=\(loadingMessage.id.uuidString)")
 
-        if currentSession.isTemporary {
+        if currentSession.isTemporary && !isTemporaryChatEnabled(for: currentSession.id) {
             currentSession.name = String(trimmedPrompt.prefix(20))
             currentSession.isTemporary = false
             currentSessionSubject.send(currentSession)
@@ -160,8 +169,16 @@ extension ChatService {
             chatSessionsSubject.send(updatedSessions)
             Persistence.saveChatSessions(updatedSessions)
             logger.info("生图请求已跳过自动标题生成: session=\(currentSession.id.uuidString)")
-        } else {
+        } else if !currentSession.isTemporary {
             promoteSessionToTopIfNeeded(sessionID: currentSession.id)
+        } else if currentSession.name == NSLocalizedString("新的对话", comment: "Default new chat session name") {
+            currentSession.name = String(trimmedPrompt.prefix(20))
+            currentSessionSubject.send(currentSession)
+            var updatedSessions = chatSessionsSubject.value
+            if let index = updatedSessions.firstIndex(where: { $0.id == currentSession.id }) {
+                updatedSessions[index] = currentSession
+                chatSessionsSubject.send(updatedSessions)
+            }
         }
 
         emitSessionRequestStatus(.started, sessionID: currentSession.id)
@@ -171,7 +188,7 @@ extension ChatService {
                 loadingMessageID: loadingMessage.id,
                 prompt: trimmedPrompt,
                 startedAt: Date(),
-                referenceCount: imageAttachments.count
+                referenceCount: effectiveReferenceImages.count
             )
         )
         logger.info("生图请求即将发送: session=\(currentSession.id.uuidString)")
@@ -200,13 +217,33 @@ extension ChatService {
                 }
             }
             let effectiveRunnableModel = RunnableModel(provider: runnableModel.provider, model: effectiveModel)
+            let modelReference = MessageModelReference(
+                providerID: effectiveRunnableModel.provider.id,
+                providerName: effectiveRunnableModel.provider.name,
+                modelUUID: effectiveRunnableModel.model.id,
+                modelName: effectiveRunnableModel.model.modelName,
+                modelDisplayName: effectiveRunnableModel.model.displayName
+            )
+            let requestLogContext = RequestLogContext(
+                requestID: UUID(),
+                sessionID: currentSession.id,
+                providerID: effectiveRunnableModel.provider.id,
+                providerName: effectiveRunnableModel.provider.name,
+                modelID: effectiveRunnableModel.model.modelName,
+                requestSource: .imageGeneration,
+                isStreaming: false,
+                requestedAt: Date(),
+                modelReference: modelReference,
+                modelPricing: effectiveRunnableModel.model.pricing
+            )
             await self.executeImageGenerationRequest(
                 adapter: adapter,
                 runnableModel: effectiveRunnableModel,
                 prompt: trimmedPrompt,
-                referenceImages: imageAttachments,
+                referenceImages: effectiveReferenceImages,
                 loadingMessageID: loadingMessage.id,
-                currentSessionID: currentSession.id
+                currentSessionID: currentSession.id,
+                requestLogContext: requestLogContext
             )
         }
         updateRequestTask(requestTask, for: currentSession.id, token: requestToken)
@@ -229,16 +266,32 @@ extension ChatService {
     }
 
     func shouldRouteMessageToImageGeneration(using runnableModel: RunnableModel) -> Bool {
-        runnableModel.model.supportsImageGeneration
+        runnableModel.model.usesDedicatedImageGenerationEndpoint
     }
 
-    private func executeImageGenerationRequest(
+    /// 传统 Images API 没有会话字段；未显式附图时复用当前可见分支最近一张助手图片，
+    /// 让下一条用户指令自然切换为 edits 请求。
+    func latestAssistantImageReference(in messages: [ChatMessage]) -> ImageAttachment? {
+        let visibleMessages = ChatResponseAttemptSupport.visibleMessages(from: messages)
+        for message in visibleMessages.reversed() where message.role == .assistant {
+            for fileName in (message.imageFileNames ?? []).reversed() {
+                if let attachment = loadImageAttachmentFromStorage(fileName: fileName) {
+                    logger.info("连续改图复用最近助手图片: \(fileName)")
+                    return attachment
+                }
+            }
+        }
+        return nil
+    }
+
+    func executeImageGenerationRequest(
         adapter: APIAdapter,
         runnableModel: RunnableModel,
         prompt: String,
         referenceImages: [ImageAttachment],
         loadingMessageID: UUID,
-        currentSessionID: UUID
+        currentSessionID: UUID,
+        requestLogContext: RequestLogContext
     ) async {
         logger.info(
             "构建生图请求: session=\(currentSessionID.uuidString), model=\(runnableModel.model.modelName), referenceCount=\(referenceImages.count)"
@@ -247,6 +300,13 @@ extension ChatService {
             for: runnableModel.provider,
             action: NSLocalizedString("发送生图请求", comment: "Send image generation request action")
         ) {
+            persistRequestLog(
+                context: requestLogContext,
+                status: .failed,
+                tokenUsage: nil,
+                finishedAt: Date(),
+                errorKind: "invalid_provider_configuration"
+            )
             addErrorMessage(configurationError, sessionID: currentSessionID)
             emitSessionRequestStatus(.error, sessionID: currentSessionID)
             imageGenerationStatusSubject.send(
@@ -268,6 +328,13 @@ extension ChatService {
         ) else {
             logger.error("生图请求构建失败: session=\(currentSessionID.uuidString)")
             let reason = NSLocalizedString("错误: 无法构建生图请求。", comment: "Failed to build image generation request")
+            persistRequestLog(
+                context: requestLogContext,
+                status: .failed,
+                tokenUsage: nil,
+                finishedAt: Date(),
+                errorKind: "build_request_failed"
+            )
             addErrorMessage(reason, sessionID: currentSessionID)
             emitSessionRequestStatus(.error, sessionID: currentSessionID)
             imageGenerationStatusSubject.send(
@@ -283,10 +350,23 @@ extension ChatService {
         }
 
         logger.info("生图请求构建成功: method=\(request.httpMethod ?? "POST"), url=\(request.url?.absoluteString ?? "unknown")")
+        RequestTransactionLogRegistry.bindRequest(
+            request,
+            requestID: requestLogContext.requestID,
+            requestedAt: requestLogContext.requestedAt,
+            providerName: requestLogContext.providerName,
+            modelID: requestLogContext.modelID,
+            isStreaming: requestLogContext.isStreaming
+        )
 
         do {
             logger.info("生图请求发送中: session=\(currentSessionID.uuidString)")
             let data = try await fetchData(for: request, provider: runnableModel.provider)
+            logResponseBodySnapshot(
+                context: requestLogContext,
+                request: request,
+                bodyData: data
+            )
             logger.info("生图响应已返回: session=\(currentSessionID.uuidString), bytes=\(data.count)")
             let imageResults = try adapter.parseImageGenerationResponse(data: data)
             logger.info("生图响应解析完成: session=\(currentSessionID.uuidString), results=\(imageResults.count)")
@@ -321,6 +401,13 @@ extension ChatService {
             guard !generatedImageFileNames.isEmpty else {
                 logger.error("生图响应中没有可保存图片: session=\(currentSessionID.uuidString)")
                 let reason = NSLocalizedString("生图响应中没有可保存的图片。", comment: "No generated image could be saved")
+                persistRequestLog(
+                    context: requestLogContext,
+                    status: .failed,
+                    tokenUsage: nil,
+                    finishedAt: Date(),
+                    errorKind: "image_generation_no_image"
+                )
                 addErrorMessage(reason, sessionID: currentSessionID)
                 emitSessionRequestStatus(.error, sessionID: currentSessionID)
                 imageGenerationStatusSubject.send(
@@ -355,6 +442,12 @@ extension ChatService {
             }
 
             emitSessionRequestStatus(.finished, sessionID: currentSessionID)
+            persistRequestLog(
+                context: requestLogContext,
+                status: .success,
+                tokenUsage: nil,
+                finishedAt: Date()
+            )
             imageGenerationStatusSubject.send(
                 .succeeded(
                     sessionID: currentSessionID,
@@ -367,9 +460,30 @@ extension ChatService {
             logger.info("生图流程完成: session=\(currentSessionID.uuidString), imageCount=\(generatedImageFileNames.count)")
         } catch is CancellationError {
             logger.info("生图请求在处理中被取消。")
+            persistRequestLog(
+                context: requestLogContext,
+                status: .cancelled,
+                tokenUsage: nil,
+                finishedAt: Date(),
+                errorKind: "cancelled"
+            )
         } catch NetworkError.badStatusCode(let code, let bodyData) {
             let snippet = responseBodySnippet(from: bodyData)
             logger.error("生图请求失败(HTTP \(code)): \(snippet)")
+            logResponseBodySnapshot(
+                context: requestLogContext,
+                request: request,
+                bodyData: bodyData,
+                httpStatusCode: code
+            )
+            persistRequestLog(
+                context: requestLogContext,
+                status: .failed,
+                tokenUsage: nil,
+                finishedAt: Date(),
+                httpStatusCode: code,
+                errorKind: "bad_status_code"
+            )
             addErrorMessage(snippet, sessionID: currentSessionID, httpStatusCode: code)
             emitSessionRequestStatus(.error, sessionID: currentSessionID)
             imageGenerationStatusSubject.send(
@@ -384,11 +498,25 @@ extension ChatService {
         } catch {
             if isCancellationError(error) {
                 logger.info("生图请求在处理中被取消 (URLError)。")
+                persistRequestLog(
+                    context: requestLogContext,
+                    status: .cancelled,
+                    tokenUsage: nil,
+                    finishedAt: Date(),
+                    errorKind: "cancelled"
+                )
             } else {
                 logger.error("生图请求失败: \(error.localizedDescription)")
                 let reason = String(
                     format: NSLocalizedString("生图请求失败: %@", comment: "Image generation request failed with reason"),
                     error.localizedDescription
+                )
+                persistRequestLog(
+                    context: requestLogContext,
+                    status: .failed,
+                    tokenUsage: nil,
+                    finishedAt: Date(),
+                    errorKind: "request_failed"
                 )
                 addErrorMessage(reason, sessionID: currentSessionID)
                 emitSessionRequestStatus(.error, sessionID: currentSessionID)

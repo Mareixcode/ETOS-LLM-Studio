@@ -30,6 +30,7 @@ extension Provider {
     func isEquivalent(to other: Provider) -> Bool {
         name == other.name &&
         baseURL == other.baseURL &&
+        normalizedChatEndpointPath == other.normalizedChatEndpointPath &&
         apiFormat == other.apiFormat &&
         headerOverrides == other.headerOverrides &&
         proxyConfiguration == other.proxyConfiguration &&
@@ -48,6 +49,7 @@ extension Model {
     func isEquivalent(to other: Model) -> Bool {
         modelName == other.modelName &&
         displayName == other.displayName &&
+        Model.normalizedPickerGroupName(pickerGroupName) == Model.normalizedPickerGroupName(other.pickerGroupName) &&
         isActivated == other.isActivated &&
         overrideParameters == other.overrideParameters &&
         kind == other.kind &&
