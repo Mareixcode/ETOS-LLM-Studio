@@ -147,6 +147,7 @@ extension SyncEngine {
 
         if let originalImageFileNames = message.imageFileNames, !originalImageFileNames.isEmpty {
             var newImageFileNames: [String] = []
+            var copiedImageNamesByOriginal: [String: String] = [:]
             for originalImageFileName in originalImageFileNames {
                 guard let imageData = Persistence.loadImage(fileName: originalImageFileName) else {
                     continue
@@ -155,10 +156,14 @@ extension SyncEngine {
                 let newImageFileName = ext.isEmpty ? UUID().uuidString : "\(UUID().uuidString).\(ext)"
                 if Persistence.saveImage(imageData, fileName: newImageFileName) != nil {
                     newImageFileNames.append(newImageFileName)
+                    copiedImageNamesByOriginal[originalImageFileName] = newImageFileName
                 }
             }
             if !newImageFileNames.isEmpty {
                 message.imageFileNames = newImageFileNames
+                let excludedNames = (message.modelExcludedImageFileNames ?? [])
+                    .compactMap { copiedImageNamesByOriginal[$0] }
+                message.modelExcludedImageFileNames = excludedNames.isEmpty ? nil : excludedNames
             }
         }
 
@@ -224,6 +229,7 @@ extension SyncEngine {
             hasher.combine(model.modelName)
             hasher.combine(model.displayName)
             hasher.combine(Model.normalizedPickerGroupName(model.pickerGroupName) ?? "")
+            hasher.combine(Model.normalizedAPIFormatOverride(model.apiFormatOverride) ?? "")
             hasher.combine(model.isActivated)
             hasher.combine(model.kind.rawValue)
             for modality in model.inputModalities.sorted(by: { $0.rawValue < $1.rawValue }) {
@@ -327,6 +333,9 @@ extension SyncEngine {
                 hasher.combine(key)
                 hasher.combine(value)
             }
+        case .localStdio(let configuration):
+            hasher.combine("localStdio")
+            hasher.combine(configuration)
         case .builtInSearch:
             hasher.combine("builtInSearch")
             hasher.combine(MCPBuiltInSearchServer.endpoint)

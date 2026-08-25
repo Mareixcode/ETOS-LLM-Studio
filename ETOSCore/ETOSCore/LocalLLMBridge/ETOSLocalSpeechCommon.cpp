@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <sys/stat.h>
 
 namespace etos_local_speech {
 namespace {
@@ -515,24 +517,207 @@ architecture architecture_from_name(const std::string & name) {
     return architecture::unknown;
 }
 
+namespace {
+
+std::string file_name_from_path(const std::string & path) {
+    const size_t separator = path.find_last_of("/\\");
+    return separator == std::string::npos ? path : path.substr(separator + 1);
+}
+
+void validate_gguf_file_extent(
+    const std::string & path,
+    const gguf_context * context
+) {
+    uint64_t required_data_bytes = 0;
+    const int64_t tensor_count = gguf_get_n_tensors(context);
+    for (int64_t index = 0; index < tensor_count; ++index) {
+        const uint64_t offset = gguf_get_tensor_offset(context, index);
+        const uint64_t size = gguf_get_tensor_size(context, index);
+        if (offset > std::numeric_limits<uint64_t>::max() - size) {
+            throw std::runtime_error("GGUF 张量范围溢出。文件可能已损坏。");
+        }
+        required_data_bytes = std::max(required_data_bytes, offset + size);
+    }
+
+    const uint64_t data_offset = gguf_get_data_offset(context);
+    if (data_offset > std::numeric_limits<uint64_t>::max() - required_data_bytes) {
+        throw std::runtime_error("GGUF 文件范围溢出。文件可能已损坏。");
+    }
+    const uint64_t required_file_bytes = data_offset + required_data_bytes;
+
+    struct stat file_info = {};
+    if (stat(path.c_str(), &file_info) != 0 || file_info.st_size < 0) {
+        throw std::runtime_error("无法读取 GGUF 文件大小。");
+    }
+    const uint64_t actual_file_bytes = static_cast<uint64_t>(file_info.st_size);
+    if (actual_file_bytes < required_file_bytes) {
+        throw std::runtime_error(
+            "etos.local_model_file_incomplete|"
+            + std::to_string(actual_file_bytes)
+            + "|"
+            + std::to_string(required_file_bytes)
+            + "|"
+            + file_name_from_path(path)
+        );
+    }
+}
+
+} // namespace
+
 std::string architecture_name(const std::string & model_path) {
     gguf_init_params params = {true, nullptr};
-    gguf_context * context = gguf_init_from_file(model_path.c_str(), params);
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> context(
+        gguf_init_from_file(model_path.c_str(), params),
+        gguf_free
+    );
     if (!context) {
         throw std::runtime_error("无法读取 GGUF 模型元数据。");
     }
-    const int64_t key = gguf_find_key(context, "general.architecture");
+    validate_gguf_file_extent(model_path, context.get());
+    const int64_t key = gguf_find_key(context.get(), "general.architecture");
     if (key < 0) {
-        gguf_free(context);
         throw std::runtime_error("GGUF 模型缺少 general.architecture。");
     }
-    const char * raw_value = gguf_get_val_str(context, key);
+    const char * raw_value = gguf_get_val_str(context.get(), key);
     const std::string result = raw_value ? raw_value : "";
-    gguf_free(context);
     if (result.empty()) {
         throw std::runtime_error("GGUF 模型架构为空。");
     }
+
+    const int64_t split_count_key = gguf_find_key(context.get(), "split.count");
+    if (split_count_key >= 0) {
+        if (gguf_get_kv_type(context.get(), split_count_key) != GGUF_TYPE_UINT16) {
+            throw std::runtime_error("GGUF 模型的 split.count 类型无效。");
+        }
+        const uint16_t split_count = gguf_get_val_u16(context.get(), split_count_key);
+        if (split_count == 0) {
+            throw std::runtime_error("GGUF 模型的 split.count 不能为 0。");
+        }
+        if (split_count > 1) {
+            const int64_t split_no_key = gguf_find_key(context.get(), "split.no");
+            if (split_no_key < 0
+                || gguf_get_kv_type(context.get(), split_no_key) != GGUF_TYPE_UINT16) {
+                throw std::runtime_error("GGUF 分片模型缺少有效的 split.no。");
+            }
+            const uint16_t split_no = gguf_get_val_u16(context.get(), split_no_key);
+            if (split_no != 0) {
+                throw std::runtime_error("GGUF 分片模型必须从第一个分片导入。");
+            }
+
+            std::vector<char> prefix(model_path.size() + 1, 0);
+            if (llama_split_prefix(
+                    prefix.data(),
+                    prefix.size(),
+                    model_path.c_str(),
+                    split_no,
+                    split_count
+                ) <= 0) {
+                throw std::runtime_error("GGUF 分片文件名与分片元数据不匹配。");
+            }
+            for (uint16_t index = 1; index < split_count; ++index) {
+                std::vector<char> split_path(model_path.size() + 64, 0);
+                if (llama_split_path(
+                        split_path.data(),
+                        split_path.size(),
+                        prefix.data(),
+                        index,
+                        split_count
+                    ) <= 0) {
+                    throw std::runtime_error("无法解析 GGUF 分片文件名。");
+                }
+                FILE * file = std::fopen(split_path.data(), "rb");
+                if (!file) {
+                    throw std::runtime_error(
+                        "etos.local_model_file_missing|"
+                        + file_name_from_path(split_path.data())
+                    );
+                }
+                std::fclose(file);
+
+                std::unique_ptr<gguf_context, decltype(&gguf_free)> split_context(
+                    gguf_init_from_file(split_path.data(), params),
+                    gguf_free
+                );
+                if (!split_context) {
+                    throw std::runtime_error("无法读取 GGUF 分片模型元数据。");
+                }
+                validate_gguf_file_extent(split_path.data(), split_context.get());
+            }
+        }
+    }
     return result;
+}
+
+void validate_lora_adapter(const std::string & adapter_path, const std::string & expected_architecture) {
+    gguf_init_params params = {true, nullptr};
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> context(
+        gguf_init_from_file(adapter_path.c_str(), params),
+        gguf_free
+    );
+    if (!context) {
+        throw std::runtime_error("无法读取 LoRA GGUF 元数据。");
+    }
+    validate_gguf_file_extent(adapter_path, context.get());
+
+    const auto required_string = [&](const char * key) -> std::string {
+        const int64_t index = gguf_find_key(context.get(), key);
+        if (index < 0 || gguf_get_kv_type(context.get(), index) != GGUF_TYPE_STRING) {
+            throw std::runtime_error(std::string("LoRA GGUF 缺少有效的 ") + key + "。");
+        }
+        const char * value = gguf_get_val_str(context.get(), index);
+        return value ? value : "";
+    };
+
+    if (required_string("general.type") != "adapter") {
+        throw std::runtime_error("所选 GGUF 不是 Adapter 文件。");
+    }
+    if (required_string("adapter.type") != "lora") {
+        throw std::runtime_error("所选 Adapter 不是 LoRA 类型。");
+    }
+    const std::string architecture = required_string("general.architecture");
+    if (architecture.empty()) {
+        throw std::runtime_error("LoRA GGUF 的基础模型架构为空。");
+    }
+    if (!expected_architecture.empty() && architecture != expected_architecture) {
+        throw std::runtime_error(
+            "LoRA 架构与基础模型不匹配（LoRA=" + architecture
+            + "，模型=" + expected_architecture + "）。"
+        );
+    }
+
+    std::map<std::string, std::pair<bool, bool>> tensor_pairs;
+    const auto register_tensor = [&](const std::string & name, const std::string & suffix, bool is_a) -> bool {
+        if (name.size() < suffix.size()
+            || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            return false;
+        }
+        auto & pair = tensor_pairs[name.substr(0, name.size() - suffix.size())];
+        if (is_a) {
+            pair.first = true;
+        } else {
+            pair.second = true;
+        }
+        return true;
+    };
+    const int64_t tensor_count = gguf_get_n_tensors(context.get());
+    for (int64_t index = 0; index < tensor_count; ++index) {
+        const char * raw_name = gguf_get_tensor_name(context.get(), index);
+        const std::string name = raw_name ? raw_name : "";
+        if (register_tensor(name, ".lora_a", true)
+            || register_tensor(name, ".lora_b", false)
+            || (name.size() >= 12 && name.compare(name.size() - 12, 12, "_norm.weight") == 0)) {
+            continue;
+        }
+        throw std::runtime_error("LoRA GGUF 包含无法识别的张量：" + name);
+    }
+    if (tensor_pairs.empty()) {
+        throw std::runtime_error("LoRA GGUF 不包含 Adapter 张量。");
+    }
+    for (const auto & entry : tensor_pairs) {
+        if (!entry.second.first || !entry.second.second) {
+            throw std::runtime_error("LoRA GGUF 张量配对不完整：" + entry.first);
+        }
+    }
 }
 
 std::vector<float> compute_fbank(const std::vector<float> & waveform, int32_t & frame_count) {

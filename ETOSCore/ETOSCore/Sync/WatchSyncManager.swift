@@ -90,6 +90,10 @@ public final class WatchSyncManager: NSObject, ObservableObject {
     @Published public private(set) var lastSummary: SyncMergeSummary = .empty
     @Published public private(set) var lastUpdatedAt: Date?
     @Published public private(set) var isCompanionAvailable: Bool = false
+
+    public var isCompanionReachable: Bool {
+        session?.isReachable == true
+    }
     
     /// 自动同步开关的配置键
     public static let autoSyncEnabledKey = "sync.autoSyncEnabled"
@@ -1402,6 +1406,9 @@ extension WatchSyncManager: WCSessionDelegate {
         _ session: WCSession,
         didReceive file: WCSessionFile
     ) {
+        if MCPNativeCapabilityCompanionRelay.handleIncomingFile(file, session: session) {
+            return
+        }
         if VideoFrameExtractionRelay.handleIncomingFile(file, session: session) {
             return
         }
@@ -1488,6 +1495,12 @@ extension WatchSyncManager: WCSessionDelegate {
         error: Error?
     ) {
         Task { @MainActor in
+            if await MCPNativeCapabilityCompanionRelay.shared.handleFinishedTransfer(
+                fileTransfer,
+                error: error
+            ) {
+                return
+            }
             if await VideoFrameExtractionRelay.shared.handleFinishedTransfer(
                 fileTransfer,
                 error: error
@@ -1536,6 +1549,12 @@ extension WatchSyncManager: WCSessionDelegate {
                 return
             }
             #endif
+            if BrowserAgentCompanionRelay.handleIncomingMessage(message, replyHandler: replyHandler) {
+                return
+            }
+            if MCPNativeCapabilityCompanionRelay.handleIncomingMessage(message, replyHandler: replyHandler) {
+                return
+            }
             // 保留消息处理以兼容旧版本
             replyHandler([:])
         }

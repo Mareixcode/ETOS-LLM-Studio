@@ -176,6 +176,19 @@ public final class AppConfigStore: ObservableObject {
     @Published public var localModelPerformanceMonitorEnabled: Bool { didSet { write(.localModelPerformanceMonitorEnabled, localModelPerformanceMonitorEnabled) } }
     @Published public var localModelCacheEnabled: Bool { didSet { write(.localModelCacheEnabled, localModelCacheEnabled) } }
     @Published public var localModelKVCacheEnabled: Bool { didSet { write(.localModelKVCacheEnabled, localModelKVCacheEnabled) } }
+    @Published public var localLinuxEnabled: Bool { didSet { write(.localLinuxEnabled, localLinuxEnabled) } }
+    @Published public var localLinuxEnvironmentPrivacyEnabled: Bool { didSet { write(.localLinuxEnvironmentPrivacyEnabled, localLinuxEnvironmentPrivacyEnabled) } }
+    @Published public var localLinuxCommandSafetyEnabled: Bool { didSet { write(.localLinuxCommandSafetyEnabled, localLinuxCommandSafetyEnabled) } }
+    @Published public var localLinuxDefaultShellPath: String { didSet { write(.localLinuxDefaultShellPath, localLinuxDefaultShellPath) } }
+    @Published public var localLinuxDefaultSessionMode: String { didSet { write(.localLinuxDefaultSessionMode, localLinuxDefaultSessionMode) } }
+    @Published public var localLinuxDefaultTimeoutSeconds: Int { didSet { write(.localLinuxDefaultTimeoutSeconds, localLinuxDefaultTimeoutSeconds) } }
+    @Published public var localLinuxOutputPreviewBytes: Int { didSet { write(.localLinuxOutputPreviewBytes, localLinuxOutputPreviewBytes) } }
+    @Published public var localLinuxLocalMCPOnDemand: Bool { didSet { write(.localLinuxLocalMCPOnDemand, localLinuxLocalMCPOnDemand) } }
+    @Published public var localLinuxActivePromptProfileID: String { didSet { write(.localLinuxActivePromptProfileID, localLinuxActivePromptProfileID) } }
+    @Published public var localLinuxWorkspaceCleanupPolicy: String { didSet { write(.localLinuxWorkspaceCleanupPolicy, localLinuxWorkspaceCleanupPolicy) } }
+    @Published public var localLinuxTerminalShortcutIDs: String { didSet { write(.localLinuxTerminalShortcutIDs, localLinuxTerminalShortcutIDs) } }
+    @Published public var localLinuxChatPreviewMode: String { didSet { write(.localLinuxChatPreviewMode, localLinuxChatPreviewMode) } }
+    @Published public var localLinuxChatPreviewPlacement: String { didSet { write(.localLinuxChatPreviewPlacement, localLinuxChatPreviewPlacement) } }
 
     @Published public var aiTemperature: Double { didSet { write(.aiTemperature, aiTemperature) } }
     @Published public var aiTopP: Double { didSet { write(.aiTopP, aiTopP) } }
@@ -195,8 +208,12 @@ public final class AppConfigStore: ObservableObject {
     @Published public var requestLogPlainMessageEnabled: Bool { didSet { write(.requestLogPlainMessageEnabled, requestLogPlainMessageEnabled) } }
     @Published public var performanceTelemetryEnabled: Bool { didSet { write(.performanceTelemetryEnabled, performanceTelemetryEnabled) } }
     @Published public var modelConnectivityTestConcurrencyLimit: Int { didSet { write(.modelConnectivityTestConcurrencyLimit, modelConnectivityTestConcurrencyLimit) } }
+    @Published public var conversationRuntimeExecutionBudget: Int { didSet { write(.conversationRuntimeExecutionBudget, conversationRuntimeExecutionBudget) } }
     @Published public var enableOpenAIStreamIncludeUsage: Bool { didSet { write(.enableOpenAIStreamIncludeUsage, enableOpenAIStreamIncludeUsage) } }
     @Published public var reasoningContentEchoMode: String { didSet { write(.reasoningContentEchoMode, reasoningContentEchoMode) } }
+    @Published public var automaticHistoryLoadingEnabled: Bool {
+        didSet { write(.automaticHistoryLoadingEnabled, automaticHistoryLoadingEnabled) }
+    }
     @Published public var lazyLoadMessageCount: Int { didSet { write(.lazyLoadMessageCount, lazyLoadMessageCount) } }
     @Published public var enableAutoSessionNaming: Bool { didSet { write(.enableAutoSessionNaming, enableAutoSessionNaming) } }
     @Published public var chatSendDelaySeconds: Double { didSet { write(.chatSendDelaySeconds, chatSendDelaySeconds) } }
@@ -246,6 +263,14 @@ public final class AppConfigStore: ObservableObject {
     @Published public var backgroundContentMode: String { didSet { write(.backgroundContentMode, backgroundContentMode) } }
     @Published public var currentBackgroundImage: String { didSet { write(.currentBackgroundImage, currentBackgroundImage) } }
     @Published public var enableAutoRotateBackground: Bool { didSet { write(.enableAutoRotateBackground, enableAutoRotateBackground) } }
+    @Published public var continueVideoBackgroundPlaybackWhenChatHidden: Bool {
+        didSet {
+            write(
+                .continueVideoBackgroundPlaybackWhenChatHidden,
+                continueVideoBackgroundPlaybackWhenChatHidden
+            )
+        }
+    }
     @Published public var enableReasoningSummary: Bool { didSet { write(.enableReasoningSummary, enableReasoningSummary) } }
     @Published public var enableLiquidGlass: Bool { didSet { write(.enableLiquidGlass, enableLiquidGlass) } }
     @Published public var liquidGlassTintOpacity: Double {
@@ -259,6 +284,9 @@ public final class AppConfigStore: ObservableObject {
         }
     }
     @Published public var enableChatTopBlurFade: Bool { didSet { write(.enableChatTopBlurFade, enableChatTopBlurFade) } }
+    @Published public var chatTimelineNavigationEnabled: Bool {
+        didSet { write(.chatTimelineNavigationEnabled, chatTimelineNavigationEnabled) }
+    }
     @Published public var enableNoBubbleUI: Bool { didSet { write(.enableNoBubbleUI, enableNoBubbleUI) } }
     @Published public var chatScrollAnimationEnabled: Bool { didSet { write(.chatScrollAnimationEnabled, chatScrollAnimationEnabled) } }
     @Published public var chatScrollAnimationSpringResponse: Double { didSet { write(.chatScrollAnimationSpringResponse, chatScrollAnimationSpringResponse) } }
@@ -267,6 +295,16 @@ public final class AppConfigStore: ObservableObject {
     @Published public var chatSendAnimationEnabled: Bool { didSet { write(.chatSendAnimationEnabled, chatSendAnimationEnabled) } }
     @Published public var chatSendAnimationSpringResponse: Double { didSet { write(.chatSendAnimationSpringResponse, chatSendAnimationSpringResponse) } }
     @Published public var chatSendAnimationSpringDamping: Double { didSet { write(.chatSendAnimationSpringDamping, chatSendAnimationSpringDamping) } }
+    @Published public var chatStreamingDisplayMode: String {
+        didSet {
+            let normalizedValue = ChatStreamingDisplayMode.normalized(chatStreamingDisplayMode).rawValue
+            guard normalizedValue == chatStreamingDisplayMode else {
+                chatStreamingDisplayMode = normalizedValue
+                return
+            }
+            write(.chatStreamingDisplayMode, chatStreamingDisplayMode)
+        }
+    }
     @Published public var messageActionBarConfiguration: String {
         didSet {
             write(.messageActionBarConfiguration, messageActionBarConfiguration)
@@ -429,6 +467,7 @@ public final class AppConfigStore: ObservableObject {
         didSet { write(.temporaryChatMemoryEnabled, temporaryChatMemoryEnabled) }
     }
     @Published public var enableSlashCommands: Bool { didSet { write(.enableSlashCommands, enableSlashCommands) } }
+    @Published public var chatComposerStyle: String { didSet { write(.chatComposerStyle, chatComposerStyle) } }
     @Published public var chatComposerDraft: String { didSet { write(.chatComposerDraft, chatComposerDraft) } }
     @Published public var restoreLastSessionOnLaunch: Bool { didSet { write(.restoreLastSessionOnLaunch, restoreLastSessionOnLaunch) } }
     @Published public var restoreLastSessionOnlyIfRecent: Bool { didSet { write(.restoreLastSessionOnlyIfRecent, restoreLastSessionOnlyIfRecent) } }
@@ -544,6 +583,25 @@ public final class AppConfigStore: ObservableObject {
         localModelPerformanceMonitorEnabled = Self.boolValue(.localModelPerformanceMonitorEnabled, userDefaults: userDefaults)
         localModelCacheEnabled = Self.boolValue(.localModelCacheEnabled, userDefaults: userDefaults)
         localModelKVCacheEnabled = Self.boolValue(.localModelKVCacheEnabled, userDefaults: userDefaults)
+        localLinuxEnabled = Self.boolValue(.localLinuxEnabled, userDefaults: userDefaults)
+        localLinuxEnvironmentPrivacyEnabled = Self.boolValue(.localLinuxEnvironmentPrivacyEnabled, userDefaults: userDefaults)
+        localLinuxCommandSafetyEnabled = Self.boolValue(.localLinuxCommandSafetyEnabled, userDefaults: userDefaults)
+        localLinuxDefaultShellPath = LocalLinuxTerminalShellConfiguration.normalizedPath(
+            Self.textValue(.localLinuxDefaultShellPath, userDefaults: userDefaults)
+        )
+        localLinuxDefaultSessionMode = Self.textValue(.localLinuxDefaultSessionMode, userDefaults: userDefaults)
+        localLinuxDefaultTimeoutSeconds = Self.integerValue(.localLinuxDefaultTimeoutSeconds, userDefaults: userDefaults)
+        localLinuxOutputPreviewBytes = Self.integerValue(.localLinuxOutputPreviewBytes, userDefaults: userDefaults)
+        localLinuxLocalMCPOnDemand = Self.boolValue(.localLinuxLocalMCPOnDemand, userDefaults: userDefaults)
+        localLinuxActivePromptProfileID = Self.textValue(.localLinuxActivePromptProfileID, userDefaults: userDefaults)
+        localLinuxWorkspaceCleanupPolicy = Self.textValue(.localLinuxWorkspaceCleanupPolicy, userDefaults: userDefaults)
+        localLinuxTerminalShortcutIDs = Self.textValue(.localLinuxTerminalShortcutIDs, userDefaults: userDefaults)
+        localLinuxChatPreviewMode = LocalLinuxChatPreviewMode.normalized(
+            Self.textValue(.localLinuxChatPreviewMode, userDefaults: userDefaults)
+        ).rawValue
+        localLinuxChatPreviewPlacement = LocalLinuxChatPreviewPlacement.normalized(
+            Self.textValue(.localLinuxChatPreviewPlacement, userDefaults: userDefaults)
+        ).rawValue
 
         aiTemperature = Self.realValue(.aiTemperature, userDefaults: userDefaults)
         aiTopP = Self.realValue(.aiTopP, userDefaults: userDefaults)
@@ -561,10 +619,12 @@ public final class AppConfigStore: ObservableObject {
         requestLogPlainMessageEnabled = Self.boolValue(.requestLogPlainMessageEnabled, userDefaults: userDefaults)
         performanceTelemetryEnabled = Self.boolValue(.performanceTelemetryEnabled, userDefaults: userDefaults)
         modelConnectivityTestConcurrencyLimit = Self.integerValue(.modelConnectivityTestConcurrencyLimit, userDefaults: userDefaults)
+        conversationRuntimeExecutionBudget = Self.integerValue(.conversationRuntimeExecutionBudget, userDefaults: userDefaults)
         enableOpenAIStreamIncludeUsage = Self.boolValue(.enableOpenAIStreamIncludeUsage, userDefaults: userDefaults)
         reasoningContentEchoMode = ReasoningContentEchoMode.normalized(
             Self.textValue(.reasoningContentEchoMode, userDefaults: userDefaults)
         ).rawValue
+        automaticHistoryLoadingEnabled = Self.boolValue(.automaticHistoryLoadingEnabled, userDefaults: userDefaults)
         lazyLoadMessageCount = Self.integerValue(.lazyLoadMessageCount, userDefaults: userDefaults)
         enableAutoSessionNaming = Self.boolValue(.enableAutoSessionNaming, userDefaults: userDefaults)
         chatSendDelaySeconds = Self.realValue(.chatSendDelaySeconds, userDefaults: userDefaults)
@@ -612,10 +672,15 @@ public final class AppConfigStore: ObservableObject {
         backgroundContentMode = Self.textValue(.backgroundContentMode, userDefaults: userDefaults)
         currentBackgroundImage = Self.textValue(.currentBackgroundImage, userDefaults: userDefaults)
         enableAutoRotateBackground = Self.boolValue(.enableAutoRotateBackground, userDefaults: userDefaults)
+        continueVideoBackgroundPlaybackWhenChatHidden = Self.boolValue(
+            .continueVideoBackgroundPlaybackWhenChatHidden,
+            userDefaults: userDefaults
+        )
         enableReasoningSummary = Self.boolValue(.enableReasoningSummary, userDefaults: userDefaults)
         enableLiquidGlass = Self.boolValue(.enableLiquidGlass, userDefaults: userDefaults)
         liquidGlassTintOpacity = Self.realValue(.liquidGlassTintOpacity, userDefaults: userDefaults)
         enableChatTopBlurFade = Self.boolValue(.enableChatTopBlurFade, userDefaults: userDefaults)
+        chatTimelineNavigationEnabled = Self.boolValue(.chatTimelineNavigationEnabled, userDefaults: userDefaults)
         enableNoBubbleUI = Self.boolValue(.enableNoBubbleUI, userDefaults: userDefaults)
         chatScrollAnimationEnabled = Self.boolValue(.chatScrollAnimationEnabled, userDefaults: userDefaults)
         chatScrollAnimationSpringResponse = Self.realValue(.chatScrollAnimationSpringResponse, userDefaults: userDefaults)
@@ -624,6 +689,7 @@ public final class AppConfigStore: ObservableObject {
         chatSendAnimationEnabled = Self.boolValue(.chatSendAnimationEnabled, userDefaults: userDefaults)
         chatSendAnimationSpringResponse = Self.realValue(.chatSendAnimationSpringResponse, userDefaults: userDefaults)
         chatSendAnimationSpringDamping = Self.realValue(.chatSendAnimationSpringDamping, userDefaults: userDefaults)
+        chatStreamingDisplayMode = Self.textValue(.chatStreamingDisplayMode, userDefaults: userDefaults)
         let initialMessageActionBarConfiguration = Self.textValue(.messageActionBarConfiguration, userDefaults: userDefaults)
         messageActionBarConfiguration = initialMessageActionBarConfiguration
         messageActionBarSettings = MessageActionBarConfiguration.decoded(from: initialMessageActionBarConfiguration)
@@ -668,6 +734,9 @@ public final class AppConfigStore: ObservableObject {
         chatQuickActionIDs = Self.textValue(.chatQuickActionIDs, userDefaults: userDefaults)
         temporaryChatMemoryEnabled = Self.boolValue(.temporaryChatMemoryEnabled, userDefaults: userDefaults)
         enableSlashCommands = Self.boolValue(.enableSlashCommands, userDefaults: userDefaults)
+        chatComposerStyle = ChatComposerStyle.normalized(
+            Self.textValue(.chatComposerStyle, userDefaults: userDefaults)
+        ).rawValue
         let initialChatComposerDraft = Self.textValue(.chatComposerDraft, userDefaults: userDefaults)
         chatComposerDraft = initialChatComposerDraft
         persistedChatComposerDraftValue = Self.normalizedAppConfigValue(.text(initialChatComposerDraft), for: .chatComposerDraft)
@@ -791,6 +860,38 @@ public final class AppConfigStore: ObservableObject {
         }
 
         return defaultValue ?? defaultBool(for: key)
+    }
+
+    public nonisolated static func integerValue(
+        for key: AppConfigKey,
+        legacyUserDefaultsKey: String? = nil,
+        userDefaults: UserDefaults = .standard,
+        defaultValue: Int? = nil
+    ) -> Int {
+        if userDefaults === UserDefaults.standard {
+            AppConfigLegacyUserDefaultsMigration.migrateStandardUserDefaults()
+        }
+        if let stored = Persistence.readAppConfigInteger(key: key.rawValue) {
+            let normalized = normalizedIntegerValue(stored, for: key)
+            snapshotCache.set(normalized, for: key)
+            return normalized
+        }
+
+        guard userDefaults !== UserDefaults.standard else {
+            return normalizedIntegerValue(defaultValue ?? defaultInteger(for: key), for: key)
+        }
+
+        let rawKey = legacyUserDefaultsKey ?? key.rawValue
+        if let object = userDefaults.object(forKey: rawKey),
+           let legacy = coerceInt(object) {
+            let normalized = normalizedIntegerValue(legacy, for: key)
+            if persistSynchronously(.integer(normalized), for: key) {
+                userDefaults.removeObject(forKey: rawKey)
+            }
+            return normalized
+        }
+
+        return normalizedIntegerValue(defaultValue ?? defaultInteger(for: key), for: key)
     }
 
     public nonisolated static func stringArrayValue(
@@ -1030,16 +1131,19 @@ public final class AppConfigStore: ObservableObject {
              .appToolsKnownDefaultToolIDs,
              .appToolsToolApprovalPolicies,
              .mcpChatToolsEnabled,
+             .mcpToolCallTitleEnabled,
              .mcpDeletedBuiltInServerIDs,
              .skillsChatToolsEnabled,
              .skillsEnabledNames,
              .shortcutChatToolsEnabled,
              .messageRegexRules,
+             .customChatSlashCommands,
              .shortcutOfficialImportShortcutName,
              .configLoaderDownloadOnceCompleted,
              .configLoaderToolCapabilityMigrated,
              .feedbackAPIBaseURL,
              .localDebugLastServerAddress,
+             .browserAgentDelegateToIPhone,
              .memoryAutoConsolidationState:
             return Self.cachedValue(for: key) ?? key.defaultValue
         case .appLockEnabled: return .bool(appLockEnabled)
@@ -1050,6 +1154,19 @@ public final class AppConfigStore: ObservableObject {
         case .localModelPerformanceMonitorEnabled: return .bool(localModelPerformanceMonitorEnabled)
         case .localModelCacheEnabled: return .bool(localModelCacheEnabled)
         case .localModelKVCacheEnabled: return .bool(localModelKVCacheEnabled)
+        case .localLinuxEnabled: return .bool(localLinuxEnabled)
+        case .localLinuxEnvironmentPrivacyEnabled: return .bool(localLinuxEnvironmentPrivacyEnabled)
+        case .localLinuxCommandSafetyEnabled: return .bool(localLinuxCommandSafetyEnabled)
+        case .localLinuxDefaultShellPath: return .text(localLinuxDefaultShellPath)
+        case .localLinuxDefaultSessionMode: return .text(localLinuxDefaultSessionMode)
+        case .localLinuxDefaultTimeoutSeconds: return .integer(localLinuxDefaultTimeoutSeconds)
+        case .localLinuxOutputPreviewBytes: return .integer(localLinuxOutputPreviewBytes)
+        case .localLinuxLocalMCPOnDemand: return .bool(localLinuxLocalMCPOnDemand)
+        case .localLinuxActivePromptProfileID: return .text(localLinuxActivePromptProfileID)
+        case .localLinuxWorkspaceCleanupPolicy: return .text(localLinuxWorkspaceCleanupPolicy)
+        case .localLinuxTerminalShortcutIDs: return .text(localLinuxTerminalShortcutIDs)
+        case .localLinuxChatPreviewMode: return .text(localLinuxChatPreviewMode)
+        case .localLinuxChatPreviewPlacement: return .text(localLinuxChatPreviewPlacement)
 
         case .aiTemperature: return .real(aiTemperature)
         case .aiTopP: return .real(aiTopP)
@@ -1065,8 +1182,10 @@ public final class AppConfigStore: ObservableObject {
         case .requestLogPlainMessageEnabled: return .bool(requestLogPlainMessageEnabled)
         case .performanceTelemetryEnabled: return .bool(performanceTelemetryEnabled)
         case .modelConnectivityTestConcurrencyLimit: return .integer(modelConnectivityTestConcurrencyLimit)
+        case .conversationRuntimeExecutionBudget: return .integer(conversationRuntimeExecutionBudget)
         case .enableOpenAIStreamIncludeUsage: return .bool(enableOpenAIStreamIncludeUsage)
         case .reasoningContentEchoMode: return .text(reasoningContentEchoMode)
+        case .automaticHistoryLoadingEnabled: return .bool(automaticHistoryLoadingEnabled)
         case .lazyLoadMessageCount: return .integer(lazyLoadMessageCount)
         case .enableAutoSessionNaming: return .bool(enableAutoSessionNaming)
         case .chatSendDelaySeconds: return .real(chatSendDelaySeconds)
@@ -1112,10 +1231,13 @@ public final class AppConfigStore: ObservableObject {
         case .backgroundContentMode: return .text(backgroundContentMode)
         case .currentBackgroundImage: return .text(currentBackgroundImage)
         case .enableAutoRotateBackground: return .bool(enableAutoRotateBackground)
+        case .continueVideoBackgroundPlaybackWhenChatHidden:
+            return .bool(continueVideoBackgroundPlaybackWhenChatHidden)
         case .enableReasoningSummary: return .bool(enableReasoningSummary)
         case .enableLiquidGlass: return .bool(enableLiquidGlass)
         case .liquidGlassTintOpacity: return .real(liquidGlassTintOpacity)
         case .enableChatTopBlurFade: return .bool(enableChatTopBlurFade)
+        case .chatTimelineNavigationEnabled: return .bool(chatTimelineNavigationEnabled)
         case .enableNoBubbleUI: return .bool(enableNoBubbleUI)
         case .chatScrollAnimationEnabled: return .bool(chatScrollAnimationEnabled)
         case .chatScrollAnimationSpringResponse: return .real(chatScrollAnimationSpringResponse)
@@ -1124,6 +1246,7 @@ public final class AppConfigStore: ObservableObject {
         case .chatSendAnimationEnabled: return .bool(chatSendAnimationEnabled)
         case .chatSendAnimationSpringResponse: return .real(chatSendAnimationSpringResponse)
         case .chatSendAnimationSpringDamping: return .real(chatSendAnimationSpringDamping)
+        case .chatStreamingDisplayMode: return .text(chatStreamingDisplayMode)
         case .messageActionBarConfiguration: return .text(messageActionBarConfiguration)
 
         case .fontUseCustomFonts: return .bool(fontUseCustomFonts)
@@ -1152,6 +1275,7 @@ public final class AppConfigStore: ObservableObject {
         case .chatQuickActionIDs: return .text(chatQuickActionIDs)
         case .temporaryChatMemoryEnabled: return .bool(temporaryChatMemoryEnabled)
         case .enableSlashCommands: return .bool(enableSlashCommands)
+        case .chatComposerStyle: return .text(chatComposerStyle)
         case .chatComposerDraft: return .text(chatComposerDraft)
         case .restoreLastSessionOnLaunch: return .bool(restoreLastSessionOnLaunch)
         case .restoreLastSessionOnlyIfRecent: return .bool(restoreLastSessionOnlyIfRecent)
@@ -1225,8 +1349,10 @@ public final class AppConfigStore: ObservableObject {
         case .syncBackupCreateOnLaunch: syncBackupCreateOnLaunch = value
         case .appToolsChatToolsEnabled,
              .mcpChatToolsEnabled,
+             .mcpToolCallTitleEnabled,
              .skillsChatToolsEnabled,
-             .shortcutChatToolsEnabled:
+             .shortcutChatToolsEnabled,
+             .browserAgentDelegateToIPhone:
             Self.persistSynchronously(.bool(value), for: key, quickSync: false)
         case .appLockEnabled: appLockEnabled = value
         case .appLockBiometricEnabled: appLockBiometricEnabled = value
@@ -1235,6 +1361,10 @@ public final class AppConfigStore: ObservableObject {
         case .localModelPerformanceMonitorEnabled: localModelPerformanceMonitorEnabled = value
         case .localModelCacheEnabled: localModelCacheEnabled = value
         case .localModelKVCacheEnabled: localModelKVCacheEnabled = value
+        case .localLinuxEnabled: localLinuxEnabled = value
+        case .localLinuxEnvironmentPrivacyEnabled: localLinuxEnvironmentPrivacyEnabled = value
+        case .localLinuxCommandSafetyEnabled: localLinuxCommandSafetyEnabled = value
+        case .localLinuxLocalMCPOnDemand: localLinuxLocalMCPOnDemand = value
         case .aiTemperatureEnabled: aiTemperatureEnabled = value
         case .aiTopPEnabled: aiTopPEnabled = value
         case .enableContextCompressionReminder: enableContextCompressionReminder = value
@@ -1244,6 +1374,7 @@ public final class AppConfigStore: ObservableObject {
         case .requestLogPlainMessageEnabled: requestLogPlainMessageEnabled = value
         case .performanceTelemetryEnabled: performanceTelemetryEnabled = value
         case .enableOpenAIStreamIncludeUsage: enableOpenAIStreamIncludeUsage = value
+        case .automaticHistoryLoadingEnabled: automaticHistoryLoadingEnabled = value
         case .enableAutoSessionNaming: enableAutoSessionNaming = value
         case .enableVideoAnalysisForNonNativeModels: enableVideoAnalysisForNonNativeModels = value
         case .enableMemory: enableMemory = value
@@ -1261,9 +1392,12 @@ public final class AppConfigStore: ObservableObject {
         case .enableResponsiveReasoningPreviewHeight: enableResponsiveReasoningPreviewHeight = value
         case .enableBackground: enableBackground = value
         case .enableAutoRotateBackground: enableAutoRotateBackground = value
+        case .continueVideoBackgroundPlaybackWhenChatHidden:
+            continueVideoBackgroundPlaybackWhenChatHidden = value
         case .enableReasoningSummary: enableReasoningSummary = value
         case .enableLiquidGlass: enableLiquidGlass = value
         case .enableChatTopBlurFade: enableChatTopBlurFade = value
+        case .chatTimelineNavigationEnabled: chatTimelineNavigationEnabled = value
         case .enableNoBubbleUI: enableNoBubbleUI = value
         case .chatScrollAnimationEnabled: chatScrollAnimationEnabled = value
         case .chatSendAnimationEnabled: chatSendAnimationEnabled = value
@@ -1305,6 +1439,12 @@ public final class AppConfigStore: ObservableObject {
             restoreLastSessionWithinMinutes = Self.normalizedIntegerValue(value, for: key)
         case .lazyLoadMessageCount: lazyLoadMessageCount = value
         case .modelConnectivityTestConcurrencyLimit: modelConnectivityTestConcurrencyLimit = Self.normalizedIntegerValue(value, for: key)
+        case .conversationRuntimeExecutionBudget:
+            conversationRuntimeExecutionBudget = Self.normalizedIntegerValue(value, for: key)
+        case .localLinuxDefaultTimeoutSeconds:
+            localLinuxDefaultTimeoutSeconds = Self.normalizedIntegerValue(value, for: key)
+        case .localLinuxOutputPreviewBytes:
+            localLinuxOutputPreviewBytes = Self.normalizedIntegerValue(value, for: key)
         case .memoryTopK: memoryTopK = value
         case .memoryReembeddingConcurrencyLimit: memoryReembeddingConcurrencyLimit = Self.normalizedIntegerValue(value, for: key)
         case .conversationMemoryRecentLimit: conversationMemoryRecentLimit = value
@@ -1372,14 +1512,31 @@ public final class AppConfigStore: ObservableObject {
              .mcpDeletedBuiltInServerIDs,
              .skillsEnabledNames,
              .messageRegexRules,
+             .customChatSlashCommands,
              .shortcutOfficialImportShortcutName,
              .localDebugLastServerAddress:
             Self.persistSynchronously(.text(value), for: key, quickSync: false)
         case .systemPrompt: systemPrompt = value
+        case .localLinuxDefaultSessionMode:
+            localLinuxDefaultSessionMode = LocalAgentMode(rawValue: value)?.rawValue ?? LocalAgentMode.chat.rawValue
+        case .localLinuxDefaultShellPath:
+            localLinuxDefaultShellPath = LocalLinuxTerminalShellConfiguration.normalizedPath(value)
+        case .localLinuxActivePromptProfileID:
+            localLinuxActivePromptProfileID = value
+        case .localLinuxWorkspaceCleanupPolicy:
+            localLinuxWorkspaceCleanupPolicy = value == "automatic" ? "automatic" : "manual"
+        case .localLinuxTerminalShortcutIDs:
+            localLinuxTerminalShortcutIDs = value
+        case .localLinuxChatPreviewMode:
+            localLinuxChatPreviewMode = LocalLinuxChatPreviewMode.normalized(value).rawValue
+        case .localLinuxChatPreviewPlacement:
+            localLinuxChatPreviewPlacement = LocalLinuxChatPreviewPlacement.normalized(value).rawValue
         case .reasoningContentEchoMode:
             reasoningContentEchoMode = ReasoningContentEchoMode.normalized(value).rawValue
         case .videoFrameExtractionMode:
             videoFrameExtractionMode = VideoFrameExtractionMode.normalized(value).rawValue
+        case .chatStreamingDisplayMode:
+            chatStreamingDisplayMode = ChatStreamingDisplayMode.normalized(value).rawValue
         case .videoAnalysisModelIdentifier: videoAnalysisModelIdentifier = value
         case .speechModelIdentifier: speechModelIdentifier = value
         case .ttsModelIdentifier: ttsModelIdentifier = value
@@ -1408,6 +1565,8 @@ public final class AppConfigStore: ObservableObject {
         case .modelPickerFolderPathsByProvider:
             modelPickerFolderPathsByProvider = Self.decodeStringDictionary(from: value) ?? [:]
         case .chatQuickActionIDs: chatQuickActionIDs = value
+        case .chatComposerStyle:
+            chatComposerStyle = ChatComposerStyle.normalized(value).rawValue
         case .chatComposerDraft: chatComposerDraft = value
         case .backgroundCropTarget: backgroundCropTarget = value
         case .shortcutBridgeShortcutName: shortcutBridgeShortcutName = value
@@ -1739,6 +1898,20 @@ public final class AppConfigStore: ObservableObject {
             return ReasoningContentEchoMode.normalized(value).rawValue
         case .videoFrameExtractionMode:
             return VideoFrameExtractionMode.normalized(value).rawValue
+        case .chatStreamingDisplayMode:
+            return ChatStreamingDisplayMode.normalized(value).rawValue
+        case .chatComposerStyle:
+            return ChatComposerStyle.normalized(value).rawValue
+        case .localLinuxDefaultSessionMode:
+            return LocalAgentMode(rawValue: value)?.rawValue ?? LocalAgentMode.chat.rawValue
+        case .localLinuxDefaultShellPath:
+            return LocalLinuxTerminalShellConfiguration.normalizedPath(value)
+        case .localLinuxWorkspaceCleanupPolicy:
+            return value == "automatic" ? "automatic" : "manual"
+        case .localLinuxChatPreviewMode:
+            return LocalLinuxChatPreviewMode.normalized(value).rawValue
+        case .localLinuxChatPreviewPlacement:
+            return LocalLinuxChatPreviewPlacement.normalized(value).rawValue
         default:
             return value
         }
@@ -1751,8 +1924,13 @@ public final class AppConfigStore: ObservableObject {
         case .restoreLastSessionWithinMinutes:
             return LaunchSessionPolicy.normalizedRestoreWindowMinutes(value)
         case .modelConnectivityTestConcurrencyLimit,
-             .memoryReembeddingConcurrencyLimit:
+             .memoryReembeddingConcurrencyLimit,
+             .conversationRuntimeExecutionBudget:
             return max(1, value)
+        case .localLinuxDefaultTimeoutSeconds:
+            return min(max(0, value), 4_294_967)
+        case .localLinuxOutputPreviewBytes:
+            return max(4_096, value)
         case .videoFrameMaximumCount:
             return min(max(4, value), 120)
         default:
@@ -1799,6 +1977,13 @@ public final class AppConfigStore: ObservableObject {
             return value
         }
         return false
+    }
+
+    private nonisolated static func defaultInteger(for key: AppConfigKey) -> Int {
+        if case .integer(let value) = key.defaultValue {
+            return value
+        }
+        return 0
     }
 
     private nonisolated static func defaultStringArray(for key: AppConfigKey) -> [String]? {

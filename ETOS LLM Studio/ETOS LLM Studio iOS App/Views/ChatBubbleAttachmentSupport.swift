@@ -35,6 +35,10 @@ extension ChatBubble {
                         cornerRadius: 16
                     ) { image in
                         imagePreview = ImagePreviewPayload(image: image)
+                    } onDownload: {
+                        onDownloadImageAttachment?(fileName)
+                    } onDelete: {
+                        onDeleteImageAttachment?(fileName)
                     }
                 }
             }
@@ -164,14 +168,16 @@ extension ChatBubble {
                         enableMathRendering: enableMathRendering,
                         customTextColor: customTextColorOverride,
                         customTextStyleColors: customTextStyleColors,
-                        isStreaming: showsStreamingIndicators
+                        isStreaming: showsStreamingIndicators,
+                        streamingState: messageState.streamingMarkdownState
                     )
                 }
                 RoleplayHTMLCardView(
                     extraction: extraction,
                     sessionID: roleplaySessionID,
                     messageID: message.id,
-                    versionIndex: message.getCurrentVersionIndex()
+                    versionIndex: message.getCurrentVersionIndex(),
+                    chatMessages: roleplayMessages
                 )
             }
         } else {
@@ -184,7 +190,8 @@ extension ChatBubble {
                 enableMathRendering: enableMathRendering,
                 customTextColor: customTextColorOverride,
                 customTextStyleColors: customTextStyleColors,
-                isStreaming: showsStreamingIndicators
+                isStreaming: showsStreamingIndicators,
+                streamingState: messageState.streamingMarkdownState
             )
         }
     }

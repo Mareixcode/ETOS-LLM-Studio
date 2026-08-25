@@ -12,6 +12,34 @@ import Combine
 @testable import ETOSCore
 
 extension ChatServiceTests {
+    @Test("发送时固化界面选择的 Agent 模式")
+    func requestedAgentModeOverridesStalePersistedMode() async throws {
+        await cleanup()
+        setupMockResponsesForChatAndTitle()
+
+        var session = createPermanentTestSession(name: "Agent 模式快照测试")
+        session.worldbookContextIsolationEnabled = true
+        chatService.setCurrentSession(session)
+        #expect(Persistence.saveLocalAgentMode(.chat, sessionID: session.id))
+
+        await chatService.sendAndProcessMessage(
+            content: "使用发送时选择的模式",
+            aiTemperature: 0,
+            aiTopP: 1,
+            systemPrompt: "",
+            maxChatHistory: 5,
+            enableStreaming: false,
+            enhancedPrompt: nil,
+            enableMemory: false,
+            enableMemoryWrite: false,
+            includeSystemTime: false,
+            requestedLocalAgentMode: .agent
+        )
+
+        #expect(Persistence.localAgentMode(sessionID: session.id) == .agent)
+        await cleanup()
+    }
+
     @Test("会话隔离策略无需绑定世界书即可屏蔽记忆与工具")
     func testSessionIsolationPolicySuppressesMemoryAndToolsWithoutWorldbook() async throws {
         await cleanup()
@@ -138,11 +166,15 @@ extension ChatServiceTests {
         let lastMessage = sentMessages.last
         let enhancedSystemMessage = sentMessages.last(where: { $0.role == .system && $0.content.contains("<enhanced_prompt>") })
         let systemContent = enhancedSystemMessage?.content ?? ""
-        let systemMessages = sentMessages.filter { $0.role == .system }
+        let runtimeSystemMessage = sentMessages.first {
+            $0.role == .system && $0.content.contains("<conversation_runtime>")
+        }
+        let systemMessages = messagesExcludingConversationRuntime(sentMessages).filter { $0.role == .system }
         let userMessage = sentMessages.last(where: { $0.role == .user })
         let userContent = userMessage?.content ?? ""
 
         #expect(lastMessage?.role == .system)
+        #expect(runtimeSystemMessage != nil)
         #expect(systemContent.contains("<enhanced_prompt>"))
         #expect(systemContent.contains(enhancedPrompt))
         #expect(systemContent.contains("\n\n---\n\n\(enhancedPrompt)"))
@@ -201,7 +233,7 @@ extension ChatServiceTests {
         )
 
         let sentMessages = mockAdapter.receivedMessages ?? []
-        let systemMessages = sentMessages.filter { $0.role == .system }
+        let systemMessages = messagesExcludingConversationRuntime(sentMessages).filter { $0.role == .system }
         let firstSystemContent = systemMessages.first?.content ?? ""
         let lastMessage = sentMessages.last
 
@@ -622,6 +654,70 @@ extension ChatServiceTests {
         #expect(!promptWithoutTime.contains("updated_at="))
 
         await cleanup()
+    }
+
+    @Test("Linux 操作说明与用户提示词融合且使用独立能力标签")
+    func testLocalLinuxInstructionsMergeAfterUserPrompts() throws {
+        let prompt = chatService.buildFinalSystemPrompt(
+            global: "用户定义的人设",
+            conversationSystem: "当前会话语气",
+            topic: nil,
+            memories: [],
+            recentConversationSummaries: [],
+            conversationProfile: nil,
+            includeSystemTime: false,
+            includeLocalLinuxInstructions: true,
+            localAgentPrompt: "只描述 Linux 操作边界"
+        )
+
+        let personaRange = try #require(prompt.range(of: "用户定义的人设"))
+        let linuxRange = try #require(prompt.range(of: "<local_linux_runtime_instructions>"))
+        #expect(personaRange.lowerBound < linuxRange.lowerBound)
+        #expect(prompt.contains("只描述 Linux 操作边界"))
+        #expect(!prompt.contains("<local_agent_runtime>"))
+    }
+
+    @Test("Linux 操作说明只随实际可调用的 Linux 工具发送")
+    func testLocalLinuxInstructionsRequireCallableLinuxTools() {
+        let chatTool = InternalToolDefinition(
+            name: "remote_search",
+            description: "普通聊天工具",
+            parameters: .dictionary(["type": .string("object")])
+        )
+
+        #expect(!chatService.shouldIncludeLocalLinuxInstructions(
+            tools: [chatTool],
+            modelSupportsToolCalling: true,
+            localLinuxToolsEnabled: false
+        ))
+        #expect(!chatService.shouldIncludeLocalLinuxInstructions(
+            tools: LocalLinuxToolDefinitions.all,
+            modelSupportsToolCalling: true,
+            localLinuxToolsEnabled: false
+        ))
+        #expect(!chatService.shouldIncludeLocalLinuxInstructions(
+            tools: LocalLinuxToolDefinitions.all,
+            modelSupportsToolCalling: false,
+            localLinuxToolsEnabled: true
+        ))
+        #expect(chatService.shouldIncludeLocalLinuxInstructions(
+            tools: LocalLinuxToolDefinitions.all,
+            modelSupportsToolCalling: true,
+            localLinuxToolsEnabled: true
+        ))
+
+        let chatPrompt = chatService.buildFinalSystemPrompt(
+            global: nil,
+            topic: nil,
+            memories: [],
+            recentConversationSummaries: [],
+            conversationProfile: nil,
+            includeSystemTime: false,
+            includeLocalLinuxInstructions: false,
+            localAgentPrompt: "不应进入 Chat 请求"
+        )
+        #expect(!chatPrompt.contains("<local_linux_runtime_instructions>"))
+        #expect(!chatPrompt.contains("不应进入 Chat 请求"))
     }
 
     @Test("search_memory 工具结果可按设置隐藏更新时间")

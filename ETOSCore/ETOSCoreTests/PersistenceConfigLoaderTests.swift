@@ -55,19 +55,38 @@ extension PersistenceTests {
     @MainActor
     func localModelKVCacheDefaultsToDisabledAndLocalOnly() {
         let key = AppConfigKey.localModelKVCacheEnabled
-        let previousSnapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+        let previousValue = AppConfigStore.shared.localModelKVCacheEnabled
 
         defer {
-            AppConfigStore.shared.apply(snapshot: previousSnapshot)
+            AppConfigStore.shared.localModelKVCacheEnabled = previousValue
         }
 
         #expect(key.defaultValue == .bool(false))
         #expect(key.participatesInSync == false)
 
-        AppConfigStore.shared.apply(snapshot: [key.rawValue: true])
+        AppConfigStore.shared.localModelKVCacheEnabled = true
 
         #expect(AppConfigStore.shared.localModelKVCacheEnabled)
         #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Bool == true)
+    }
+
+    @Test("默认终端 Shell 使用本机数据库配置")
+    @MainActor
+    func localLinuxTerminalShellDefaultsToSHAndStaysLocal() {
+        let key = AppConfigKey.localLinuxDefaultShellPath
+        let previousValue = AppConfigStore.shared.localLinuxDefaultShellPath
+
+        defer {
+            AppConfigStore.shared.localLinuxDefaultShellPath = previousValue
+        }
+
+        #expect(key.defaultValue == .text("/bin/sh"))
+        #expect(key.participatesInSync == false)
+
+        AppConfigStore.shared.localLinuxDefaultShellPath = "/bin/bash"
+
+        #expect(AppConfigStore.shared.localLinuxDefaultShellPath == "/bin/bash")
+        #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? String == "/bin/bash")
     }
 
     @Test("iOS 与 watchOS 默认使用按提供商选择模型")
@@ -205,6 +224,42 @@ extension PersistenceTests {
         #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Bool == false)
     }
 
+    @Test("视频背景离开聊天持续播放默认关闭并支持配置快照")
+    @MainActor
+    func continueVideoBackgroundPlaybackDefaultAndPersistence() {
+        let key = AppConfigKey.continueVideoBackgroundPlaybackWhenChatHidden
+        let previousSnapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+
+        defer {
+            AppConfigStore.shared.apply(snapshot: previousSnapshot)
+        }
+
+        #expect(key.defaultValue == .bool(false))
+
+        AppConfigStore.shared.apply(snapshot: [key.rawValue: true])
+
+        #expect(AppConfigStore.shared.continueVideoBackgroundPlaybackWhenChatHidden)
+        #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Bool == true)
+    }
+
+    @Test("四键消息导航默认开启并支持配置快照")
+    @MainActor
+    func chatTimelineNavigationDefaultAndPersistence() {
+        let key = AppConfigKey.chatTimelineNavigationEnabled
+        let previousSnapshot = AppConfigStore.shared.snapshot(includeLocalOnly: true)
+
+        defer {
+            AppConfigStore.shared.apply(snapshot: previousSnapshot)
+        }
+
+        #expect(key.defaultValue == .bool(true))
+
+        AppConfigStore.shared.apply(snapshot: [key.rawValue: false])
+
+        #expect(AppConfigStore.shared.chatTimelineNavigationEnabled == false)
+        #expect(AppConfigStore.shared.snapshot(includeLocalOnly: true)[key.rawValue] as? Bool == false)
+    }
+
     private func restoreAppConfigValue(_ value: Any, for key: AppConfigKey) {
         switch key.defaultValue {
         case .bool:
@@ -274,7 +329,7 @@ extension PersistenceTests {
             baseURL: "https://test.com",
             apiKeys: ["key1", "key2"],
             apiFormat: "openai-compatible",
-            models: [Model(modelName: "test-model")]
+            models: [Model(modelName: "test-model", apiFormatOverride: "gemini")]
         )
 
         ConfigLoader.saveProvider(provider)
@@ -287,6 +342,7 @@ extension PersistenceTests {
         #expect(foundProvider?.name == "Test Provider")
         #expect(foundProvider?.apiKeys == ["key1", "key2"])
         #expect(foundProvider?.models.first?.modelName == "test-model")
+        #expect(foundProvider?.models.first?.apiFormatOverride == "gemini")
         #expect(!Persistence.auxiliaryBlobExists(forKey: "providers"))
     }
 

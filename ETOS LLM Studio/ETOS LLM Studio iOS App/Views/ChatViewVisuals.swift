@@ -9,12 +9,21 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import ETOSCore
 
 /// 聊天页短暂显示的轻量状态通知，由调用方决定内容与强调色。
 struct ChatTransientNotice {
     let message: String
     let systemImage: String
     let tint: Color
+
+    static var copyCompleted: ChatTransientNotice {
+        ChatTransientNotice(
+            message: NSLocalizedString("已复制", comment: "Copy completion notice"),
+            systemImage: "checkmark.circle.fill",
+            tint: .green
+        )
+    }
 }
 
 extension ChatView {
@@ -130,7 +139,10 @@ extension ChatView {
 
                         LoopingBackgroundVideoView(
                             url: videoURL,
-                            contentMode: viewModel.backgroundContentMode
+                            contentMode: viewModel.backgroundContentMode,
+                            shouldPlay: scenePhase == .active && (
+                                isChatVisible || appConfig.continueVideoBackgroundPlaybackWhenChatHidden
+                            )
                         )
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
@@ -188,13 +200,78 @@ extension ChatView {
         }
     }
 
-    /// Telegram 风格滚动到底部按钮
+    var scrollNavigationPanelHeight: CGFloat {
+        scrollNavigationButtonHitSize * 4 + scrollNavigationButtonSpacing * 3
+    }
+
+    var canPresentExpandedScrollNavigationPanel: Bool {
+        Self.canPresentExpandedScrollNavigation(
+            viewportHeight: chatScrollViewportHeight,
+            panelHeight: scrollNavigationPanelHeight
+        )
+    }
+
+    var scrollNavigationPanelTransition: AnyTransition {
+        accessibilityReduceMotion
+            ? .opacity
+            : .move(edge: .trailing).combined(with: .opacity)
+    }
+
     @ViewBuilder
-    func telegramScrollToBottomButton(action: @escaping () -> Void) -> some View {
+    var telegramScrollNavigationButtons: some View {
+        VStack(spacing: scrollNavigationButtonSpacing) {
+            telegramScrollNavigationButton(
+                systemName: "arrow.up.to.line",
+                accessibilityLabel: NSLocalizedString("滚动到顶部", comment: ""),
+                isEnabled: canNavigateToTimelineTop
+            ) {
+                handleScrollToTopButtonTap()
+            }
+            telegramScrollNavigationButton(
+                systemName: "chevron.up",
+                accessibilityLabel: NSLocalizedString("滚动到上一条消息", comment: ""),
+                isEnabled: previousMessageNavigationTargetID != nil
+            ) {
+                handleAdjacentMessageNavigation(.previous)
+            }
+            telegramScrollNavigationButton(
+                systemName: "chevron.down",
+                accessibilityLabel: NSLocalizedString("滚动到下一条消息", comment: ""),
+                isEnabled: nextMessageNavigationTargetID != nil
+            ) {
+                handleAdjacentMessageNavigation(.next)
+            }
+            telegramScrollToBottomButton(isEnabled: canNavigateToTimelineBottom) {
+                handleScrollToBottomButtonTap()
+            }
+        }
+    }
+
+    /// 保留原有圆形材质，只扩展为四个一致的时间线导航动作。
+    @ViewBuilder
+    func telegramScrollToBottomButton(
+        isEnabled: Bool = true,
+        action: @escaping () -> Void
+    ) -> some View {
+        telegramScrollNavigationButton(
+            systemName: "arrow.down.to.line",
+            accessibilityLabel: NSLocalizedString("滚动到底部", comment: ""),
+            isEnabled: isEnabled,
+            action: action
+        )
+    }
+
+    @ViewBuilder
+    func telegramScrollNavigationButton(
+        systemName: String,
+        accessibilityLabel: String,
+        isEnabled: Bool = true,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             if isLiquidGlassEnabled {
                 if #available(iOS 26.0, *) {
-                    scrollToBottomButtonIcon
+                    scrollNavigationButtonIcon(systemName: systemName)
                         .background(
                             Circle()
                                 .fill(scrollToBottomButtonMaterialOverlayColor)
@@ -206,20 +283,24 @@ extension ChatView {
                         )
                         .shadow(color: scrollToBottomButtonMaterialShadowColor, radius: 6, x: 0, y: 2)
                 } else {
-                    scrollToBottomButtonIcon
+                    scrollNavigationButtonIcon(systemName: systemName)
                         .background(scrollToBottomButtonBackground)
                 }
             } else {
-                scrollToBottomButtonIcon
+                scrollNavigationButtonIcon(systemName: systemName)
                     .background(scrollToBottomButtonBackground)
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(NSLocalizedString("滚动到底部", comment: ""))
+        .frame(width: scrollNavigationButtonHitSize, height: scrollNavigationButtonHitSize)
+        .contentShape(Rectangle())
+        .accessibilityLabel(accessibilityLabel)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.36)
     }
 
-    var scrollToBottomButtonIcon: some View {
-        Image(systemName: "chevron.down")
+    func scrollNavigationButtonIcon(systemName: String) -> some View {
+        Image(systemName: systemName)
             .etFont(.system(size: 16, weight: .semibold))
             .foregroundColor(scrollToBottomButtonIconColor)
             .frame(width: scrollToBottomButtonSize, height: scrollToBottomButtonSize)
@@ -268,9 +349,9 @@ extension ChatView {
                 }
                 .overlay(
                     Capsule()
-                        .stroke(historyBannerStrokeColor, lineWidth: 0.8)
+                        .stroke(scrollToBottomButtonMaterialStrokeColor, lineWidth: 0.5)
                 )
-                .shadow(color: scrollToBottomButtonShadowColor, radius: 6, x: 0, y: 2)
+                .shadow(color: scrollToBottomButtonMaterialShadowColor, radius: 6, x: 0, y: 2)
                 .contentShape(Capsule())
             }
             .buttonStyle(.plain)
@@ -287,25 +368,26 @@ extension ChatView {
         if isLiquidGlassEnabled {
             if #available(iOS 26.0, *) {
                 shape
-                    .fill(Color(uiColor: .systemBackground).opacity(0.62))
-                    .glassEffect(.regular.tint(scrollToBottomButtonGlassTintColor).interactive(), in: shape)
-                    .clipShape(shape)
+                    .fill(Color.clear)
+                    .glassEffect(.clear.interactive(), in: shape)
+                    .overlay(shape.fill(scrollToBottomButtonMaterialOverlayColor))
             } else {
-                shape.fill(Color(uiColor: .systemBackground).opacity(0.9))
+                shape
+                    .fill(.ultraThinMaterial)
+                    .overlay(shape.fill(scrollToBottomButtonMaterialOverlayColor))
             }
         } else {
-            shape.fill(Color(uiColor: .systemBackground).opacity(0.9))
+            shape
+                .fill(.ultraThinMaterial)
+                .overlay(shape.fill(scrollToBottomButtonMaterialOverlayColor))
         }
-    }
-
-    var historyBannerStrokeColor: Color {
-        isLiquidGlassEnabled ? scrollToBottomButtonGlassStrokeColor : scrollToBottomButtonBorderColor
     }
 }
 
 private struct LoopingBackgroundVideoView: UIViewRepresentable {
     let url: URL
     let contentMode: String
+    let shouldPlay: Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -313,12 +395,22 @@ private struct LoopingBackgroundVideoView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PlayerContainerView {
         let view = PlayerContainerView()
-        context.coordinator.configure(view: view, url: url, contentMode: contentMode)
+        context.coordinator.configure(
+            view: view,
+            url: url,
+            contentMode: contentMode,
+            shouldPlay: shouldPlay
+        )
         return view
     }
 
     func updateUIView(_ uiView: PlayerContainerView, context: Context) {
-        context.coordinator.configure(view: uiView, url: url, contentMode: contentMode)
+        context.coordinator.configure(
+            view: uiView,
+            url: url,
+            contentMode: contentMode,
+            shouldPlay: shouldPlay
+        )
     }
 
     static func dismantleUIView(_ uiView: PlayerContainerView, coordinator: Coordinator) {
@@ -331,10 +423,15 @@ private struct LoopingBackgroundVideoView: UIViewRepresentable {
         private var player: AVQueuePlayer?
         private var looper: AVPlayerLooper?
 
-        func configure(view: PlayerContainerView, url: URL, contentMode: String) {
+        func configure(
+            view: PlayerContainerView,
+            url: URL,
+            contentMode: String,
+            shouldPlay: Bool
+        ) {
             view.playerLayer.videoGravity = contentMode == "fit" ? .resizeAspect : .resizeAspectFill
             if currentURL == url, view.playerLayer.player === player {
-                player?.play()
+                updatePlayback(shouldPlay: shouldPlay)
                 return
             }
 
@@ -346,7 +443,15 @@ private struct LoopingBackgroundVideoView: UIViewRepresentable {
             view.playerLayer.player = player
             self.player = player
             currentURL = url
-            player.play()
+            updatePlayback(shouldPlay: shouldPlay)
+        }
+
+        private func updatePlayback(shouldPlay: Bool) {
+            if shouldPlay {
+                player?.play()
+            } else {
+                player?.pause()
+            }
         }
 
         func stop() {

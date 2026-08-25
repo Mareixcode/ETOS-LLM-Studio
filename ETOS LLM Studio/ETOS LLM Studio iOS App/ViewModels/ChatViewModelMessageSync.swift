@@ -8,89 +8,178 @@
 
 import Foundation
 import ETOSCore
+import SwiftUI
 
 extension ChatViewModel {
     var usesAutomaticHistoryWindow: Bool {
-        lazyLoadMessageCount == 0
+        automaticHistoryLoadingEnabled
     }
 
     var usesManualHistoryLoading: Bool {
-        lazyLoadMessageCount > 0
+        !automaticHistoryLoadingEnabled && lazyLoadMessageCount > 0
     }
 
     func updateDisplayedMessages() {
         ensureVisibleMessagesCachePrepared()
-
-        if lastSessionID != currentSession?.id {
-            lastSessionID = currentSession?.id
-            additionalHistoryLoaded = 0
+        ensureHistoryWindowPrepared()
+        guard let historyWindow else {
+            updateDisplayedStatesIfNeeded([])
+            updateHistoryBoundaryState(for: ChatHistoryWindow(lowerBound: 0, upperBound: 0))
+            return
         }
 
-        let lazyCount = lazyLoadMessageCount
-        let filtered = visibleMessagesCache
-        let weightedCount = visibleMessagesWeightedCount
-        if lazyCount > 0 && weightedCount > lazyCount {
-            let limit = lazyCount + additionalHistoryLoaded
-            if weightedCount > limit {
-                let subset = Self.suffixMessagesForLazyLoad(filtered, weightedLimit: limit)
-                updateDisplayedStatesIfNeeded(subset)
-                updateHistoryFullyLoadedIfNeeded(false)
-            } else {
-                updateDisplayedStatesIfNeeded(filtered)
-                updateHistoryFullyLoadedIfNeeded(true)
-                additionalHistoryLoaded = max(additionalHistoryLoaded, max(0, weightedCount - lazyCount))
-            }
-        } else if usesAutomaticHistoryWindow && weightedCount > automaticHistoryWindowSize {
-            let limit = automaticHistoryWindowSize + additionalHistoryLoaded
-            if weightedCount > limit {
-                let subset = Self.suffixMessagesForLazyLoad(filtered, weightedLimit: limit)
-                updateDisplayedStatesIfNeeded(subset)
-                updateHistoryFullyLoadedIfNeeded(false)
-            } else {
-                updateDisplayedStatesIfNeeded(filtered)
-                updateHistoryFullyLoadedIfNeeded(true)
-                additionalHistoryLoaded = max(additionalHistoryLoaded, max(0, weightedCount - automaticHistoryWindowSize))
-            }
-        } else {
-            updateDisplayedStatesIfNeeded(filtered)
-            updateHistoryFullyLoadedIfNeeded(true)
-            additionalHistoryLoaded = 0
-        }
-    }
-
-    func loadEntireHistory() {
-        additionalHistoryLoaded = max(0, visibleMessagesWeightedCount - lazyLoadMessageCount)
-        updateDisplayedStatesIfNeeded(visibleMessagesCache)
-        updateHistoryFullyLoadedIfNeeded(true)
+        let subset = ChatHistoryWindowSupport.messages(
+            in: historyWindow,
+            from: visibleMessagesCache
+        )
+        updateDisplayedStatesIfNeeded(subset)
+        updateHistoryBoundaryState(for: historyWindow)
     }
 
     func loadMoreHistoryChunk(count: Int? = nil) {
         guard !isHistoryFullyLoaded else { return }
-        let increment = count ?? incrementalHistoryBatchSize
-        additionalHistoryLoaded += increment
+        ensureHistoryWindowPrepared()
+        guard let historyWindow else { return }
+        self.historyWindow = ChatHistoryWindowSupport.expandingEarlier(
+            historyWindow,
+            in: visibleMessagesCache,
+            weightedBatchSize: count ?? incrementalHistoryBatchSize,
+            maximumWeightedCount: nil
+        )
         updateDisplayedMessages()
     }
 
     @discardableResult
     func loadMoreAutomaticHistoryIfNeeded(count: Int? = nil) -> Bool {
         guard usesAutomaticHistoryWindow, !isHistoryFullyLoaded else { return false }
-        let previousLoaded = additionalHistoryLoaded
-        let increment = count ?? automaticHistoryBatchSize
-        additionalHistoryLoaded += increment
+        ensureHistoryWindowPrepared()
+        guard let historyWindow else { return false }
+        let updated = ChatHistoryWindowSupport.expandingEarlier(
+            historyWindow,
+            in: visibleMessagesCache,
+            weightedBatchSize: count ?? automaticHistoryBatchSize,
+            maximumWeightedCount: automaticHistoryMaximumWindowSize
+        )
+        guard updated != historyWindow else { return false }
+        self.historyWindow = updated
         updateDisplayedMessages()
-        return additionalHistoryLoaded != previousLoaded
-    }
-
-    func resetLazyLoadState() {
-        additionalHistoryLoaded = 0
-        updateDisplayedMessages()
+        return true
     }
 
     @discardableResult
-    func resetAutomaticHistoryWindowIfNeeded() -> Bool {
-        guard usesAutomaticHistoryWindow, additionalHistoryLoaded > 0 else { return false }
-        resetLazyLoadState()
+    func loadMoreAutomaticLaterHistoryIfNeeded(count: Int? = nil) -> Bool {
+        guard usesAutomaticHistoryWindow, !isLaterHistoryFullyLoaded else { return false }
+        ensureHistoryWindowPrepared()
+        guard let historyWindow else { return false }
+        let updated = ChatHistoryWindowSupport.expandingLater(
+            historyWindow,
+            in: visibleMessagesCache,
+            weightedBatchSize: count ?? automaticHistoryBatchSize,
+            maximumWeightedCount: automaticHistoryMaximumWindowSize
+        )
+        guard updated != historyWindow else { return false }
+        self.historyWindow = updated
+        updateDisplayedMessages()
         return true
+    }
+
+    func historyWindowPosition(of messageID: UUID) -> ChatHistoryWindowPosition? {
+        ensureVisibleMessagesCachePrepared()
+        ensureHistoryWindowPrepared()
+        guard let historyWindow else { return nil }
+        return ChatHistoryWindowSupport.position(
+            of: messageID,
+            in: visibleMessagesCache,
+            window: historyWindow
+        )
+    }
+
+    func historyWindowDistance(to messageID: UUID) -> Int? {
+        ensureVisibleMessagesCachePrepared()
+        ensureHistoryWindowPrepared()
+        guard let historyWindow else { return nil }
+        return ChatHistoryWindowSupport.distance(
+            to: messageID,
+            in: visibleMessagesCache,
+            window: historyWindow
+        )
+    }
+
+    @discardableResult
+    func shiftHistoryWindow(toward messageID: UUID, weightedBatchSize: Int) -> Bool {
+        ensureVisibleMessagesCachePrepared()
+        ensureHistoryWindowPrepared()
+        guard let historyWindow,
+              let position = ChatHistoryWindowSupport.position(
+                of: messageID,
+                in: visibleMessagesCache,
+                window: historyWindow
+              ) else {
+            return false
+        }
+
+        let updated: ChatHistoryWindow
+        switch position {
+        case .earlier:
+            updated = ChatHistoryWindowSupport.expandingEarlier(
+                historyWindow,
+                in: visibleMessagesCache,
+                weightedBatchSize: weightedBatchSize,
+                maximumWeightedCount: automaticHistoryMaximumWindowSize
+            )
+        case .later:
+            updated = ChatHistoryWindowSupport.expandingLater(
+                historyWindow,
+                in: visibleMessagesCache,
+                weightedBatchSize: weightedBatchSize,
+                maximumWeightedCount: automaticHistoryMaximumWindowSize
+            )
+        case .visible:
+            return false
+        }
+
+        guard updated != historyWindow else { return false }
+        self.historyWindow = updated
+        updateDisplayedMessages()
+        return true
+    }
+
+    @discardableResult
+    func centerHistoryWindow(on messageID: UUID) -> Bool {
+        ensureVisibleMessagesCachePrepared()
+        guard let centeredWindow = ChatHistoryWindowSupport.centered(
+            on: messageID,
+            in: visibleMessagesCache,
+            maximumWeightedCount: automaticHistoryMaximumWindowSize
+        ), centeredWindow != historyWindow else {
+            return false
+        }
+        historyWindow = centeredWindow
+        updateDisplayedMessages()
+        return true
+    }
+
+    func resetLazyLoadState() {
+        historyWindow = nil
+        updateDisplayedMessages()
+    }
+
+    /// 顶部导航直接切换到首个有界窗口，避免长会话逐段播放数十秒滚动动画。
+    func moveHistoryWindowToStart() {
+        ensureVisibleMessagesCachePrepared()
+        let weightedLimit: Int
+        if usesAutomaticHistoryWindow {
+            weightedLimit = automaticHistoryMaximumWindowSize
+        } else if usesManualHistoryLoading {
+            weightedLimit = max(1, lazyLoadMessageCount)
+        } else {
+            weightedLimit = max(1, visibleMessagesCache.count)
+        }
+        historyWindow = ChatHistoryWindowSupport.leading(
+            in: visibleMessagesCache,
+            weightedLimit: weightedLimit
+        )
+        updateDisplayedMessages()
     }
 
     func hasAutoOpenedPendingToolCall(_ toolCallID: String) -> Bool {
@@ -112,10 +201,51 @@ extension ChatViewModel {
         autoOpenedPendingToolCallIDs.insert(toolCallID)
     }
 
-    func applyMessagesUpdate(_ incomingMessages: [ChatMessage]) {
+    func beginHistorySession(_ sessionID: UUID?) {
+        guard historyWindowSessionID != sessionID else { return }
+        historyWindowSessionID = sessionID
+        historyWindow = nil
+        allMessagesForSession = []
+        visibleMessagesCache = []
+        retainedRenderMessageIDs.removeAll(keepingCapacity: true)
+        messageStateByID.removeAll(keepingCapacity: true)
+        cleanupPreparedMarkdownCache(validIDs: [])
+        cleanupStreamingMarkdownPreparation(validIDs: [])
+        updateDisplayedStatesIfNeeded([])
+        updateHistoryBoundaryState(for: ChatHistoryWindow(lowerBound: 0, upperBound: 0))
+    }
+
+    func applyMessagesUpdate(_ incomingMessages: [ChatMessage], for sessionID: UUID?) {
+        let didChangeSession = historyWindowSessionID != sessionID
+        if didChangeSession {
+            beginHistorySession(sessionID)
+        }
         let previousMessages = allMessagesForSession
+        let previousVisibleMessages = visibleMessagesCache
+        let previousHistoryWindow = historyWindow
         allMessagesForSession = incomingMessages
         refreshVisibleMessagesCache()
+        if previousVisibleMessages.isEmpty, !visibleMessagesCache.isEmpty {
+            historyWindow = nil
+        } else if let previousHistoryWindow, historyWindow != nil {
+            if usesManualHistoryLoading {
+                historyWindow = ChatHistoryWindowSupport.rebased(
+                    previousHistoryWindow,
+                    from: previousVisibleMessages,
+                    to: visibleMessagesCache,
+                    minimumTrailingWeightedCount: lazyLoadMessageCount
+                )
+            } else if usesAutomaticHistoryWindow {
+                historyWindow = ChatHistoryWindowSupport.rebased(
+                    previousHistoryWindow,
+                    from: previousVisibleMessages,
+                    to: visibleMessagesCache,
+                    minimumTrailingWeightedCount: automaticHistoryWindowSize
+                )
+            } else {
+                historyWindow = ChatHistoryWindowSupport.full(messageCount: visibleMessagesCache.count)
+            }
+        }
         let hasSameMessageIdentity = hasMatchingMessageIdentity(previousMessages, incomingMessages)
         if !hasSameMessageIdentity {
             allMessageIdentityVersion &+= 1
@@ -123,7 +253,7 @@ extension ChatViewModel {
         syncAutoOpenedPendingToolCallIDs(with: incomingMessages)
         updateAutoReasoningPreviewState(with: incomingMessages)
 
-        if hasSameMessageIdentity {
+        if hasSameMessageIdentity, !didChangeSession {
             applyIncrementalMessageUpdates(previousMessages: previousMessages, incomingMessages: incomingMessages)
             return
         }
@@ -135,6 +265,9 @@ extension ChatViewModel {
         if latestAssistantMessageID != metadata.latestAssistantID {
             latestAssistantMessageID = metadata.latestAssistantID
         }
+        if latestAgentToolExecutionPreview != metadata.agentToolPreview {
+            latestAgentToolExecutionPreview = metadata.agentToolPreview
+        }
 
         updateDisplayedMessages()
     }
@@ -143,6 +276,8 @@ extension ChatViewModel {
         let currentIDs = messages.map(\.id)
         let newIDs = newMessages.map(\.id)
         let visibleIDSet = Set(newIDs)
+        updateRetainedRenderMessageIDs(visibleIDs: visibleIDSet)
+        let retainedIDSet = visibleIDSet.union(retainedRenderMessageIDs)
 
         var newStates: [ChatMessageRenderState] = []
         newStates.reserveCapacity(newMessages.count)
@@ -157,15 +292,22 @@ extension ChatViewModel {
                 state = created
             }
             state.update(with: message)
-            scheduleVisualMessagePreparationIfNeeded(for: state, source: message)
-            scheduleReasoningMarkdownPreparationIfNeeded(for: message)
+            if canUseStreamingMarkdownFastPath(for: message) {
+                state.updateVisualMessage(message)
+                state.updateRoleplayHTML(nil)
+                scheduleStreamingMarkdownPreparationIfEligible(for: state, message: message)
+            } else {
+                scheduleVisualMessagePreparationIfNeeded(for: state, source: message)
+                scheduleReasoningMarkdownPreparationIfNeeded(for: message)
+            }
             newStates.append(state)
         }
 
         if !messageStateByID.isEmpty {
-            messageStateByID = messageStateByID.filter { visibleIDSet.contains($0.key) }
+            messageStateByID = messageStateByID.filter { retainedIDSet.contains($0.key) }
         }
-        cleanupPreparedMarkdownCache(validIDs: visibleIDSet)
+        cleanupPreparedMarkdownCache(validIDs: retainedIDSet)
+        cleanupStreamingMarkdownPreparation(validIDs: retainedIDSet)
 
         if currentIDs != newIDs {
             messages = newStates
@@ -175,13 +317,39 @@ extension ChatViewModel {
         }
     }
 
+    /// 最近离开窗口的渲染结果保留一小段，来回翻阅长 Markdown 时无需重复解析。
+    func updateRetainedRenderMessageIDs(visibleIDs: Set<UUID>) {
+        let validMessageIDs = Set(visibleMessagesCache.map(\.id))
+        retainedRenderMessageIDs.removeAll {
+            visibleIDs.contains($0) || !validMessageIDs.contains($0)
+        }
+        let newlyHiddenIDs = messages.map(\.id).filter {
+            validMessageIDs.contains($0)
+                && !visibleIDs.contains($0)
+                && !retainedRenderMessageIDs.contains($0)
+        }
+        retainedRenderMessageIDs.append(contentsOf: newlyHiddenIDs)
+        if retainedRenderMessageIDs.count > retainedRenderMessageCacheLimit {
+            retainedRenderMessageIDs.removeFirst(
+                retainedRenderMessageIDs.count - retainedRenderMessageCacheLimit
+            )
+        }
+    }
+
     func scheduleMarkdownPreparationIfNeeded(for message: ChatMessage) {
         let messageID = message.id
         let sourceText = message.content
 
+        if isActivelyStreaming(message) {
+            markdownPrepareTasks[messageID]?.cancel()
+            markdownPrepareTasks.removeValue(forKey: messageID)
+            return
+        }
+
         if preparedMarkdownByMessageID[messageID]?.sourceText == sourceText {
             markdownPrepareTasks[messageID]?.cancel()
             markdownPrepareTasks.removeValue(forKey: messageID)
+            finishPreparedMarkdownHandoff(for: messageID, channel: .content)
             return
         }
 
@@ -193,7 +361,11 @@ extension ChatViewModel {
             guard !Task.isCancelled, let self else { return }
             guard self.markdownPrepareGenerations[messageID] == generation else { return }
             guard self.messageStateByID[messageID]?.visualMessage.content == sourceText else { return }
-            self.preparedMarkdownByMessageID[messageID] = prepared
+            self.finishPreparedMarkdownHandoff(
+                prepared,
+                for: messageID,
+                channel: .content
+            )
             if self.markdownPrepareGenerations[messageID] == generation {
                 self.markdownPrepareTasks[messageID] = nil
             }
@@ -280,7 +452,11 @@ extension ChatViewModel {
             message: message,
             isStreaming: isStreamingReasoningMessage
         ), let sourceText = message.reasoningContent else {
-            preparedReasoningMarkdownByMessageID.removeValue(forKey: messageID)
+            finishPreparedMarkdownHandoff(
+                for: messageID,
+                channel: .reasoning,
+                removesPreparedPayload: true
+            )
             reasoningMarkdownPrepareTasks[messageID]?.cancel()
             reasoningMarkdownPrepareTasks.removeValue(forKey: messageID)
             reasoningMarkdownPrepareGenerations.removeValue(forKey: messageID)
@@ -290,6 +466,7 @@ extension ChatViewModel {
         if preparedReasoningMarkdownByMessageID[messageID]?.sourceText == sourceText {
             reasoningMarkdownPrepareTasks[messageID]?.cancel()
             reasoningMarkdownPrepareTasks.removeValue(forKey: messageID)
+            finishPreparedMarkdownHandoff(for: messageID, channel: .reasoning)
             return
         }
 
@@ -301,10 +478,72 @@ extension ChatViewModel {
             guard !Task.isCancelled, let self else { return }
             guard self.reasoningMarkdownPrepareGenerations[messageID] == generation else { return }
             guard self.messageStateByID[messageID]?.message.reasoningContent == sourceText else { return }
-            self.preparedReasoningMarkdownByMessageID[messageID] = prepared
+            self.finishPreparedMarkdownHandoff(
+                prepared,
+                for: messageID,
+                channel: .reasoning
+            )
             if self.reasoningMarkdownPrepareGenerations[messageID] == generation {
                 self.reasoningMarkdownPrepareTasks[messageID] = nil
             }
+        }
+    }
+
+    /// prepared payload、流式视图结束和布局 revision 必须在同一事务中发布，
+    /// 防止 SwiftUI 在 UIKit/静态 Markdown 交接的中间状态缓存错误行高。
+    func finishPreparedMarkdownHandoff(
+        _ prepared: ETPreparedMarkdownRenderPayload? = nil,
+        for messageID: UUID,
+        channel: ETStreamingMarkdownChannel,
+        removesPreparedPayload: Bool = false
+    ) {
+        let state = messageStateByID[messageID]
+        let isAwaitingHandoff = state?.streamingMarkdownState.isAwaitingStaticHandoff(
+            channel: channel
+        ) == true
+        let payloadNeedsUpdate: Bool
+        switch channel {
+        case .content:
+            if removesPreparedPayload {
+                payloadNeedsUpdate = preparedMarkdownByMessageID[messageID] != nil
+            } else if let prepared {
+                payloadNeedsUpdate = preparedMarkdownByMessageID[messageID]?.sourceText != prepared.sourceText
+            } else {
+                payloadNeedsUpdate = false
+            }
+        case .reasoning:
+            if removesPreparedPayload {
+                payloadNeedsUpdate = preparedReasoningMarkdownByMessageID[messageID] != nil
+            } else if let prepared {
+                payloadNeedsUpdate = preparedReasoningMarkdownByMessageID[messageID]?.sourceText != prepared.sourceText
+            } else {
+                payloadNeedsUpdate = false
+            }
+        }
+        guard payloadNeedsUpdate || isAwaitingHandoff else { return }
+
+        var transaction = Transaction()
+        transaction.animation = nil
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            switch channel {
+            case .content:
+                if removesPreparedPayload {
+                    preparedMarkdownByMessageID.removeValue(forKey: messageID)
+                } else if let prepared {
+                    preparedMarkdownByMessageID[messageID] = prepared
+                }
+            case .reasoning:
+                if removesPreparedPayload {
+                    preparedReasoningMarkdownByMessageID.removeValue(forKey: messageID)
+                } else if let prepared {
+                    preparedReasoningMarkdownByMessageID[messageID] = prepared
+                }
+            }
+            if isAwaitingHandoff {
+                state?.streamingMarkdownState.completeStaticHandoff(channel: channel)
+            }
+            state?.invalidateLayoutAfterRendererHandoff()
         }
     }
 
@@ -382,6 +621,9 @@ extension ChatViewModel {
             if latestAssistantMessageID != metadata.latestAssistantID {
                 latestAssistantMessageID = metadata.latestAssistantID
             }
+            if latestAgentToolExecutionPreview != metadata.agentToolPreview {
+                latestAgentToolExecutionPreview = metadata.agentToolPreview
+            }
             updateDisplayedMessages()
             return
         }
@@ -389,9 +631,9 @@ extension ChatViewModel {
         let visibleIDs = Set(messages.map(\.id))
         var updatedToolCallResultIDs = toolCallResultIDs
         var updatedLatestAssistantID = latestAssistantMessageID
+        var needsAgentToolPreviewRefresh = false
         var needsDisplayRefilter = false
         var needsFullDisplayRefresh = false
-        var shouldBumpStreamingScrollAnchor = false
 
         for (oldMessage, newMessage) in zip(previousMessages, incomingMessages) where oldMessage != newMessage {
             if oldMessage.selectedResponseAttemptID != newMessage.selectedResponseAttemptID
@@ -402,15 +644,26 @@ extension ChatViewModel {
             }
 
             if visibleIDs.contains(newMessage.id) {
-                messageStateByID[newMessage.id]?.update(with: newMessage)
                 if let state = messageStateByID[newMessage.id] {
-                    scheduleVisualMessagePreparationIfNeeded(for: state, source: newMessage)
-                }
-                scheduleReasoningMarkdownPreparationIfNeeded(for: newMessage)
-                if oldMessage.content != newMessage.content
-                    || oldMessage.reasoningContent != newMessage.reasoningContent
-                    || oldMessage.toolCalls != newMessage.toolCalls {
-                    shouldBumpStreamingScrollAnchor = true
+                    let usesFastPath = canUseStreamingMarkdownFastPath(for: newMessage)
+                        && ETStreamingMessageUpdatePolicy.isTextOnlyChange(
+                            from: oldMessage,
+                            to: newMessage
+                        )
+                    if usesFastPath {
+                        state.updateWithoutPublishing(with: newMessage)
+                        scheduleStreamingMarkdownPreparationIfEligible(for: state, message: newMessage)
+                    } else {
+                        state.update(with: newMessage)
+                        if canUseStreamingMarkdownFastPath(for: newMessage) {
+                            state.updateVisualMessage(newMessage)
+                            state.updateRoleplayHTML(nil)
+                            scheduleStreamingMarkdownPreparationIfEligible(for: state, message: newMessage)
+                        } else {
+                            scheduleVisualMessagePreparationIfNeeded(for: state, source: newMessage)
+                            scheduleReasoningMarkdownPreparationIfNeeded(for: newMessage)
+                        }
+                    }
                 }
             }
 
@@ -420,6 +673,9 @@ extension ChatViewModel {
                 updatedToolCallResultIDs.subtract(oldResultIDs)
                 updatedToolCallResultIDs.formUnion(newResultIDs)
                 needsDisplayRefilter = true
+            }
+            if oldMessage.toolCalls != newMessage.toolCalls {
+                needsAgentToolPreviewRefresh = true
             }
 
             if updatedLatestAssistantID == oldMessage.id {
@@ -439,10 +695,19 @@ extension ChatViewModel {
         if latestAssistantMessageID != updatedLatestAssistantID {
             latestAssistantMessageID = updatedLatestAssistantID
         }
-        if shouldBumpStreamingScrollAnchor {
-            streamingScrollAnchorVersion &+= 1
+        if needsAgentToolPreviewRefresh {
+            let preview = collectAgentToolExecutionPreview(from: incomingMessages)
+            if latestAgentToolExecutionPreview != preview {
+                latestAgentToolExecutionPreview = preview
+            }
         }
         if needsFullDisplayRefresh {
+            if !needsAgentToolPreviewRefresh {
+                let preview = collectAgentToolExecutionPreview(from: incomingMessages)
+                if latestAgentToolExecutionPreview != preview {
+                    latestAgentToolExecutionPreview = preview
+                }
+            }
             updateDisplayedMessages()
             return
         }
@@ -456,18 +721,36 @@ extension ChatViewModel {
         return zip(lhs, rhs).allSatisfy { $0.id == $1.id }
     }
 
-    func collectMessageMetadata(from messages: [ChatMessage]) -> (toolCallResultIDs: Set<String>, latestAssistantID: UUID?) {
+    func collectMessageMetadata(
+        from messages: [ChatMessage]
+    ) -> (
+        toolCallResultIDs: Set<String>,
+        latestAssistantID: UUID?,
+        agentToolPreview: AgentToolExecutionPreviewSnapshot?
+    ) {
         var resultIDs = Set<String>()
         var latestAssistantID: UUID?
+        var toolPreviewAccumulator = AgentToolExecutionPreviewAccumulator()
 
         for message in ChatResponseAttemptSupport.visibleMessages(from: messages) {
             resultIDs.formUnion(toolCallResultIDs(for: message))
+            toolPreviewAccumulator.append(message)
             if message.role == .assistant {
                 latestAssistantID = message.id
             }
         }
 
-        return (resultIDs, latestAssistantID)
+        return (resultIDs, latestAssistantID, toolPreviewAccumulator.preferred)
+    }
+
+    func collectAgentToolExecutionPreview(
+        from messages: [ChatMessage]
+    ) -> AgentToolExecutionPreviewSnapshot? {
+        var accumulator = AgentToolExecutionPreviewAccumulator()
+        for message in ChatResponseAttemptSupport.visibleMessages(from: messages) {
+            accumulator.append(message)
+        }
+        return accumulator.preferred
     }
 
     func toolCallResultIDs(for message: ChatMessage) -> Set<String> {
@@ -486,8 +769,11 @@ extension ChatViewModel {
         guard !autoOpenedPendingToolCallIDs.isEmpty else { return }
         let existingToolCallIDs = Set(
             messages
-                .compactMap(\.toolCalls)
-                .flatMap { $0.map(\.id) }
+                .flatMap { message in
+                    (message.toolCalls ?? []).map { call in
+                        "\(message.id.uuidString)#\(call.id)"
+                    }
+                }
         )
         let filteredIDs = autoOpenedPendingToolCallIDs.intersection(existingToolCallIDs)
         if filteredIDs != autoOpenedPendingToolCallIDs {
@@ -535,11 +821,21 @@ extension ChatViewModel {
     }
 
     func refreshCurrentSessionSendingState() {
+        let wasSendingMessage = isSendingMessage
         guard let currentSessionID = currentSession?.id else {
             isSendingMessage = false
+            if wasSendingMessage {
+                finalizeStreamingMarkdownIfNeeded()
+            }
             return
         }
         isSendingMessage = runningSessionIDs.contains(currentSessionID)
+        if isSendingMessage {
+            pendingSendSubmissionSessionIDs.remove(currentSessionID)
+        }
+        if wasSendingMessage, !isSendingMessage {
+            finalizeStreamingMarkdownIfNeeded()
+        }
     }
 
     func visibleMessages(from source: [ChatMessage]) -> [ChatMessage] {
@@ -548,7 +844,27 @@ extension ChatViewModel {
 
     func refreshVisibleMessagesCache() {
         visibleMessagesCache = visibleMessages(from: allMessagesForSession)
-        visibleMessagesWeightedCount = Self.lazyLoadWeightedMessageCount(in: visibleMessagesCache)
+    }
+
+    func ensureHistoryWindowPrepared() {
+        guard historyWindow == nil else {
+            historyWindow = historyWindow?.clamped(to: visibleMessagesCache.count)
+            return
+        }
+
+        if usesAutomaticHistoryWindow {
+            historyWindow = ChatHistoryWindowSupport.trailing(
+                in: visibleMessagesCache,
+                weightedLimit: automaticHistoryWindowSize
+            )
+        } else if usesManualHistoryLoading {
+            historyWindow = ChatHistoryWindowSupport.trailing(
+                in: visibleMessagesCache,
+                weightedLimit: lazyLoadMessageCount
+            )
+        } else {
+            historyWindow = ChatHistoryWindowSupport.full(messageCount: visibleMessagesCache.count)
+        }
     }
 
     func ensureVisibleMessagesCachePrepared() {
@@ -584,14 +900,34 @@ extension ChatViewModel {
         isHistoryFullyLoaded = newValue
     }
 
+    func updateLaterHistoryFullyLoadedIfNeeded(_ newValue: Bool) {
+        guard isLaterHistoryFullyLoaded != newValue else { return }
+        isLaterHistoryFullyLoaded = newValue
+    }
+
+    func updateHistoryBoundaryState(for window: ChatHistoryWindow) {
+        let clamped = window.clamped(to: visibleMessagesCache.count)
+        updateHistoryFullyLoadedIfNeeded(clamped.lowerBound == 0)
+        updateLaterHistoryFullyLoadedIfNeeded(clamped.upperBound == visibleMessagesCache.count)
+    }
+
     func filterDisplayMessages(_ source: [ChatMessageRenderState]) -> [ChatMessageRenderState] {
         guard !toolCallResultIDs.isEmpty else { return source }
-        return source.filter { state in
-            let message = state.message
-            guard message.role == .tool else { return true }
-            guard let toolCalls = message.toolCalls, !toolCalls.isEmpty else { return true }
-            return toolCalls.allSatisfy { !toolCallResultIDs.contains($0.id) }
+        return source.filter {
+            ChatJumpTargetSupport.isRenderedAsBubble(
+                $0.message,
+                hiddenToolCallResultIDs: toolCallResultIDs
+            )
         }
+    }
+
+    /// 导航索引与真实消息栈使用同一套过滤规则，避免跳到已折叠进工具卡片的隐藏消息。
+    func messageNavigationIDs() -> [UUID] {
+        ensureVisibleMessagesCachePrepared()
+        return ChatJumpTargetSupport.renderedMessageIDs(
+            in: visibleMessagesCache,
+            hiddenToolCallResultIDs: toolCallResultIDs
+        )
     }
 
     nonisolated static func lazyLoadWeight(for message: ChatMessage) -> Int {
@@ -623,29 +959,12 @@ extension ChatViewModel {
     }
 
     nonisolated static func lazyLoadWeightedMessageCount(in messages: [ChatMessage]) -> Int {
-        messages.indices.reduce(0) { partialResult, index in
-            partialResult + lazyLoadWeight(in: messages, at: index)
-        }
+        ChatHistoryWindowSupport.weightedCount(in: messages)
     }
 
     nonisolated static func suffixMessagesForLazyLoad(_ messages: [ChatMessage], weightedLimit: Int) -> [ChatMessage] {
-        guard weightedLimit > 0, !messages.isEmpty else { return [] }
-
-        var remaining = weightedLimit
-        var startIndex = messages.endIndex
-
-        while startIndex > messages.startIndex {
-            guard remaining > 0 else { break }
-            let candidateIndex = messages.index(before: startIndex)
-            let weight = lazyLoadWeight(in: messages, at: candidateIndex)
-            if weight > remaining {
-                break
-            }
-            remaining -= weight
-            startIndex = candidateIndex
-        }
-
-        return Array(messages[startIndex...])
+        let window = ChatHistoryWindowSupport.trailing(in: messages, weightedLimit: weightedLimit)
+        return ChatHistoryWindowSupport.messages(in: window, from: messages)
     }
 
     nonisolated static func autoReasoningDisclosureTargetState(

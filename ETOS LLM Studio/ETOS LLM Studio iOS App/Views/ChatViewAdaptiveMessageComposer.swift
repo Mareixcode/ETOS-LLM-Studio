@@ -21,12 +21,23 @@ enum AdaptiveComposerPresentation: Equatable {
 
 struct ComposerPressButtonStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let usesSystemGlassFeedback: Bool
 
+    init(usesSystemGlassFeedback: Bool = false) {
+        self.usesSystemGlassFeedback = usesSystemGlassFeedback
+    }
+
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.94 : 1)
-            .opacity(configuration.isPressed ? 0.78 : 1)
-            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+        if usesSystemGlassFeedback {
+            // 交互式 Liquid Glass 已提供完整按压反馈，避免叠加反向缩放削弱系统高光。
+            configuration.label
+        } else {
+            configuration.label
+                .scaleEffect(configuration.isPressed && !reduceMotion ? 0.94 : 1)
+                .opacity(configuration.isPressed ? 0.78 : 1)
+                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+        }
     }
 }
 
@@ -71,6 +82,9 @@ extension TelegramMessageComposer {
             adaptiveRefreshSendableText()
         }
         .onChange(of: viewModel.selectedModel?.id) { _, _ in
+            adaptiveRefreshRequestControls()
+        }
+        .onChange(of: appConfig.localLinuxEnabled) { _, _ in
             adaptiveRefreshRequestControls()
         }
     }
@@ -222,7 +236,7 @@ extension TelegramMessageComposer {
         .contentShape(shape)
     }
 
-    private var adaptiveRequestControlsPanel: some View {
+    var adaptiveRequestControlsPanel: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 8) {
@@ -241,12 +255,21 @@ extension TelegramMessageComposer {
                 }
 
                 if let selectedModel = viewModel.selectedModel {
-                    if adaptiveRequestControls.isEmpty {
+                    if appConfig.localLinuxEnabled,
+                       let sessionID = viewModel.currentSession?.id {
+                        LocalAgentModePicker(
+                            sessionID: sessionID,
+                            isLocked: isSending,
+                            mode: $localAgentMode
+                        )
+                    }
+
+                    if adaptiveRequestControls.isEmpty && viewModel.currentSession == nil {
                         Text(NSLocalizedString("当前模型没有可用的请求控制。", comment: ""))
                             .etFont(.footnote)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
+                    } else if !adaptiveRequestControls.isEmpty {
                         VStack(spacing: 14) {
                             ChatRequestBodyControlRows(
                                 runnableModel: selectedModel,
@@ -269,7 +292,8 @@ extension TelegramMessageComposer {
 
     private var adaptiveRequestControlsPanelHeight: CGFloat {
         let maximumHeight = min(UIScreen.main.bounds.height * 0.38, 340)
-        let estimatedContentHeight = 82 + CGFloat(adaptiveRequestControls.count) * 68
+        let agentModeHeight: CGFloat = appConfig.localLinuxEnabled && viewModel.currentSession != nil ? 150 : 0
+        let estimatedContentHeight = 82 + agentModeHeight + CGFloat(adaptiveRequestControls.count) * 68
         return min(maximumHeight, max(124, estimatedContentHeight))
     }
 
@@ -341,8 +365,10 @@ extension TelegramMessageComposer {
         )
     }
 
-    private var adaptiveShowsRequestControlsButton: Bool {
-        !adaptiveRequestControls.isEmpty && adaptivePresentation != .expandedText
+    var adaptiveShowsRequestControlsButton: Bool {
+        (!adaptiveRequestControls.isEmpty
+            || (appConfig.localLinuxEnabled && viewModel.currentSession != nil && viewModel.selectedModel != nil))
+            && adaptivePresentation != .expandedText
     }
 
     private var adaptiveShowsSpeechButton: Bool {
@@ -398,7 +424,7 @@ extension TelegramMessageComposer {
     }
 
     @ViewBuilder
-    private var adaptiveSpeechContent: some View {
+    var adaptiveSpeechContent: some View {
         switch inlineSpeechRecorder.phase {
         case .idle:
             EmptyView()
@@ -497,17 +523,24 @@ extension TelegramMessageComposer {
         }
     }
 
-    private func adaptiveActionButton(
+    func adaptiveActionButton(
         size: CGFloat,
-        participatesInGlassContainer: Bool
+        participatesInGlassContainer: Bool,
+        embeddedInCard: Bool = false
     ) -> some View {
         Button(action: adaptiveHandleAction) {
             adaptiveActionLabel(
                 size: size,
-                participatesInGlassContainer: participatesInGlassContainer
+                participatesInGlassContainer: participatesInGlassContainer,
+                embeddedInCard: embeddedInCard
             )
         }
-        .buttonStyle(ComposerPressButtonStyle())
+        .buttonStyle(
+            ComposerPressButtonStyle(
+                usesSystemGlassFeedback: participatesInGlassContainer
+                    && viewModel.enableLiquidGlass
+            )
+        )
         .disabled(adaptiveActionIsDisabled)
         .accessibilityLabel(adaptiveActionAccessibilityLabel)
     }
@@ -515,14 +548,27 @@ extension TelegramMessageComposer {
     @ViewBuilder
     private func adaptiveActionLabel(
         size: CGFloat,
-        participatesInGlassContainer: Bool
+        participatesInGlassContainer: Bool,
+        embeddedInCard: Bool
     ) -> some View {
         let label = Image(systemName: adaptiveActionIconName)
             .etFont(.system(size: min(17, max(14, size * 0.45)), weight: .semibold))
             .foregroundStyle(adaptiveActionForegroundColor)
             .frame(width: size, height: size)
+        let emphasizesAction = (isSending && !adaptiveHasContent)
+            || adaptiveHasContent
+            || (viewModel.canQuickRetryLatestMessage && !inlineSpeechRecorder.phase.isActive)
 
-        if #available(iOS 26.0, *),
+        if embeddedInCard {
+            label
+                .background {
+                    if emphasizesAction {
+                        adaptiveActionBackground
+                    } else {
+                        Circle().fill(Color.primary.opacity(0.08))
+                    }
+                }
+        } else if #available(iOS 26.0, *),
            viewModel.enableLiquidGlass,
            participatesInGlassContainer {
             label
@@ -537,7 +583,7 @@ extension TelegramMessageComposer {
     }
 
     private var adaptiveGlassActionFill: Color {
-        if isSending {
+        if isSending && !adaptiveHasContent {
             return Color.red.opacity(0.85 * 0.82)
         }
         if adaptiveHasContent {
@@ -561,7 +607,7 @@ extension TelegramMessageComposer {
     }
 
     private var adaptiveActionIconName: String {
-        if isSending {
+        if isSending && !adaptiveHasContent {
             return "stop.fill"
         }
         if adaptiveHasContent {
@@ -574,7 +620,7 @@ extension TelegramMessageComposer {
     }
 
     private var adaptiveActionForegroundColor: Color {
-        if isSending
+        if isSending && !adaptiveHasContent
             || (viewModel.canQuickRetryLatestMessage
                 && !adaptiveHasContent
                 && !inlineSpeechRecorder.phase.isActive) {
@@ -590,7 +636,7 @@ extension TelegramMessageComposer {
 
     @ViewBuilder
     private var adaptiveActionBackground: some View {
-        if isSending {
+        if isSending && !adaptiveHasContent {
             actionCircleBackground(fill: Color.red.opacity(0.85))
         } else if adaptiveHasContent {
             actionCircleBackground(
@@ -607,6 +653,9 @@ extension TelegramMessageComposer {
     }
 
     private var adaptiveActionIsDisabled: Bool {
+        if isSendActionPending {
+            return true
+        }
         if inlineSpeechRecorder.phase.isActive, !isSending {
             return true
         }
@@ -617,7 +666,7 @@ extension TelegramMessageComposer {
     }
 
     private var adaptiveActionAccessibilityLabel: String {
-        if isSending {
+        if isSending && !adaptiveHasContent {
             return NSLocalizedString("停止生成", comment: "")
         }
         if viewModel.canQuickRetryLatestMessage,
@@ -638,7 +687,7 @@ extension TelegramMessageComposer {
         return String(format: "%d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 
-    private func adaptiveToggleRequestControls() {
+    func adaptiveToggleRequestControls() {
         let willExpand = !isRequestControlsExpanded
         if willExpand {
             adaptiveRefreshRequestControls()
@@ -664,7 +713,7 @@ extension TelegramMessageComposer {
         }
     }
 
-    private func adaptiveStartSpeechInput() {
+    func adaptiveStartSpeechInput() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         withAnimation(adaptiveComposerAnimation) {
             isRequestControlsExpanded = false
@@ -675,15 +724,12 @@ extension TelegramMessageComposer {
     }
 
     private func adaptiveHandleAction() {
-        if isSending {
+        if isSending && !adaptiveHasContent {
             stopAction()
         } else if adaptiveHasContent {
             adaptiveCloseRequestControls()
             if let command = adaptiveRecognizedSlashCommand {
-                text = ""
-                slashCommandSuggestions = []
-                adaptiveRecognizedSlashCommand = nil
-                slashCommandAction(command)
+                performSelectedSlashCommand(command)
             } else {
                 sendAction()
             }
@@ -698,7 +744,9 @@ extension TelegramMessageComposer {
     private func adaptiveRefreshRequestControls() {
         let controls = viewModel.selectedModel?.model.requestBodyControls.filter(\.isEnabled) ?? []
         adaptiveRequestControls = controls
-        if controls.isEmpty, isRequestControlsExpanded {
+        if controls.isEmpty,
+           (!appConfig.localLinuxEnabled || viewModel.selectedModel == nil || viewModel.currentSession == nil),
+           isRequestControlsExpanded {
             withAnimation(adaptiveComposerAnimation) {
                 isRequestControlsExpanded = false
             }
@@ -709,5 +757,60 @@ extension TelegramMessageComposer {
         adaptiveHasSendableText = !text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
+    }
+}
+
+private struct LocalAgentModePicker: View {
+    let sessionID: UUID
+    let isLocked: Bool
+    @EnvironmentObject private var viewModel: ChatViewModel
+    @Binding var mode: LocalAgentMode
+    @State private var hasActiveRun = false
+    @State private var modeSaveTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Picker(NSLocalizedString("会话模式", comment: "Chat or Agent session mode"), selection: $mode) {
+                ForEach(LocalAgentMode.allCases) { value in
+                    Text(value.displayName).tag(value)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(isLocked || hasActiveRun)
+            .onChange(of: mode) { _, value in
+                persistMode(value)
+            }
+            if hasActiveRun {
+                Text(NSLocalizedString("当前 Agent Run 尚未结束；请先在任务页停止它，再切换会话模式。", comment: "Active Agent run mode switch guidance"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task(id: sessionID) {
+            await reloadRunState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cloudSyncLocalDataDidChange)) { _ in
+            Task { await reloadRunState() }
+        }
+    }
+
+    private func persistMode(_ value: LocalAgentMode) {
+        modeSaveTask?.cancel()
+        modeSaveTask = Task {
+            await viewModel.chatService.waitForInitialPersistenceStateIfNeeded()
+            guard !Task.isCancelled, mode == value else { return }
+            _ = await Task.detached(priority: .userInitiated) {
+                Persistence.saveLocalAgentMode(value, sessionID: sessionID)
+            }.value
+        }
+    }
+
+    private func reloadRunState() async {
+        hasActiveRun = await Task.detached(priority: .userInitiated) {
+            guard let run = Persistence.loadLatestConversationRun(sessionID: sessionID) else {
+                return false
+            }
+            return !run.status.isTerminal
+        }.value
     }
 }

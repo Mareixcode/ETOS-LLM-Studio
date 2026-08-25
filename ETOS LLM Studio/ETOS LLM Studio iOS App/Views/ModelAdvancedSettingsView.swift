@@ -383,6 +383,26 @@ struct ModelAdvancedSettingsView: View {
                 Text(NSLocalizedString("启动与发送", comment: "Conversation launch and send settings section"))
             }
 
+            Section {
+                LabeledContent(NSLocalizedString("自动执行预算", comment: "Conversation runtime execution budget")) {
+                    TextField(
+                        NSLocalizedString("数量", comment: ""),
+                        value: conversationRuntimeBudgetBinding,
+                        formatter: numberFormatter
+                    )
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.trailing)
+                    .monospacedDigit()
+                    .frame(width: 80)
+                }
+            } header: {
+                Text(NSLocalizedString("会话协作", comment: "Conversation collaboration settings"))
+            } footer: {
+                Text(NSLocalizedString("自动执行预算由同一根协作链共享，耗尽后可从会话列表继续。", comment: "Conversation runtime settings explanation"))
+                    .etFont(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Section(NSLocalizedString("上下文窗口管理", comment: "")) {
                 LabeledContent(NSLocalizedString("最大上下文消息数", comment: "")) {
                     TextField(NSLocalizedString("数量", comment: ""), value: $maxChatHistory, formatter: numberFormatter)
@@ -390,10 +410,17 @@ struct ModelAdvancedSettingsView: View {
                         .frame(width: 80)
                 }
 
-                LabeledContent(NSLocalizedString("懒加载轮次", comment: "")) {
-                    TextField(NSLocalizedString("数量", comment: ""), value: $lazyLoadMessageCount, formatter: numberFormatter)
-                        .multilineTextAlignment(.trailing)
-                        .frame(width: 80)
+                Toggle(
+                    NSLocalizedString("自动管理历史消息", comment: "自动管理聊天历史窗口设置"),
+                    isOn: $viewModel.automaticHistoryLoadingEnabled
+                )
+
+                if !viewModel.automaticHistoryLoadingEnabled {
+                    LabeledContent(NSLocalizedString("初始显示消息数", comment: "手动模式初始显示聊天消息数设置")) {
+                        TextField(NSLocalizedString("数量", comment: ""), value: $lazyLoadMessageCount, formatter: numberFormatter)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 80)
+                    }
                 }
 
                 Toggle(
@@ -507,6 +534,13 @@ struct ModelAdvancedSettingsView: View {
             }
         }
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    private var conversationRuntimeBudgetBinding: Binding<Int> {
+        Binding(
+            get: { max(1, appConfig.conversationRuntimeExecutionBudget) },
+            set: { appConfig.conversationRuntimeExecutionBudget = max(1, $0) }
+        )
     }
 
     private var outputSettingsContent: some View {
@@ -754,8 +788,8 @@ struct ModelAdvancedSettingsView: View {
                 NSLocalizedString("设置为 0 时立即发送；大于 0 时，点击发送后会等待对应秒数，期间可点停止取消。", comment: "Send delay setting footer")
             ),
             (
-                NSLocalizedString("懒加载轮次", comment: ""),
-                NSLocalizedString("设置进入历史会话时默认加载的最近对话轮次（从最近一条用户消息开始向后）。数值越小，长对话加载越快；设置为 0 表示加载全部历史。", comment: "")
+                NSLocalizedString("自动管理历史消息", comment: "自动管理聊天历史窗口设置"),
+                NSLocalizedString("开启后会在接近边缘时自动加载并回收历史气泡。关闭后按设置显示最近消息，每次向上加载 5 条；回到底部时恢复初始范围。设为 0 时显示全部历史。", comment: "自动管理聊天历史窗口说明")
             ),
             (
                 NSLocalizedString("上下文压缩提醒", comment: "Context compression reminder toggle"),

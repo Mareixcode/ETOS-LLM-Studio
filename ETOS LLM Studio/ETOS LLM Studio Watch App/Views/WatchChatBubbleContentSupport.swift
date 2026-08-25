@@ -31,11 +31,8 @@ extension ChatBubble {
 
     @ViewBuilder
     func renderContent(_ content: String) -> some View {
-        let retryFailedPrefix = NSLocalizedString("重试失败", comment: "Retry failed error message prefix")
         let shouldRenderAsOutgoing = message.role == .user
             || message.role == .error
-            || (message.role == .assistant
-                && (message.content.hasPrefix(retryFailedPrefix) || message.content.hasPrefix("重试失败")))
         if let extraction = messageState.roleplayHTML,
            let roleplaySessionID,
            extraction.containsHTML {
@@ -51,6 +48,7 @@ extension ChatBubble {
                         customTextColor: customTextColorOverride,
                         customTextStyleColors: customTextStyleColors,
                         isStreaming: showsStreamingIndicators,
+                        streamingState: messageState.streamingMarkdownState,
                         onCodeBlockHeaderTap: onCodeBlockHeaderTap
                     )
                 }
@@ -58,7 +56,8 @@ extension ChatBubble {
                     extraction: extraction,
                     sessionID: roleplaySessionID,
                     messageID: message.id,
-                    versionIndex: message.getCurrentVersionIndex()
+                    versionIndex: message.getCurrentVersionIndex(),
+                    chatMessages: roleplayMessages
                 ) { item in
                     webHTMLPageItem = item
                 }
@@ -74,6 +73,7 @@ extension ChatBubble {
                 customTextColor: customTextColorOverride,
                 customTextStyleColors: customTextStyleColors,
                 isStreaming: showsStreamingIndicators,
+                streamingState: messageState.streamingMarkdownState,
                 onCodeBlockHeaderTap: onCodeBlockHeaderTap
             )
         }
@@ -319,7 +319,9 @@ extension ChatBubble {
                         textColor: contentColor,
                         customTextStyleColors: customTextStyleColors,
                         font: .footnote,
-                        onCodeBlockHeaderTap: onCodeBlockHeaderTap
+                        onCodeBlockHeaderTap: onCodeBlockHeaderTap,
+                        streamingMarkdownState: messageState.streamingMarkdownState,
+                        isStreaming: showsStreamingIndicators
                     )
                 }
             }

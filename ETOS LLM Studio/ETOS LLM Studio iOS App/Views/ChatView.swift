@@ -23,11 +23,16 @@ struct ChatView: View {
     @EnvironmentObject var viewModel: ChatViewModel
     @Environment(\.colorScheme) var colorScheme
     @Environment(\.accessibilityReduceMotion) var accessibilityReduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) var accessibilityVoiceOverEnabled
+    @Environment(\.scenePhase) var scenePhase
     @ObservedObject var appConfig = AppConfigStore.shared
     @ObservedObject var toolPermissionCenter = ToolPermissionCenter.shared
     @ObservedObject var ttsManager = TTSManager.shared
     @ObservedObject var localNotificationCenter = AppLocalNotificationCenter.shared
+    @State var isChatVisible = false
     @State var showScrollToBottom = false
+    @State var showScrollNavigationPanel = false
+    @State var scrollNavigationHideTask: Task<Void, Never>?
     @State var shouldKeepBottomPinned = true
     @State var suppressAutoScrollOnce = false
     @State var navigationDestination: ChatQuickAction?
@@ -43,6 +48,7 @@ struct ChatView: View {
     @State var messageToDelete: ChatMessage?
     @State var messageVersionToDelete: MessageVersionDeletePayload?
     @State var messageActionSheetPayload: MessageActionSheetPayload?
+    @State var pendingMessageActionJumpIndex: Int?
     @State var fullErrorContent: FullErrorContentPayload?
     @State var editingSessionID: UUID?
     @State var sessionDraftName: String = ""
@@ -79,6 +85,7 @@ struct ChatView: View {
     @State var isSelectedMessagesExportPresented = false
     @State var showSelectedMessagesDeleteConfirm = false
     @State var activeChatPickerSheet: ChatPickerSheet?
+    @State var awaitsChatPickerDismissalForMessageJump = false
     @State var chatPickerDismissDestination: ChatQuickAction?
     @State var activeChatPickerDetent: PresentationDetent = .medium
     @State var quickModelSettingsTarget: RunnableModel?
@@ -91,19 +98,45 @@ struct ChatView: View {
     @State var bottomSafeAreaInset: CGFloat = 0
     @State var isKeyboardVisible = false
     @State var chatInputBarHeight: CGFloat = 0
+    @State var chatScrollViewportWidth: CGFloat = 0
     @State var chatScrollViewportHeight: CGFloat = 0
     @State var scrollDistanceToBottom: CGFloat = 0
+    @State var scrollDistanceToTop: CGFloat = 0
     @State var pendingHistoryResetWorkItem: DispatchWorkItem?
     @State var pendingBottomSnapTask: Task<Void, Never>?
     @State var chatLayoutSettleTask: Task<Void, Never>?
+    @State var pendingScrollTargetTask: Task<Void, Never>?
+    @State var scrollTargetGeneration: UInt = 0
+    @State var isAutomaticHistoryLoadInFlight = false
+    @State var awaitsAutomaticHistoryAnchorMetrics = false
+    @State var automaticHistoryLoadDirection: ChatAutomaticHistoryDirection?
+    @State var pendingAutomaticHistoryLoadRequest: ChatAutomaticHistoryLoadRequest?
+    @State var lastAutomaticHistoryLoadAnchorID: UUID?
     @State var chatScrollTarget: ChatScrollTargetID?
     @State var chatScrollTargetAnchor: UnitPoint = .bottom
+    @State var activeBottomScrollCommandTarget: ChatScrollTargetID?
+    @State var bottomScrollCommandReleaseTask: Task<Void, Never>?
+    @State var messageNavigationCursorID: UUID?
+    @State var chatNavigationMessageIDs: [UUID] = []
+    @State var chatNavigationIndexByMessageID: [UUID: Int] = [:]
+    @State var previousMessageNavigationTargetID: UUID?
+    @State var nextMessageNavigationTargetID: UUID?
+    @State var awaitsFreshBottomNavigationSnapshot = false
+    @State var bottomNavigationSnapshotBaselineRevision: UInt = 0
+    @State var bottomScrollCommandGeneration: UInt = 0
     @State var needsImmediateBottomSnap: Bool = true
     @State var isChatLayoutSettling: Bool = false
+    @State var isChatScrollUserInteracting: Bool = false
+    @StateObject var chatLayoutIntegrityMonitor = ChatLayoutIntegrityMonitor()
     @State var isComposerRequestControlsExpanded = false
     @State var shouldRestorePendingJumpOnAppear: Bool = false
     @State var pendingJumpRequest: MessageJumpRequest?
+    @State var isMessageJumpInFlight = false
     @State var localResourceUsagePanelOffset: CGSize = .zero
+    @State var localTerminalPreviewOffset: CGSize = .zero
+    @State var localTerminalInitialJobID: UUID?
+    @State var currentLocalAgentMode = LocalAgentMode.chat
+    @State var localAgentModeSelectionRevision: UInt = 0
     // 发送飞行动画：状态、输入文字区域与分轴呈现几何。
     @State var flightState: SendFlightState?
     @State var inputBarRect: CGRect = .zero
@@ -136,8 +169,13 @@ struct ChatView: View {
     let chatPickerAnimation = Animation.spring(response: 0.42, dampingFraction: 0.82)
     let scrollToBottomButtonAnimation = Animation.timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.52)
     let bottomPinnedDistanceThreshold: CGFloat = 24
+    let bottomScrollCommandArrivalTolerance: CGFloat = 1
     let scrollToBottomButtonRevealDistance: CGFloat = 48
+    let automaticHistoryLoadTriggerDistance: CGFloat = 240
+    let historyJumpBatchSize = 12
     let scrollToBottomButtonSize: CGFloat = 40
+    let scrollNavigationButtonHitSize: CGFloat = 44
+    let scrollNavigationButtonSpacing: CGFloat = 4
     let scrollToBottomButtonInputSpacing: CGFloat = 16
     let landscapeSessionSidebarMinWidth: CGFloat = 220
     let landscapeSessionSidebarMaxWidth: CGFloat = 300
@@ -259,18 +297,6 @@ struct ChatView: View {
     var scrollToBottomButtonMaterialShadowColor: Color {
         Color.black.opacity(colorScheme == .dark ? 0.3 : 0.1)
     }
-    var scrollToBottomButtonBorderColor: Color {
-        colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.06)
-    }
-    var scrollToBottomButtonGlassTintColor: Color {
-        colorScheme == .dark ? Color.white.opacity(0.08) : Color.white.opacity(0.12)
-    }
-    var scrollToBottomButtonGlassStrokeColor: Color {
-        colorScheme == .dark ? Color.white.opacity(0.24) : Color.white.opacity(0.36)
-    }
-    var scrollToBottomButtonShadowColor: Color {
-        colorScheme == .dark ? Color.black.opacity(0.3) : TelegramColors.scrollButtonShadow
-    }
     var totalSessionPickerCount: Int {
         sessionPickerChildFolders.count + sessionPickerDirectSessions.count
     }
@@ -303,12 +329,18 @@ struct ChatView: View {
     }
     var body: some View {
         applyPresentationModifiers(to: adaptiveChatLayout)
+            .copyCompletionNoticeAction {
+                showChatTransientNotice(.copyCompleted, duration: .seconds(1.4))
+            }
             .onAppear {
+                isChatVisible = true
                 reloadChatQuickActions()
                 refreshTemporaryChatState()
                 refreshChatToolPermissionAutoPresentationBlocker()
+                resolvePendingSearchJumpIfNeeded()
             }
             .onDisappear {
+                isChatVisible = false
                 setChatToolPermissionAutoPresentationBlocked(false)
             }
             .onChange(of: chatToolPermissionAutoPresentationBlocked) { _, _ in
@@ -318,6 +350,8 @@ struct ChatView: View {
                 reloadChatQuickActions()
             }
             .onChange(of: viewModel.currentSession?.id) { _, _ in
+                localAgentModeSelectionRevision &+= 1
+                currentLocalAgentMode = .chat
                 refreshTemporaryChatState()
                 continuationExpansionState = .collapsed
                 if isMessageSelectionMode {
@@ -326,6 +360,12 @@ struct ChatView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .temporaryChatStateDidChange)) { _ in
                 refreshTemporaryChatState()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .cloudSyncLocalDataDidChange)) { _ in
+                Task { await reloadCurrentLocalAgentMode() }
+            }
+            .task(id: viewModel.currentSession?.id) {
+                await reloadCurrentLocalAgentMode()
             }
             .task(id: conversationContinuationRelationshipRefreshKey) {
                 await reloadConversationContinuationRelationships()
@@ -621,7 +661,7 @@ private struct LocalResourceUsageFloatingPanel: View {
         guard resourceUsageTask == nil else { return }
         resourceUsageTask = Task { @MainActor in
             while !Task.isCancelled {
-                resourceUsageMonitor.refresh()
+                await resourceUsageMonitor.refresh()
                 do {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {
@@ -729,8 +769,9 @@ extension ChatView {
         showsBackground: Bool = true
     ) -> some View {
         let displayedMessages = viewModel.displayMessages
+        let sessionMessages = viewModel.allMessagesForSession
         let retryableMessageIDs = MessageActionBarAvailability.retryableMessageIDs(
-            in: viewModel.allMessagesForSession,
+            in: sessionMessages,
             isSending: viewModel.isSendingMessage
         )
         let messageLayoutWidth = max(1, chatViewportWidth - 16)
@@ -745,9 +786,27 @@ extension ChatView {
                 // Z-Index 1: 消息列表
                 ScrollView {
                     VStack(spacing: 0) {
-                        ScrollDistanceToBottomObserver { distanceToBottom, isUserInteracting in
-                            updateScrollToBottomVisibility(
+                        ChatScrollMetricsObserver(
+                            keepsBottomPinned: $shouldKeepBottomPinned,
+                            isStreaming: viewModel.isSendingMessage,
+                            streamingDisplayMode: ChatStreamingDisplayMode.normalized(
+                                appConfig.chatStreamingDisplayMode
+                            ),
+                            reduceMotion: accessibilityReduceMotion,
+                            metricsRefreshGeneration: bottomScrollCommandGeneration,
+                            isViewportTransitioning: isChatLayoutSettling,
+                            hasProgrammaticScrollCommand: hasChatProgrammaticScrollOwnership,
+                            anchorAdjustment: chatLayoutIntegrityMonitor.pendingAnchorAdjustment,
+                            onAnchorAdjustmentApplied: { adjustmentID in
+                                chatLayoutIntegrityMonitor.completeAnchorAdjustment(id: adjustmentID)
+                            },
+                            onUserPanBegan: {
+                                handleChatScrollPanBegan()
+                            }
+                        ) { distanceToBottom, distanceToTop, isUserInteracting in
+                            handleChatScrollMetrics(
                                 distanceToBottom: distanceToBottom,
+                                distanceToTop: distanceToTop,
                                 isUserInteracting: isUserInteracting
                             )
                         }
@@ -755,7 +814,9 @@ extension ChatView {
 
                         LazyVStack(spacing: 0) {
                             // 顶部留白（为导航栏留出空间）
-                            Color.clear.frame(height: 8)
+                            Color.clear
+                                .frame(height: 8)
+                                .id(ChatScrollTargetID.top)
 
                             // 历史加载提示
                             historyBanner
@@ -810,24 +871,39 @@ extension ChatView {
                                 let connectsTimelineFromPrevious = shouldConnectTimeline(previousMessage, with: message)
                                 let connectsTimelineToNext = shouldConnectTimeline(message, with: nextMessage)
                                 let showsStreamingIndicators = viewModel.isSendingMessage && viewModel.latestAssistantMessageID == message.id
+                                // 贴底流式气泡只跟随真实滚动偏移，避免相位弹簧与吸底校正互相拉扯。
+                                let isBottomPinnedStreamingBubble = showsStreamingIndicators && shouldKeepBottomPinned
                                 let reportsSendFlightTarget = isSendFlightTarget(message.id)
                                 let sendFlightOpacity = sendFlightMessageOpacity(for: message)
+                                let preparedMarkdownPayload = viewModel.preparedMarkdownByMessageID[message.id]
+                                let preparedReasoningMarkdownPayload = viewModel.preparedReasoningMarkdownByMessageID[message.id]
                                 ChatBubble(
                                     messageState: state,
                                     roleplaySessionID: viewModel.currentSession?.id,
+                                    roleplayMessages: sessionMessages,
                                     layoutWidth: messageLayoutWidth,
                                     reasoningPreviewMaxHeight: reasoningPreviewMaxHeight,
-                                    preparedMarkdownPayload: viewModel.preparedMarkdownByMessageID[message.id],
-                                    preparedReasoningMarkdownPayload: viewModel.preparedReasoningMarkdownByMessageID[message.id],
+                                    preparedMarkdownPayload: preparedMarkdownPayload,
+                                    preparedReasoningMarkdownPayload: preparedReasoningMarkdownPayload,
                                     reasoningThinkingTitle: viewModel.reasoningThinkingTitleByMessageID[message.id],
                                     isReasoningExpanded: Binding(
                                         get: { viewModel.reasoningExpandedState[message.id, default: false] },
-                                        set: { viewModel.setReasoningExpanded($0, for: message.id) }
+                                        set: { isExpanded in
+                                            viewModel.setReasoningExpanded(isExpanded, for: message.id)
+                                            if isExpanded {
+                                                shouldKeepBottomPinned = false
+                                            }
+                                        }
                                     ),
                                     isReasoningAutoPreview: viewModel.isAutoReasoningPreview(for: message.id),
                                     isToolCallsExpanded: Binding(
                                         get: { viewModel.toolCallsExpandedState[message.id, default: false] },
-                                        set: { viewModel.toolCallsExpandedState[message.id] = $0 }
+                                        set: { isExpanded in
+                                            viewModel.toolCallsExpandedState[message.id] = isExpanded
+                                            if isExpanded {
+                                                shouldKeepBottomPinned = false
+                                            }
+                                        }
                                     ),
                                     enableMarkdown: viewModel.enableMarkdown,
                                     enableBackground: viewModel.enableBackground,
@@ -854,7 +930,7 @@ extension ChatView {
                                         performDeferredRetry(message)
                                     },
                                     onCopy: {
-                                        UIPasteboard.general.string = message.content
+                                        UIPasteboard.general.string = state.message.content
                                     },
                                     onSwitchToPreviousVersion: {
                                         viewModel.switchToPreviousVersion(of: message)
@@ -870,9 +946,83 @@ extension ChatView {
                                     onOpenMore: { latestMessage in
                                         messageActionSheetPayload = MessageActionSheetPayload(message: latestMessage)
                                     },
+                                    onDownloadImageAttachment: { fileName in
+                                        Task {
+                                            await downloadImagesToPhotoLibrary(fileNames: [fileName])
+                                        }
+                                    },
+                                    onDeleteImageAttachment: { fileName in
+                                        viewModel.removeImageAttachment(
+                                            fileName: fileName,
+                                            fromMessageID: message.id
+                                        )
+                                    },
+                                    sourceConversationName: message.sourceSessionID.flatMap { sourceSessionID in
+                                        viewModel.chatSessions.first(where: { $0.id == sourceSessionID })?.name
+                                    },
+                                    onOpenSourceConversation: message.sourceSessionID.map { sourceSessionID in
+                                        { _ = viewModel.setCurrentSessionIfExists(sessionID: sourceSessionID) }
+                                    },
+                                    onOpenConversation: { sessionID in
+                                        _ = viewModel.setCurrentSessionIfExists(sessionID: sessionID)
+                                    },
                                     reportsSendFlightTarget: reportsSendFlightTarget,
+                                    reportsLayoutIntegrityFrame: true,
+                                    layoutRecoveryRevision: chatLayoutIntegrityMonitor.recoveryRevision(
+                                        for: message.id
+                                    ),
                                     providers: viewModel.providers
                                 )
+                                .background {
+                                    ChatMessageLayoutFrameReporter(
+                                        messageID: message.id,
+                                        metadata: ChatMessageLayoutMetadata(
+                                            role: message.role.rawValue,
+                                            contentUTF8Length: preparedMarkdownPayload?.sourceUTF8Length ?? 0,
+                                            reasoningUTF8Length: preparedReasoningMarkdownPayload?.sourceUTF8Length ?? 0,
+                                            isAwaitingStaticHandoff: state.streamingMarkdownState
+                                                .isAwaitingStaticHandoff(channel: .content)
+                                                || state.streamingMarkdownState
+                                                    .isAwaitingStaticHandoff(channel: .reasoning),
+                                            hasPreparedMarkdown: preparedMarkdownPayload != nil,
+                                            hasPreparedReasoningMarkdown: preparedReasoningMarkdownPayload != nil,
+                                            layoutRevision: state.layoutRevision,
+                                            recoveryRevision: chatLayoutIntegrityMonitor
+                                                .recoveryRevision(for: message.id),
+                                            rendererHandoffRevision: state.rendererHandoffRevision,
+                                            rendererHandoffAt: state.lastRendererHandoffAt,
+                                            usesNoBubbleStyle: viewModel.enableNoBubbleUI
+                                                && message.role != .error
+                                                && !(message.role == .user && message.authorKind == .user),
+                                            contentRenderer: ChatBubbleRendererIdentity.resolved(
+                                                hasContent: !message.content.isEmpty,
+                                                enableMarkdown: viewModel.enableMarkdown,
+                                                isStreaming: showsStreamingIndicators,
+                                                isAwaitingStaticHandoff: state.streamingMarkdownState
+                                                    .isAwaitingStaticHandoff(channel: .content),
+                                                hasPreparedMarkdown: preparedMarkdownPayload != nil,
+                                                usesWebRenderer: viewModel.enableAdvancedRenderer
+                                                    && preparedMarkdownPayload?.containsMermaidContent == true,
+                                                hasRoleplayHTML: state.roleplayHTML?.containsHTML == true
+                                            ),
+                                            reasoningRenderer: ChatBubbleRendererIdentity.resolved(
+                                                hasContent: !(message.reasoningContent?.isEmpty ?? true),
+                                                enableMarkdown: viewModel.enableMarkdown,
+                                                isStreaming: showsStreamingIndicators,
+                                                isAwaitingStaticHandoff: state.streamingMarkdownState
+                                                    .isAwaitingStaticHandoff(channel: .reasoning),
+                                                hasPreparedMarkdown: preparedReasoningMarkdownPayload != nil,
+                                                usesWebRenderer: viewModel.enableAdvancedRenderer
+                                                    && preparedReasoningMarkdownPayload?.containsMermaidContent == true
+                                            ),
+                                            layoutWidthBucket: ChatBubbleLayoutIdentity.widthBucket(
+                                                for: messageLayoutWidth
+                                            )
+                                        ),
+                                        probeRevision: chatLayoutIntegrityMonitor.layoutProbeRevision,
+                                        stackRecoveryRevision: chatLayoutIntegrityMonitor.stackRecoveryRevision
+                                    )
+                                }
                                 // 发送入场动画：用户气泡走 Overlay 飞行（见 flightOverlayLayer），
                                 // 真实气泡在飞行期间无动画隐身，避免两份白字文本叠加。
                                 .transition(
@@ -898,22 +1048,26 @@ extension ChatView {
                                         dampingFraction: appConfig.chatScrollAnimationSpringDamping
                                     ))
                                 ) { [scrollAnimEnabled = appConfig.chatScrollAnimationEnabled,
-                                     scrollAnimOffset = appConfig.chatScrollAnimationOffset] content, phase in
+                                     scrollAnimOffset = appConfig.chatScrollAnimationOffset,
+                                     layoutSettling = isChatLayoutSettling,
+                                     keepsBottomPinned = shouldKeepBottomPinned,
+                                     scrollUserInteracting = isChatScrollUserInteracting] content, phase in
                                     content
                                         .offset(
                                             y: Self.chatScrollTransitionOffset(
                                                 phaseValue: phase.value,
                                                 configuredOffset: scrollAnimOffset,
                                                 isEnabled: scrollAnimEnabled,
-                                                isConnectedToAdjacentBubble: mergeWithPrevious || mergeWithNext
+                                                isConnectedToAdjacentBubble: mergeWithPrevious || mergeWithNext,
+                                                isBottomPinnedStreamingBubble: isBottomPinnedStreamingBubble,
+                                                isViewportTransitioning: Self
+                                                    .shouldSuppressScrollTransitionForViewportChange(
+                                                        isLayoutSettling: layoutSettling,
+                                                        keepsBottomPinned: keepsBottomPinned,
+                                                        isUserInteracting: scrollUserInteracting
+                                                    )
                                             )
                                         )
-                                }
-                                .onAppear {
-                                    loadMoreAutomaticHistoryIfNeeded(
-                                        anchorMessageID: state.id,
-                                        isFirstDisplayedMessage: index == 0
-                                    )
                                 }
 
                                 if let contexts = outgoingContinuationContextsByMessageID[message.id] {
@@ -931,6 +1085,7 @@ extension ChatView {
                                 .frame(height: 8)
                                 .id(ChatScrollTargetID.bottom)
                         }
+                        .id(chatLayoutIntegrityMonitor.stackRecoveryRevision)
                         .scrollTargetLayout()
                     }
                     .padding(.horizontal, 8)
@@ -939,75 +1094,161 @@ extension ChatView {
                     .frame(width: chatViewportWidth, alignment: .top)
                 }
                 .frame(width: chatViewportWidth)
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.size.height
-                } action: { newHeight in
-                    chatScrollViewportHeight = newHeight
+                .coordinateSpace(.named(ChatMessageLayoutAudit.coordinateSpaceName))
+                .onPreferenceChange(ChatMessageLayoutFramePreferenceKey.self) { frames in
+                    chatLayoutIntegrityMonitor.updateSnapshot(
+                        frames,
+                        orderedMessageIDs: viewModel.displayMessages.map(\.id)
+                    )
+                    refreshMessageNavigationTargets()
+                }
+                .onChange(of: chatLayoutAuditContext) { _, context in
+                    chatLayoutIntegrityMonitor.updateContext(context)
+                }
+                .onChange(of: accessibilityVoiceOverEnabled) { _, isEnabled in
+                    if isEnabled {
+                        revealScrollNavigationPanel()
+                    } else {
+                        scheduleScrollNavigationPanelHide()
+                    }
+                }
+                .onChange(of: chatLayoutIntegrityMonitor.anchorScrollTargetMessageID) { oldValue, newValue in
+                    var transaction = Transaction()
+                    transaction.animation = nil
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        if let newValue {
+                            chatScrollTargetAnchor = .center
+                            chatScrollTarget = .message(newValue)
+                        } else if let oldValue,
+                                  chatScrollTarget == .message(oldValue) {
+                            chatScrollTarget = nil
+                        }
+                    }
+                }
+                // 静态尺寸变化由 SwiftUI 锚定；流式增长改由 UIKit 只动画 contentOffset。
+                // 两套机制不会同时接管，用户主动离底后也不会抢回阅读位置。
+                .chatDefaultSizeChangeScrollAnchor(
+                    Self.chatSizeChangeScrollAnchor(
+                        keepsBottomPinned: shouldKeepBottomPinned,
+                        isStreaming: viewModel.isSendingMessage
+                    )
+                )
+                .onGeometryChange(for: CGSize.self) { proxy in
+                    proxy.size
+                } action: { newSize in
+                    chatScrollViewportWidth = newSize.width
+                    chatScrollViewportHeight = newSize.height
+                    refreshMessageNavigationTargets()
                 }
                 .scrollPosition(id: $chatScrollTarget, anchor: chatScrollTargetAnchor)
+                .chatOnUserScrollPhaseChange { distanceToBottom, isUserInteracting in
+                    updateChatScrollInteractionState(isUserInteracting)
+                    updateScrollToBottomVisibility(
+                        distanceToBottom: distanceToBottom,
+                        isUserInteracting: isUserInteracting
+                    )
+                    resolveActiveBottomScrollCommand(
+                        distanceToBottom: distanceToBottom
+                    )
+                }
                 .scrollDismissesKeyboard(.interactively)
                 .scrollIndicators(.hidden)
+                .simultaneousGesture(scrollNavigationEdgeRevealGesture)
+                .accessibilityActions {
+                    if appConfig.chatTimelineNavigationEnabled {
+                        if canNavigateToTimelineTop {
+                            Button(NSLocalizedString("滚动到顶部", comment: "")) {
+                                handleScrollToTopButtonTap()
+                            }
+                        }
+                        if previousMessageNavigationTargetID != nil {
+                            Button(NSLocalizedString("滚动到上一条消息", comment: "")) {
+                                handleAdjacentMessageNavigation(.previous)
+                            }
+                        }
+                        if nextMessageNavigationTargetID != nil {
+                            Button(NSLocalizedString("滚动到下一条消息", comment: "")) {
+                                handleAdjacentMessageNavigation(.next)
+                            }
+                        }
+                        if canNavigateToTimelineBottom {
+                            Button(NSLocalizedString("滚动到底部", comment: "")) {
+                                handleScrollToBottomButtonTap()
+                            }
+                        }
+                    }
+                }
                 .simultaneousGesture(
                     TapGesture().onEnded {
                         dismissComposerInput()
                     }
                 )
-                .onChange(of: viewModel.messages.count) { _, _ in
-                    guard !viewModel.messages.isEmpty else {
-                        showScrollToBottom = false
-                        return
-                    }
-                    if needsImmediateBottomSnap {
-                        scheduleImmediateBottomSnap()
-                        return
-                    }
-                    if suppressAutoScrollOnce {
-                        suppressAutoScrollOnce = false
-                        return
-                    }
-                    guard shouldKeepBottomPinned || scrollDistanceToBottom < bottomPinnedDistanceThreshold else { return }
-                    scrollToBottom()
-                }
                 .onChange(of: toolPermissionCenter.activeRequest?.id) { _, newValue in
                     guard newValue != nil, shouldKeepBottomPinned || scrollDistanceToBottom < bottomPinnedDistanceThreshold else { return }
                     scrollToBottom()
                 }
-                .onChange(of: pendingJumpRequest) { _, request in
-                    guard let request else { return }
-                    scrollToMessage(request.messageID)
-                }
                 .onChange(of: viewModel.pendingSearchJumpTarget) { _, _ in
                     resolvePendingSearchJumpIfNeeded()
+                }
+                .onChange(of: viewModel.automaticHistoryLoadingEnabled) { _, _ in
+                    cancelAutomaticHistoryNavigation()
+                }
+                .onChange(of: viewModel.lazyLoadMessageCount) { _, _ in
+                    cancelAutomaticHistoryNavigation()
                 }
                 .onChange(of: viewModel.currentSession?.id) { _, _ in
                     pendingHistoryResetWorkItem?.cancel()
                     pendingHistoryResetWorkItem = nil
+                    pendingBottomSnapTask?.cancel()
+                    pendingBottomSnapTask = nil
+                    awaitsFreshBottomNavigationSnapshot = false
+                    bottomNavigationSnapshotBaselineRevision = 0
+                    cancelPendingScrollTargetCommand()
+                    lastAutomaticHistoryLoadAnchorID = nil
                     shouldRestorePendingJumpOnAppear = false
+                    pendingJumpRequest = nil
+                    isMessageJumpInFlight = false
+                    messageNavigationCursorID = nil
+                    chatNavigationMessageIDs = []
+                    chatNavigationIndexByMessageID = [:]
+                    previousMessageNavigationTargetID = nil
+                    nextMessageNavigationTargetID = nil
+                    hideScrollNavigationPanel()
                     shouldKeepBottomPinned = true
                     showScrollToBottom = false
                     needsImmediateBottomSnap = true
-                    scheduleImmediateBottomSnap()
+                    chatScrollTarget = nil
+                    chatLayoutIntegrityMonitor.updateContext(chatLayoutAuditContext)
                     resolvePendingSearchJumpIfNeeded()
                 }
                 .onChange(of: viewModel.displayMessageIdentityVersion) { _, _ in
-                    if needsImmediateBottomSnap, !viewModel.displayMessages.isEmpty {
-                        scheduleImmediateBottomSnap()
+                    handleDisplayedMessageIdentityChange()
+                    refreshMessageNavigationIndex()
+                    if accessibilityVoiceOverEnabled {
+                        revealScrollNavigationPanel()
                     }
-                    resolvePendingSearchJumpIfNeeded()
                 }
-                .onChange(of: viewModel.streamingScrollAnchorVersion) { _, _ in
-                    guard viewModel.isSendingMessage, shouldKeepBottomPinned else { return }
-                    scrollToBottom(animated: false)
+                .onChange(of: appConfig.chatTimelineNavigationEnabled) { _, isEnabled in
+                    if isEnabled {
+                        refreshMessageNavigationIndex()
+                        if accessibilityVoiceOverEnabled {
+                            revealScrollNavigationPanel()
+                        }
+                    } else {
+                        hideScrollNavigationPanel()
+                    }
                 }
                 .onAppear {
+                    chatLayoutIntegrityMonitor.updateContext(chatLayoutAuditContext)
+                    refreshMessageNavigationIndex()
+                    if accessibilityVoiceOverEnabled {
+                        revealScrollNavigationPanel()
+                    }
                     if shouldRestorePendingJumpOnAppear {
                         shouldRestorePendingJumpOnAppear = false
                         resolvePendingSearchJumpIfNeeded()
-                        DispatchQueue.main.async {
-                            if let request = pendingJumpRequest {
-                                scrollToMessage(request.messageID)
-                            }
-                        }
+                        restorePendingMessageJumpIfNeeded()
                         return
                     }
                     resolvePendingSearchJumpIfNeeded()
@@ -1037,9 +1278,35 @@ extension ChatView {
                 // Telegram 风格：底部输入栏
                 .safeAreaInset(edge: .bottom) {
                     VStack(spacing: 0) {
+                        if LocalLinuxChatPreviewPlacement.normalized(appConfig.localLinuxChatPreviewPlacement) == .aboveInput {
+                            LocalLinuxChatDockedPreview(
+                                mode: LocalLinuxChatPreviewMode
+                                    .normalized(appConfig.localLinuxChatPreviewMode)
+                                    .resolved(for: currentLocalAgentMode),
+                                isLocalLinuxEnabled: appConfig.localLinuxEnabled,
+                                agentToolPreview: viewModel.latestAgentToolExecutionPreview,
+                                isLiquidGlassEnabled: isLiquidGlassEnabled,
+                                onOpenTerminal: { jobID in
+                                    localTerminalInitialJobID = jobID
+                                    navigationDestination = .localTerminal
+                                },
+                                onOpenBrowser: {
+                                    navigationDestination = .browser
+                                }
+                            )
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 6)
+                        }
+
                         telegramInputBar
                         RoleplayScriptButtonBar(sessionID: viewModel.currentSession?.id)
                     }
+                        .animation(
+                            accessibilityReduceMotion
+                                ? nil
+                                : .spring(response: 0.32, dampingFraction: 1),
+                            value: appConfig.localLinuxChatPreviewPlacement
+                        )
                         .frame(width: chatViewportWidth)
                         .background(
                             GeometryReader { proxy in
@@ -1051,13 +1318,24 @@ extension ChatView {
                         )
                         // 按钮锚定整个底部输入区顶部，角色脚本栏出现时与输入框同步上移。
                         .overlay(alignment: .topTrailing) {
-                            if showScrollToBottom {
-                                telegramScrollToBottomButton {
+                            if appConfig.chatTimelineNavigationEnabled
+                                && showScrollNavigationPanel
+                                && canPresentExpandedScrollNavigationPanel {
+                                telegramScrollNavigationButtons
+                                .padding(.trailing, 16)
+                                .offset(y: -(scrollNavigationPanelHeight + scrollToBottomButtonInputSpacing))
+                                .transition(scrollNavigationPanelTransition)
+                            } else if showScrollToBottom || (
+                                appConfig.chatTimelineNavigationEnabled
+                                    && showScrollNavigationPanel
+                                    && canNavigateToTimelineBottom
+                            ) {
+                                telegramScrollToBottomButton(isEnabled: canNavigateToTimelineBottom) {
                                     handleScrollToBottomButtonTap()
                                 }
                                 .padding(.trailing, 16)
-                                .offset(y: -(scrollToBottomButtonSize + scrollToBottomButtonInputSpacing))
-                                .transition(.scale.combined(with: .opacity))
+                                .offset(y: -(scrollNavigationButtonHitSize + scrollToBottomButtonInputSpacing))
+                                .transition(scrollNavigationPanelTransition)
                             }
                         }
                 }
@@ -1080,6 +1358,31 @@ extension ChatView {
                     )
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     .zIndex(24)
+                }
+
+                if LocalLinuxChatPreviewPlacement.normalized(appConfig.localLinuxChatPreviewPlacement) == .floating {
+                    LocalLinuxChatFloatingPreview(
+                        mode: LocalLinuxChatPreviewMode
+                            .normalized(appConfig.localLinuxChatPreviewMode)
+                            .resolved(for: currentLocalAgentMode),
+                        isLocalLinuxEnabled: appConfig.localLinuxEnabled,
+                        agentToolPreview: viewModel.latestAgentToolExecutionPreview,
+                        sessionID: viewModel.currentSession?.id,
+                        containerSize: chatViewportSize,
+                        topPadding: navBarHeight + 12,
+                        bottomPadding: max(16, chatInputBarHeight + 16),
+                        offset: $localTerminalPreviewOffset,
+                        isLiquidGlassEnabled: isLiquidGlassEnabled,
+                        onOpenTerminal: { jobID in
+                            localTerminalInitialJobID = jobID
+                            navigationDestination = .localTerminal
+                        },
+                        onOpenBrowser: {
+                            navigationDestination = .browser
+                        }
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    .zIndex(25)
                 }
 
                 VStack {
@@ -1117,7 +1420,8 @@ extension ChatView {
                 RoleplaySessionScriptHost(
                     sessionID: viewModel.currentSession?.id,
                     messageID: displayedMessages.last?.message.id,
-                    versionIndex: displayedMessages.last?.message.getCurrentVersionIndex() ?? 0
+                    versionIndex: displayedMessages.last?.message.getCurrentVersionIndex() ?? 0,
+                    chatMessages: sessionMessages
                 )
             }
             .coordinateSpace(.named(ChatView.flightCoordinateSpace))
@@ -1142,7 +1446,7 @@ extension ChatView {
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
                 beginChatLayoutSettling(
-                    keepBottomPinned: shouldKeepBottomPinned || scrollDistanceToBottom < bottomPinnedDistanceThreshold
+                    keepBottomPinned: resolvedBottomPinIntentForViewportChange()
                 )
                 if !isKeyboardVisible {
                     isKeyboardVisible = true
@@ -1150,7 +1454,7 @@ extension ChatView {
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
                 beginChatLayoutSettling(
-                    keepBottomPinned: shouldKeepBottomPinned || scrollDistanceToBottom < bottomPinnedDistanceThreshold
+                    keepBottomPinned: resolvedBottomPinIntentForViewportChange()
                 )
                 if isKeyboardVisible {
                     isKeyboardVisible = false
@@ -1163,6 +1467,24 @@ extension ChatView {
                 pendingBottomSnapTask = nil
                 chatLayoutSettleTask?.cancel()
                 chatLayoutSettleTask = nil
+                isChatLayoutSettling = false
+                chatLayoutIntegrityMonitor.stop()
+                awaitsFreshBottomNavigationSnapshot = false
+                bottomNavigationSnapshotBaselineRevision = 0
+                if isMessageJumpInFlight,
+                   case .message(let messageID)? = chatScrollTarget {
+                    pendingJumpRequest = MessageJumpRequest(messageID: messageID)
+                    shouldRestorePendingJumpOnAppear = true
+                } else if isMessageJumpInFlight {
+                    pendingJumpRequest = nil
+                    shouldRestorePendingJumpOnAppear = false
+                    isMessageJumpInFlight = false
+                }
+                cancelPendingScrollTargetCommand(preservingMessageJump: true)
+                messageNavigationCursorID = nil
+                scrollNavigationHideTask?.cancel()
+                scrollNavigationHideTask = nil
+                showScrollNavigationPanel = false
                 pendingFlightCleanupTask?.cancel()
                 pendingFlightCleanupTask = nil
                 chatTransientNoticeDismissTask?.cancel()

@@ -87,6 +87,18 @@ public final class LocalModelStore: ObservableObject {
         return fileManager.fileExists(atPath: url.path)
     }
 
+    public func loraURL(for record: LocalModelRecord) -> URL? {
+        guard let relativePath = record.loraRelativePath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
+            return nil
+        }
+        return directoryURL.appendingPathComponent(relativePath)
+    }
+
+    public func loraFileExists(for record: LocalModelRecord) -> Bool {
+        guard let url = loraURL(for: record) else { return false }
+        return fileManager.fileExists(atPath: url.path)
+    }
+
     public func importModel(from sourceURL: URL, displayName: String? = nil, mmprojURL: URL? = nil) throws -> LocalModelRecord {
         let didStartSecurityScope = sourceURL.startAccessingSecurityScopedResource()
         let didStartProjectorSecurityScope = mmprojURL?.startAccessingSecurityScopedResource() ?? false
@@ -102,23 +114,39 @@ public final class LocalModelStore: ObservableObject {
         let sourceFileName = sourceURL.lastPathComponent
         let destinationFileName = uniqueFileName(for: sourceFileName)
         let destinationURL = directoryURL.appendingPathComponent(destinationFileName)
-        try fileManager.copyItem(at: sourceURL, to: destinationURL)
-        let importedProjector = try mmprojURL.map { try copyProjectorFile(from: $0) }
-        return try registerImportedFile(
-            fileName: destinationFileName,
-            displayName: displayName ?? sourceURL.deletingPathExtension().lastPathComponent,
-            importedProjector: importedProjector
-        )
+        var importedProjector: ImportedProjectorFile?
+        do {
+            try fileManager.copyItem(at: sourceURL, to: destinationURL)
+            importedProjector = try mmprojURL.map { try copyProjectorFile(from: $0) }
+            return try registerImportedFile(
+                fileName: destinationFileName,
+                displayName: displayName ?? sourceURL.deletingPathExtension().lastPathComponent,
+                importedProjector: importedProjector
+            )
+        } catch {
+            try? fileManager.removeItem(at: destinationURL)
+            if let importedProjector {
+                try? fileManager.removeItem(
+                    at: directoryURL.appendingPathComponent(importedProjector.relativePath)
+                )
+            }
+            throw error
+        }
     }
 
     public func registerDownloadedModel(fileAt sourceURL: URL, suggestedFileName: String, displayName: String? = nil) throws -> LocalModelRecord {
         let destinationFileName = uniqueFileName(for: suggestedFileName)
         let destinationURL = directoryURL.appendingPathComponent(destinationFileName)
         try fileManager.moveItem(at: sourceURL, to: destinationURL)
-        return try registerImportedFile(
-            fileName: destinationFileName,
-            displayName: displayName ?? URL(fileURLWithPath: suggestedFileName).deletingPathExtension().lastPathComponent
-        )
+        do {
+            return try registerImportedFile(
+                fileName: destinationFileName,
+                displayName: displayName ?? URL(fileURLWithPath: suggestedFileName).deletingPathExtension().lastPathComponent
+            )
+        } catch {
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
+        }
     }
 
     public func update(_ record: LocalModelRecord) {
@@ -131,6 +159,7 @@ public final class LocalModelStore: ObservableObject {
             let oldRecord = models[index]
             models[index] = updated
             removeProjectorFileIfUnreferenced(from: oldRecord, replacingWith: updated)
+            removeLoRAFileIfUnreferenced(from: oldRecord, replacingWith: updated)
         } else {
             models.append(updated)
         }
@@ -186,6 +215,7 @@ public final class LocalModelStore: ObservableObject {
     }
 
     public func delete(_ record: LocalModelRecord, deleteFile: Bool = true) {
+        let storedRecord = models.first(where: { $0.id == record.id })
         models.removeAll { $0.id == record.id }
         for index in models.indices {
             if models[index].speechDecoderModelID == record.id {
@@ -197,9 +227,15 @@ public final class LocalModelStore: ObservableObject {
         }
         if deleteFile {
             try? fileManager.removeItem(at: fileURL(for: record))
-            if let mmprojRelativePath = record.mmprojRelativePath,
-               !models.contains(where: { $0.mmprojRelativePath == mmprojRelativePath }) {
-                deleteProjectorFile(relativePath: mmprojRelativePath)
+            let projectorPaths = Set([record.mmprojRelativePath, storedRecord?.mmprojRelativePath].compactMap { $0 })
+            for relativePath in projectorPaths
+                where !models.contains(where: { $0.mmprojRelativePath == relativePath }) {
+                deleteProjectorFile(relativePath: relativePath)
+            }
+            let loraPaths = Set([record.loraRelativePath, storedRecord?.loraRelativePath].compactMap { $0 })
+            for relativePath in loraPaths
+                where !models.contains(where: { $0.loraRelativePath == relativePath }) {
+                deleteLoRAFile(relativePath: relativePath)
             }
         }
         persistModels()
@@ -232,6 +268,64 @@ public final class LocalModelStore: ObservableObject {
         try? fileManager.removeItem(at: directoryURL.appendingPathComponent(trimmed))
     }
 
+    @discardableResult
+    public func copyLoRAAdapter(from sourceURL: URL, into record: inout LocalModelRecord) throws -> LocalModelRecord {
+        let didStartSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if didStartSecurityScope {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let importedAdapter = try copyLoRAFile(
+            from: sourceURL,
+            compatibleWith: record.ggufArchitecture
+        )
+        record.loraFileName = importedAdapter.fileName
+        record.loraRelativePath = importedAdapter.relativePath
+        record.loraFileSize = importedAdapter.fileSize
+        record.loraScale = LocalModelRecord.defaultLoRAScale
+        record.normalizeGenerationParameters()
+        return record
+    }
+
+    public func copyLoRAAdapter(
+        from sourceURL: URL,
+        for record: LocalModelRecord,
+        suggestedFileName: String? = nil
+    ) async throws -> LocalModelRecord {
+        let destinationDirectory = directoryURL
+        return try await Task.detached(priority: .userInitiated) {
+            let didStartSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+            defer {
+                if didStartSecurityScope {
+                    sourceURL.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            let importedAdapter = try Self.copyLoRAFile(
+                from: sourceURL,
+                to: destinationDirectory,
+                compatibleWith: record.ggufArchitecture,
+                suggestedFileName: suggestedFileName,
+                fileManager: .default
+            )
+            var updatedRecord = record
+            updatedRecord.loraFileName = importedAdapter.fileName
+            updatedRecord.loraRelativePath = importedAdapter.relativePath
+            updatedRecord.loraFileSize = importedAdapter.fileSize
+            updatedRecord.loraScale = LocalModelRecord.defaultLoRAScale
+            updatedRecord.normalizeGenerationParameters()
+            return updatedRecord
+        }.value
+    }
+
+    public func deleteLoRAFile(relativePath: String) {
+        let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? fileManager.removeItem(at: directoryURL.appendingPathComponent(trimmed))
+    }
+
     private func registerImportedFile(
         fileName: String,
         displayName: String,
@@ -240,6 +334,7 @@ public final class LocalModelStore: ObservableObject {
         let destinationURL = directoryURL.appendingPathComponent(fileName)
         let attributes = try fileManager.attributesOfItem(atPath: destinationURL.path)
         let size = attributes[.size] as? Int64 ?? 0
+        let architecture = try LocalGGUFMetadata.validatedArchitecture(at: destinationURL)
         let now = Date()
         var record = LocalModelRecord(
             displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -250,7 +345,7 @@ public final class LocalModelStore: ObservableObject {
             mmprojFileName: importedProjector?.fileName,
             mmprojRelativePath: importedProjector?.relativePath,
             mmprojFileSize: importedProjector?.fileSize,
-            ggufArchitecture: LocalGGUFMetadata.architecture(at: destinationURL),
+            ggufArchitecture: architecture,
             createdAt: now,
             updatedAt: now
         )
@@ -302,6 +397,12 @@ public final class LocalModelStore: ObservableObject {
         var fileSize: Int64
     }
 
+    private struct ImportedLoRAFile {
+        var fileName: String
+        var relativePath: String
+        var fileSize: Int64
+    }
+
     private func copyProjectorFile(from sourceURL: URL) throws -> ImportedProjectorFile {
         let sourceFileName = sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "mmproj.gguf"
         let destinationFileName = uniqueFileName(for: sourceFileName)
@@ -309,6 +410,43 @@ public final class LocalModelStore: ObservableObject {
         try fileManager.copyItem(at: sourceURL, to: destinationURL)
         let attributes = try fileManager.attributesOfItem(atPath: destinationURL.path)
         return ImportedProjectorFile(
+            fileName: destinationFileName,
+            relativePath: destinationFileName,
+            fileSize: attributes[.size] as? Int64 ?? 0
+        )
+    }
+
+    private func copyLoRAFile(from sourceURL: URL, compatibleWith architecture: String?) throws -> ImportedLoRAFile {
+        try Self.copyLoRAFile(
+            from: sourceURL,
+            to: directoryURL,
+            compatibleWith: architecture,
+            suggestedFileName: nil,
+            fileManager: fileManager
+        )
+    }
+
+    private static func copyLoRAFile(
+        from sourceURL: URL,
+        to destinationDirectory: URL,
+        compatibleWith architecture: String?,
+        suggestedFileName: String?,
+        fileManager: FileManager
+    ) throws -> ImportedLoRAFile {
+        try LocalGGUFMetadata.validateLoRAAdapter(at: sourceURL, compatibleWith: architecture)
+        let suggestedBaseName = suggestedFileName.map { URL(fileURLWithPath: $0).lastPathComponent }
+        let sourceFileName = suggestedBaseName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? "adapter.gguf"
+        let destinationFileName = uniqueFileName(
+            for: sourceFileName,
+            in: destinationDirectory,
+            fileManager: fileManager
+        )
+        let destinationURL = destinationDirectory.appendingPathComponent(destinationFileName)
+        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+        let attributes = try fileManager.attributesOfItem(atPath: destinationURL.path)
+        return ImportedLoRAFile(
             fileName: destinationFileName,
             relativePath: destinationFileName,
             fileSize: attributes[.size] as? Int64 ?? 0
@@ -326,6 +464,20 @@ public final class LocalModelStore: ObservableObject {
         }
         if !isStillReferenced {
             deleteProjectorFile(relativePath: oldRelativePath)
+        }
+    }
+
+    private func removeLoRAFileIfUnreferenced(from oldRecord: LocalModelRecord, replacingWith newRecord: LocalModelRecord) {
+        guard let oldRelativePath = oldRecord.loraRelativePath,
+              !oldRelativePath.isEmpty,
+              oldRelativePath != newRecord.loraRelativePath else {
+            return
+        }
+        let isStillReferenced = models.contains { record in
+            record.id != oldRecord.id && record.loraRelativePath == oldRelativePath
+        }
+        if !isStillReferenced {
+            deleteLoRAFile(relativePath: oldRelativePath)
         }
     }
 
@@ -396,13 +548,17 @@ public final class LocalModelStore: ObservableObject {
     }
 
     private func uniqueFileName(for originalName: String) -> String {
+        Self.uniqueFileName(for: originalName, in: directoryURL, fileManager: fileManager)
+    }
+
+    private static func uniqueFileName(for originalName: String, in directory: URL, fileManager: FileManager) -> String {
         let normalizedOriginal = originalName.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "model.gguf"
         let nsName = normalizedOriginal as NSString
         let base = nsName.deletingPathExtension.nilIfEmpty ?? "model"
         let ext = nsName.pathExtension.nilIfEmpty ?? "gguf"
         var candidate = "\(base).\(ext)"
         var suffix = 2
-        while fileManager.fileExists(atPath: directoryURL.appendingPathComponent(candidate).path) {
+        while fileManager.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
             candidate = "\(base)-\(suffix).\(ext)"
             suffix += 1
         }

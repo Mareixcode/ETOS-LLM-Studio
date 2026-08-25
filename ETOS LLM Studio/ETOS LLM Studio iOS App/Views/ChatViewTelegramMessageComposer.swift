@@ -20,9 +20,12 @@ struct TelegramMessageComposer: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) var accessibilityReduceMotion
     @ObservedObject var appConfig = AppConfigStore.shared
+    @ObservedObject private var customSlashCommandStore = CustomChatSlashCommandStore.shared
     @Binding var text: String
     @Binding var isRequestControlsExpanded: Bool
+    @Binding var localAgentMode: LocalAgentMode
     let isSending: Bool
+    let isSendActionPending: Bool
     let sendAction: () -> Void
     let stopAction: () -> Void
     let slashCommandAction: (ChatSlashCommand) -> Void
@@ -39,8 +42,9 @@ struct TelegramMessageComposer: View {
     @State var isExpandedComposer = false
     @State var adaptiveRequestControls: [ModelRequestBodyControl] = []
     @State var adaptiveHasSendableText = false
-    @State var adaptiveRecognizedSlashCommand: ChatSlashCommand?
-    @State var slashCommandSuggestions: [ChatSlashCommand] = []
+    @State var adaptiveRecognizedSlashCommand: ChatSlashCommandSuggestion?
+    @State var slashCommandSuggestions: [ChatSlashCommandSuggestion] = []
+    @State private var customSlashCommandPrefilledPrompt: String?
     @StateObject var inlineSpeechRecorder = InlineSpeechRecorderController()
     @Namespace var adaptiveGlassNamespace
     @State private var inlineSpeechFinalizeTask: Task<Void, Never>?
@@ -94,12 +98,17 @@ struct TelegramMessageComposer: View {
                 )
             }
 
-            Color.clear
-                .frame(height: composerReservedHeight)
-                .overlay(alignment: .bottom) {
-                    composerOverlayContent
-                }
-                .zIndex(1)
+            if usesCardComposer {
+                cardComposerLayout
+                    .zIndex(1)
+            } else {
+                Color.clear
+                    .frame(height: composerReservedHeight)
+                    .overlay(alignment: .bottom) {
+                        composerOverlayContent
+                    }
+                    .zIndex(1)
+            }
         }
         .padding(.bottom, 6)
         .animation(
@@ -147,6 +156,16 @@ struct TelegramMessageComposer: View {
             handleAutoExpand(for: newValue)
         }
         .onChange(of: appConfig.enableSlashCommands) { _, _ in
+            refreshSlashCommandState(for: text)
+        }
+        .onChange(of: appConfig.chatComposerStyle) { _, _ in
+            withAnimation(adaptiveComposerAnimation) {
+                isExpandedComposer = false
+                isRequestControlsExpanded = false
+            }
+            handleAutoExpand(for: text)
+        }
+        .onChange(of: customSlashCommandStore.commands) { _, _ in
             refreshSlashCommandState(for: text)
         }
         .onChange(of: showAudioRecorder) { _, presented in
@@ -257,7 +276,8 @@ struct TelegramMessageComposer: View {
 
     func attachmentMenuButton(
         size: CGFloat,
-        participatesInGlassContainer: Bool = false
+        participatesInGlassContainer: Bool = false,
+        embeddedInCard: Bool = false
     ) -> some View {
         Menu {
             Button {
@@ -294,23 +314,34 @@ struct TelegramMessageComposer: View {
         } label: {
             attachmentMenuLabel(
                 size: size,
-                participatesInGlassContainer: participatesInGlassContainer
+                participatesInGlassContainer: participatesInGlassContainer,
+                embeddedInCard: embeddedInCard
             )
         }
-        .buttonStyle(ComposerPressButtonStyle())
+        .buttonStyle(
+            ComposerPressButtonStyle(
+                usesSystemGlassFeedback: participatesInGlassContainer
+                    && isLiquidGlassEnabled
+            )
+        )
+        .accessibilityLabel(NSLocalizedString("添加附件", comment: "聊天输入栏附件菜单"))
     }
 
     @ViewBuilder
     private func attachmentMenuLabel(
         size: CGFloat,
-        participatesInGlassContainer: Bool
+        participatesInGlassContainer: Bool,
+        embeddedInCard: Bool
     ) -> some View {
-        let label = Image(systemName: "paperclip")
+        let label = Image(systemName: embeddedInCard ? "plus" : "paperclip")
             .etFont(.system(size: max(14, size * 0.45), weight: .semibold))
             .foregroundColor(TelegramColors.attachButtonColor)
             .frame(width: size, height: size)
 
-        if #available(iOS 26.0, *),
+        if embeddedInCard {
+            label
+                .background(Circle().fill(Color.primary.opacity(0.08)))
+        } else if #available(iOS 26.0, *),
            isLiquidGlassEnabled,
            participatesInGlassContainer {
             label
@@ -488,6 +519,10 @@ struct TelegramMessageComposer: View {
         let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
         // 复用自动展开时的文本规整结果，避免视图渲染时重复扫描草稿。
         adaptiveHasSendableText = !trimmed.isEmpty
+        guard !usesCardComposer else {
+            isExpandedComposer = false
+            return
+        }
         if trimmed.isEmpty {
             if isExpandedComposer {
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
@@ -536,15 +571,41 @@ struct TelegramMessageComposer: View {
             slashCommandSuggestions = []
             return
         }
-        adaptiveRecognizedSlashCommand = ChatSlashCommandParser.recognizedCommand(in: value)
-        slashCommandSuggestions = ChatSlashCommandParser.suggestions(for: value)
+
+        if customSlashCommandPrefilledPrompt == value {
+            adaptiveRecognizedSlashCommand = nil
+            slashCommandSuggestions = []
+            return
+        }
+        customSlashCommandPrefilledPrompt = nil
+        adaptiveRecognizedSlashCommand = ChatSlashCommandParser.recognizedSuggestion(
+            in: value,
+            customCommands: customSlashCommandStore.commands
+        )
+        slashCommandSuggestions = ChatSlashCommandParser.suggestions(
+            for: value,
+            customCommands: customSlashCommandStore.commands
+        )
     }
 
-    private func performSuggestedSlashCommand(_ command: ChatSlashCommand) {
-        text = ""
+    private func performSuggestedSlashCommand(_ command: ChatSlashCommandSuggestion) {
+        performSelectedSlashCommand(command)
+    }
+
+    func performSelectedSlashCommand(_ command: ChatSlashCommandSuggestion) {
         adaptiveRecognizedSlashCommand = nil
         slashCommandSuggestions = []
-        slashCommandAction(command)
+
+        switch command {
+        case .builtIn(let builtInCommand):
+            customSlashCommandPrefilledPrompt = nil
+            text = ""
+            slashCommandAction(builtInCommand)
+        case .custom(let customCommand):
+            customSlashCommandPrefilledPrompt = customCommand.prompt
+            text = customCommand.prompt
+            focus.wrappedValue = true
+        }
     }
 
     private func measuredTextLineCount(for value: String, width: CGFloat) -> Int {

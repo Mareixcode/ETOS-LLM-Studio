@@ -69,10 +69,13 @@ public enum ChatQuickRetrySupport {
         case .error:
             return true
         case .assistant:
-            return isAbnormalStoppedAssistantMessage(latestMessage)
+            return !(latestMessage.toolCalls ?? []).isEmpty
+                || isAbnormalStoppedAssistantMessage(latestMessage)
         case .user:
             return true
-        case .system, .tool:
+        case .tool:
+            return true
+        case .system:
             return false
         }
     }
@@ -147,32 +150,25 @@ public enum ChatResponseAttemptSupport {
     }
 
     public static func versionInfo(for message: ChatMessage, in messages: [ChatMessage]) -> ChatResponseAttemptVersionInfo? {
-        guard canCarryResponseAttemptVersionInfo(message),
-              let groupID = message.responseGroupID,
-              let attemptID = message.responseAttemptID else {
+        guard let groupID = responseGroupID(for: message, in: messages) else {
             return nil
         }
 
         let attempts = orderedAttemptIDs(for: groupID, in: messages)
         guard attempts.count > 1,
-              let currentIndex = attempts.firstIndex(of: attemptID) else {
+              let selectedAttemptID = selectedAttemptIDsByGroup(in: messages)[groupID],
+              let currentIndex = attempts.firstIndex(of: selectedAttemptID) else {
             return nil
         }
 
-        if let selectedAttemptID = selectedAttemptIDsByGroup(in: messages)[groupID],
-           selectedAttemptID != attemptID {
+        if let messageAttemptID = message.responseAttemptID,
+           messageAttemptID != selectedAttemptID {
             return nil
         }
-
-        let visibleAttemptMessages = messages.filter {
-            $0.responseGroupID == groupID && $0.responseAttemptID == attemptID
-        }
-        let lastCarrierID = visibleAttemptMessages.last(where: canCarryResponseAttemptVersionInfo)?.id
-        guard lastCarrierID == message.id else { return nil }
 
         return ChatResponseAttemptVersionInfo(
             responseGroupID: groupID,
-            currentAttemptID: attemptID,
+            currentAttemptID: selectedAttemptID,
             currentIndex: currentIndex,
             totalCount: attempts.count
         )
@@ -344,13 +340,20 @@ public enum ChatResponseAttemptSupport {
         }
     }
 
-    private static func canCarryResponseAttemptVersionInfo(_ message: ChatMessage) -> Bool {
-        switch message.role {
-        case .assistant, .tool, .system, .error:
-            return true
-        case .user:
-            return false
+    private static func responseGroupID(for message: ChatMessage, in messages: [ChatMessage]) -> UUID? {
+        if let responseGroupID = message.responseGroupID {
+            return responseGroupID
         }
+
+        let visibleMessages = visibleMessages(from: messages)
+        guard let turn = ChatConversationTurnSupport.turn(
+            containingMessageID: message.id,
+            in: visibleMessages
+        ),
+        let anchorIndex = turn.responseGroupAnchorIndex else {
+            return nil
+        }
+        return visibleMessages[anchorIndex].id
     }
 }
 
@@ -570,10 +573,16 @@ public struct RequestLogSummary: Codable, Hashable, Sendable {
 public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     public let id: UUID
     public var name: String
+    /// 仅对当前会话生效的系统提示词，位于全局用户系统提示词之后。
+    public var systemPrompt: String?
     public var topicPrompt: String?
     public var enhancedPrompt: String?
+    /// 会话首选聊天模型；nil 表示继续跟随当前全局模型。
+    public var preferredModelIdentifier: String?
     /// 会话所属文件夹，nil 表示未分类。
     public var folderID: UUID?
+    /// 隐藏子代理归属的可见主会话；非 nil 时不会出现在普通会话列表中。
+    public var containerSessionID: UUID?
     public var lorebookIDs: [UUID]
     /// 绑定到当前会话的标签 ID，标签实体由 SessionTag 单独维护。
     public var tagIDs: [UUID]
@@ -586,6 +595,11 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     }
     public var isTemporary: Bool = false
 
+    /// 嵌入式子代理拥有独立上下文，但其生命周期和可见性都由主会话管理。
+    public var isEmbeddedSubagent: Bool {
+        containerSessionID != nil
+    }
+
     /// 当前会话是否启用了记忆与工具隔离。
     public var isWorldbookContextIsolationActive: Bool {
         worldbookContextIsolationEnabled
@@ -594,20 +608,26 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     public init(
         id: UUID,
         name: String,
+        systemPrompt: String? = nil,
         topicPrompt: String? = nil,
         enhancedPrompt: String? = nil,
+        preferredModelIdentifier: String? = nil,
         worldbookIDs: [UUID] = [],
         lorebookIDs: [UUID]? = nil,
         tagIDs: [UUID] = [],
         worldbookContextIsolationEnabled: Bool = false,
         folderID: UUID? = nil,
+        containerSessionID: UUID? = nil,
         isTemporary: Bool = false
     ) {
         self.id = id
         self.name = name
+        self.systemPrompt = systemPrompt
         self.topicPrompt = topicPrompt
         self.enhancedPrompt = enhancedPrompt
+        self.preferredModelIdentifier = preferredModelIdentifier
         self.folderID = folderID
+        self.containerSessionID = containerSessionID
         self.lorebookIDs = lorebookIDs ?? worldbookIDs
         self.tagIDs = tagIDs
         self.worldbookContextIsolationEnabled = worldbookContextIsolationEnabled
@@ -617,9 +637,12 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id
         case name
+        case systemPrompt
         case topicPrompt
         case enhancedPrompt
+        case preferredModelIdentifier
         case folderID
+        case containerSessionID
         case worldbookIDs
         case lorebookIDs
         case lorebookIds
@@ -632,9 +655,12 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(UUID.self, forKey: .id)
         self.name = try container.decode(String.self, forKey: .name)
+        self.systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
         self.topicPrompt = try container.decodeIfPresent(String.self, forKey: .topicPrompt)
         self.enhancedPrompt = try container.decodeIfPresent(String.self, forKey: .enhancedPrompt)
+        self.preferredModelIdentifier = try container.decodeIfPresent(String.self, forKey: .preferredModelIdentifier)
         self.folderID = try container.decodeIfPresent(UUID.self, forKey: .folderID)
+        self.containerSessionID = try container.decodeIfPresent(UUID.self, forKey: .containerSessionID)
         if let ids = try container.decodeIfPresent([UUID].self, forKey: .lorebookIDs) {
             self.lorebookIDs = ids
         } else if let ids = try container.decodeIfPresent([UUID].self, forKey: .lorebookIds) {
@@ -659,9 +685,12 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(systemPrompt, forKey: .systemPrompt)
         try container.encodeIfPresent(topicPrompt, forKey: .topicPrompt)
         try container.encodeIfPresent(enhancedPrompt, forKey: .enhancedPrompt)
+        try container.encodeIfPresent(preferredModelIdentifier, forKey: .preferredModelIdentifier)
         try container.encodeIfPresent(folderID, forKey: .folderID)
+        try container.encodeIfPresent(containerSessionID, forKey: .containerSessionID)
         if !lorebookIDs.isEmpty {
             try container.encode(lorebookIDs, forKey: .lorebookIDs)
             // 兼容旧版本持久化字段，避免多端混用时丢失绑定。

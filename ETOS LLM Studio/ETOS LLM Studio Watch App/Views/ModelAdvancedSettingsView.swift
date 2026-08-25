@@ -63,7 +63,6 @@ struct ModelAdvancedSettingsView: View {
     let updateSelectedGlobalSystemPromptContent: (String) -> Void
     let updateGlobalSystemPromptEntry: (UUID, String, String) -> Void
     let deleteGlobalSystemPromptEntry: (UUID) -> Void
-    let onSessionSelected: () -> Void
     let destination: ModelAdvancedSettingsDestination
 
     private let samplingParameterStep = 0.01
@@ -226,14 +225,6 @@ struct ModelAdvancedSettingsView: View {
             }
 
             if destination == .conversation {
-                Section {
-                    NavigationLink {
-                        sessionHistoryDestination
-                    } label: {
-                        Label(NSLocalizedString("历史会话管理", comment: ""), systemImage: "clock")
-                    }
-                }
-
                 Section(header: Text(NSLocalizedString("消息规则", comment: ""))) {
                     NavigationLink {
                         MessageRegexRulesView()
@@ -255,7 +246,22 @@ struct ModelAdvancedSettingsView: View {
                     }
                 }
 
-                Section(header: Text(NSLocalizedString("上下文窗口管理", comment: ""))) {
+                Section(
+                    header: Text(NSLocalizedString("会话协作", comment: "Conversation collaboration settings")),
+                    footer: Text(NSLocalizedString("自动执行预算由同一根协作链共享，耗尽后可从会话列表继续。", comment: "Watch conversation runtime settings explanation"))
+                ) {
+                    TextField(
+                        NSLocalizedString("自动执行预算", comment: "Conversation runtime execution budget"),
+                        value: conversationRuntimeBudgetBinding,
+                        formatter: numberFormatter
+                    )
+                    .monospacedDigit()
+                }
+
+                Section(
+                    header: Text(NSLocalizedString("上下文窗口管理", comment: "")),
+                    footer: Text(NSLocalizedString("开启后会在接近边缘时自动加载并回收历史气泡。关闭后按设置显示最近消息，每次向上加载 5 条；回到底部时恢复初始范围。设为 0 时显示全部历史。", comment: "自动管理聊天历史窗口说明"))
+                ) {
                     HStack {
                         Text(NSLocalizedString("最大上下文消息数", comment: ""))
                         Spacer()
@@ -264,12 +270,19 @@ struct ModelAdvancedSettingsView: View {
                             .frame(width: 60)
                     }
 
-                    HStack {
-                        Text(NSLocalizedString("懒加载轮次", comment: ""))
-                        Spacer()
-                        TextField(NSLocalizedString("数量", comment: ""), value: $lazyLoadMessageCount, formatter: numberFormatter)
-                            .multilineTextAlignment(.trailing)
-                            .frame(width: 60)
+                    Toggle(
+                        NSLocalizedString("自动管理历史消息", comment: "自动管理聊天历史窗口设置"),
+                        isOn: $viewModel.automaticHistoryLoadingEnabled
+                    )
+
+                    if !viewModel.automaticHistoryLoadingEnabled {
+                        HStack {
+                            Text(NSLocalizedString("初始显示消息数", comment: "手动模式初始显示聊天消息数设置"))
+                            Spacer()
+                            TextField(NSLocalizedString("数量", comment: ""), value: $lazyLoadMessageCount, formatter: numberFormatter)
+                                .multilineTextAlignment(.trailing)
+                                .frame(width: 60)
+                        }
                     }
 
                     Toggle(
@@ -456,67 +469,10 @@ struct ModelAdvancedSettingsView: View {
         .onDisappear(perform: commitContextCompressionReminderThresholdDraft)
     }
 
-    private var sessionHistoryDestination: some View {
-        SessionListView(
-            sessions: $viewModel.chatSessions,
-            folders: $viewModel.sessionFolders,
-            tags: viewModel.sessionTags,
-            currentSession: $viewModel.currentSession,
-            runningSessionIDs: viewModel.runningSessionIDs,
-            deleteSessionAction: { session in
-                viewModel.deleteSessions([session])
-            },
-            branchAction: { session, copyMessages in
-                viewModel.branchSession(from: session, copyMessages: copyMessages)
-            },
-            deleteLastMessageAction: { session in
-                viewModel.deleteLastMessage(for: session)
-            },
-            sendSessionToCompanionAction: { session in
-                WatchSyncManager.shared.sendSessionToCompanion(sessionID: session.id)
-            },
-            onSessionSelected: { selectedSession, messageOrdinal in
-                if let messageOrdinal {
-                    viewModel.requestMessageJump(
-                        sessionID: selectedSession.id,
-                        messageOrdinal: messageOrdinal
-                    )
-                } else {
-                    viewModel.clearPendingMessageJumpTarget()
-                }
-                ChatService.shared.setCurrentSession(selectedSession)
-                onSessionSelected()
-            },
-            updateSessionAction: { session in
-                viewModel.updateSession(session)
-            },
-            createFolderAction: { name, parentID in
-                viewModel.createSessionFolder(name: name, parentID: parentID)
-            },
-            renameFolderAction: { folder, newName in
-                viewModel.renameSessionFolder(folder, newName: newName)
-            },
-            deleteFolderAction: { folder in
-                viewModel.deleteSessionFolder(folder)
-            },
-            moveSessionToFolderAction: { session, folderID in
-                viewModel.moveSession(session, toFolderID: folderID)
-            },
-            moveFolderToFolderAction: { folder, parentID in
-                viewModel.moveSessionFolder(folder, toParentID: parentID)
-            },
-            createTagAction: { name, color in
-                viewModel.createSessionTag(name: name, color: color)
-            },
-            updateTagAction: { tag, name, color in
-                viewModel.updateSessionTag(tag, name: name, color: color)
-            },
-            deleteTagAction: { tag in
-                viewModel.deleteSessionTag(tag)
-            },
-            setSessionTagsAction: { session, tagIDs in
-                viewModel.setSessionTags(for: session, tagIDs: tagIDs)
-            }
+    private var conversationRuntimeBudgetBinding: Binding<Int> {
+        Binding(
+            get: { max(1, appConfig.conversationRuntimeExecutionBudget) },
+            set: { appConfig.conversationRuntimeExecutionBudget = max(1, $0) }
         )
     }
 
@@ -659,7 +615,7 @@ struct ModelAdvancedSettingsView: View {
                 (
                     NSLocalizedString("上下文窗口管理", comment: ""),
                     [
-                        NSLocalizedString("设置进入历史会话时默认加载的最近对话轮次（从最近一条用户消息开始向后）。数值越小，长对话加载越快；设置为 0 表示加载全部历史。", comment: ""),
+                        NSLocalizedString("开启后会在接近边缘时自动加载并回收历史气泡。关闭后按设置显示最近消息，每次向上加载 5 条；回到底部时恢复初始范围。设为 0 时显示全部历史。", comment: "自动管理聊天历史窗口说明"),
                         NSLocalizedString("达到阈值后，系统会发送通知；点击通知会立即按默认参数创建续聊会话，原会话会完整保留。", comment: "Watch context compression reminder settings explanation")
                     ].joined(separator: "\n\n")
                 ),

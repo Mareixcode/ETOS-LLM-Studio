@@ -303,7 +303,13 @@ extension SyncEngine {
         var skipped = 0
         var localContentHashes = Set(local.map { computeMCPServerContentHash($0) })
 
-        for var server in incoming {
+        for incomingServer in incoming {
+            guard var server = MCPServerConfigurationTransferService.materializeEnvironmentReferences(
+                in: incomingServer
+            ) else {
+                skipped += 1
+                continue
+            }
             let incomingHash = computeMCPServerContentHash(server)
             if localContentHashes.contains(incomingHash) {
                 skipped += 1
@@ -419,6 +425,11 @@ extension SyncEngine {
                 if let imageFileNames = messages[index].imageFileNames {
                     let mappedImageFileNames = imageFileNames.map { imageMapping[$0] ?? $0 }
                     messages[index].imageFileNames = mappedImageFileNames
+                }
+                if let excludedImageFileNames = messages[index].modelExcludedImageFileNames {
+                    messages[index].modelExcludedImageFileNames = excludedImageFileNames.map {
+                        imageMapping[$0] ?? $0
+                    }
                 }
             }
             return SyncedSession(session: payload.session, messages: messages)

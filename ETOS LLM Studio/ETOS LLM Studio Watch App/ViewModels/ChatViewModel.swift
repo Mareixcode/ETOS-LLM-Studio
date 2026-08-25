@@ -84,6 +84,7 @@ class ChatViewModel: ObservableObject {
     @Published var reasoningThinkingTitleByMessageID: [UUID: String] = [:]
     var allMessagesForSession: [ChatMessage] = []
     @Published var isHistoryFullyLoaded: Bool = false
+    @Published var isLaterHistoryFullyLoaded: Bool = true
     @Published var userInput: String = AppConfigStore.shared.chatComposerDraft {
         didSet {
             guard userInput != AppConfigStore.shared.chatComposerDraft else { return }
@@ -122,6 +123,7 @@ class ChatViewModel: ObservableObject {
     @Published var autoOpenedPendingToolCallIDs: Set<String> = []
     @Published var isSendingMessage: Bool = false
     @Published var isSendDelayPending: Bool = false
+    @Published var pendingSendSubmissionSessionIDs: Set<UUID> = []
     @Published var speechModels: [RunnableModel] = []
     @Published var ttsModels: [RunnableModel] = []
     @Published var selectedSpeechModel: RunnableModel?
@@ -161,6 +163,7 @@ class ChatViewModel: ObservableObject {
     @Published var streamingScrollAnchorVersion: Int = 0
     @Published var toolCallResultIDs: Set<String> = []
     @Published var runningSessionIDs: Set<UUID> = []
+    @Published var conversationRuntimeStates: [UUID: ConversationRuntimeSessionState] = [:]
     @Published var pendingSearchJumpTarget: SessionMessageJumpTarget?
     @Published var imageGenerationFeedback: ImageGenerationFeedback = .idle
     @Published var mathRenderOverrides: Set<UUID> = []
@@ -238,12 +241,18 @@ class ChatViewModel: ObservableObject {
     @Published var enableOpenAIStreamIncludeUsage: Bool = AppConfigStore.shared.enableOpenAIStreamIncludeUsage {
         didSet { AppConfigStore.shared.enableOpenAIStreamIncludeUsage = enableOpenAIStreamIncludeUsage }
     }
+    @Published var automaticHistoryLoadingEnabled: Bool = AppConfigStore.shared.automaticHistoryLoadingEnabled {
+        didSet {
+            AppConfigStore.shared.automaticHistoryLoadingEnabled = automaticHistoryLoadingEnabled
+            guard oldValue != automaticHistoryLoadingEnabled else { return }
+            resetLazyLoadState()
+        }
+    }
     @Published var lazyLoadMessageCount: Int = AppConfigStore.shared.lazyLoadMessageCount {
         didSet {
             AppConfigStore.shared.lazyLoadMessageCount = lazyLoadMessageCount
             guard oldValue != lazyLoadMessageCount else { return }
-            additionalHistoryLoaded = 0
-            updateDisplayedMessages()
+            resetLazyLoadState()
         }
     }
     @Published var currentBackgroundImage: String = AppConfigStore.shared.currentBackgroundImage {
@@ -396,7 +405,7 @@ class ChatViewModel: ObservableObject {
     }
 
     var remainingHistoryCount: Int {
-        max(0, allMessagesForSession.count - messages.count)
+        max(0, historyWindow?.lowerBound ?? 0)
     }
 
     var historyLoadChunkCount: Int {
@@ -413,13 +422,15 @@ class ChatViewModel: ObservableObject {
     let chatService: ChatService
     let ttsManager: TTSManager
     var cancellables = Set<AnyCancellable>()
-    var additionalHistoryLoaded: Int = 0
-    var lastSessionID: UUID?
+    var historyWindow: ChatHistoryWindow?
+    var historyWindowSessionID: UUID?
     let incrementalHistoryBatchSize = 5
     let automaticHistoryWindowSize = 3
     let automaticHistoryBatchSize = 4
+    let automaticHistoryMaximumWindowSize = 9
+    let retainedRenderMessageCacheLimit = 4
+    var retainedRenderMessageIDs: [UUID] = []
     var visibleMessagesCache: [ChatMessage] = []
-    var visibleMessagesWeightedCount: Int = 0
     var displayMessageIDs: [UUID] = []
     var activatedModelIDs: [String] = []
     var audioRecorder: AVAudioRecorder?
@@ -432,14 +443,20 @@ class ChatViewModel: ObservableObject {
     var visualMessagePrepareTasks: [UUID: Task<Void, Never>] = [:]
     var markdownPrepareTasks: [UUID: Task<Void, Never>] = [:]
     var reasoningMarkdownPrepareTasks: [UUID: Task<Void, Never>] = [:]
+    var streamingMarkdownPrepareTasks: [ETStreamingMarkdownStreamID: Task<Void, Never>] = [:]
     var visualMessagePrepareGenerations: [UUID: Int] = [:]
     var markdownPrepareGenerations: [UUID: Int] = [:]
     var reasoningMarkdownPrepareGenerations: [UUID: Int] = [:]
+    var streamingMarkdownPrepareGenerations: [ETStreamingMarkdownStreamID: Int] = [:]
     var autoReasoningPreviewMessageIDs: Set<UUID> = []
     var userControlledReasoningPreviewMessageIDs: Set<UUID> = []
     var isPersistingGlobalSystemPrompts = false
     var lastAutoPlayedAssistantMessageID: UUID?
     var pendingReplyNotificationContextBySessionID: [UUID: PendingBackgroundReplyNotificationContext] = [:]
+    var askUserInputRequestsBySessionID: [UUID: [AppToolAskUserInputRequest]] = [:]
+    var toolInputDraftRequestsBySessionID: [UUID: [AppToolInputDraftRequest]] = [:]
+    var pendingToolSupplementMessagesBySessionID: [UUID: [String]] = [:]
+    var dispatchingToolSupplementSessionIDs: Set<UUID> = []
     var lastNotifiedAssistantMarker: AssistantReplyMarker?
     var lastMemoryEmbeddingErrorSignature: String = ""
     var lastMemoryEmbeddingErrorDate: Date = .distantPast
@@ -447,7 +464,7 @@ class ChatViewModel: ObservableObject {
     var memoryRetryStoppedNoticeTask: Task<Void, Never>?
     var pendingSendDelayTask: Task<Void, Never>?
     private var pendingSendDelayPayload: PendingChatSendPayload?
-    private let iso8601Formatter = ISO8601DateFormatter()
+    let iso8601Formatter = ISO8601DateFormatter()
     let backgroundImageCache: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
         cache.countLimit = 6
@@ -459,6 +476,7 @@ class ChatViewModel: ObservableObject {
         return cache
     }()
     var globalSystemPromptReloadTask: Task<Void, Never>?
+    var conversationMemoryReloadTask: Task<Void, Never>?
     var backgroundBlurTask: Task<Void, Never>?
 
     // MARK: - 初始化
@@ -516,7 +534,7 @@ class ChatViewModel: ObservableObject {
             hasAudio: hasAudio,
             imageCount: pendingImageAttachments.count,
             fileCount: pendingFileAttachments.count,
-            isSending: isSendingMessage || isSendDelayPending
+            isSending: isSendDelayPending || isSendSubmissionPending
         ) else { return nil }
         
         let audioToSend = pendingAudioAttachment
@@ -571,7 +589,12 @@ class ChatViewModel: ObservableObject {
     }
 
     private func sendCapturedMessage(_ payload: PendingChatSendPayload) {
-        Task {
+        if let sessionID = payload.sessionID,
+           !runningSessionIDs.contains(sessionID) {
+            pendingSendSubmissionSessionIDs.insert(sessionID)
+        }
+        Task { [weak self] in
+            guard let self else { return }
             await chatService.sendAndProcessMessage(
                 content: payload.content,
                 aiTemperature: payload.aiTemperature,
@@ -592,6 +615,10 @@ class ChatViewModel: ObservableObject {
                 imageAttachments: payload.imageAttachments,
                 fileAttachments: payload.fileAttachments
             )
+            if let sessionID = payload.sessionID {
+                pendingSendSubmissionSessionIDs.remove(sessionID)
+            }
+            flushPendingToolSupplementMessagesIfPossible()
         }
     }
 
@@ -604,6 +631,7 @@ class ChatViewModel: ObservableObject {
         pendingSendDelayPayload = nil
         isSendDelayPending = false
         restorePendingSendDraftIfPossible(payload)
+        flushPendingToolSupplementMessagesIfPossible()
         return true
     }
 
@@ -773,8 +801,13 @@ class ChatViewModel: ObservableObject {
     var canQuickRetryLatestMessage: Bool {
         ChatQuickRetrySupport.canRetryLatestMessage(
             in: allMessagesForSession,
-            isSending: isSendingMessage || isSendDelayPending
+            isSending: isSendingMessage || isSendDelayPending || isSendSubmissionPending
         )
+    }
+
+    var isSendSubmissionPending: Bool {
+        guard let currentSessionID = currentSession?.id else { return false }
+        return pendingSendSubmissionSessionIDs.contains(currentSessionID)
     }
 
     func quickRetryLatestMessage() {
@@ -830,47 +863,6 @@ class ChatViewModel: ObservableObject {
         globalSystemPromptEntries.remove(at: index)
         let fallbackSelection = (selectedGlobalSystemPromptEntryID == id) ? globalSystemPromptEntries.first?.id : selectedGlobalSystemPromptEntryID
         persistGlobalSystemPromptEntries(selectedEntryID: fallbackSelection)
-    }
-
-    func submitAskUserInputAnswers(
-        _ answers: [AppToolAskUserInputQuestionAnswer],
-        for requestOverride: AppToolAskUserInputRequest? = nil
-    ) {
-        guard let request = requestOverride ?? activeAskUserInputRequest else { return }
-        let submission = AppToolAskUserInputSubmission(
-            requestID: request.requestID,
-            cancelled: false,
-            submittedAt: iso8601Formatter.string(from: Date()),
-            answers: answers
-        )
-        if activeAskUserInputRequest?.requestID == request.requestID {
-            activeAskUserInputRequest = nil
-        }
-        sendToolSupplementMessage(
-            AppToolAskUserInputSubmissionFormatter.messageContent(
-                request: request,
-                submission: submission
-            )
-        )
-    }
-
-    func cancelAskUserInputRequest(using requestOverride: AppToolAskUserInputRequest? = nil) {
-        guard let request = requestOverride ?? activeAskUserInputRequest else { return }
-        let submission = AppToolAskUserInputSubmission(
-            requestID: request.requestID,
-            cancelled: true,
-            submittedAt: iso8601Formatter.string(from: Date()),
-            answers: []
-        )
-        if activeAskUserInputRequest?.requestID == request.requestID {
-            activeAskUserInputRequest = nil
-        }
-        sendToolSupplementMessage(
-            AppToolAskUserInputSubmissionFormatter.messageContent(
-                request: request,
-                submission: submission
-            )
-        )
     }
 
     // MARK: - 私有方法 (内部逻辑)

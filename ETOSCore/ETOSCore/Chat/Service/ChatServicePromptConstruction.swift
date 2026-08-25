@@ -11,7 +11,10 @@ import Foundation
 extension ChatService {
     func buildFinalSystemPrompt(
         global: String?,
+        conversationSystem: String? = nil,
         topic: String?,
+        includeConversationRuntime: Bool = false,
+        linkedConversations: [LinkedConversationContact] = [],
         memories: [MemoryItem],
         recentConversationSummaries: [ConversationSessionSummary],
         conversationProfile: ConversationUserProfile?,
@@ -20,9 +23,23 @@ extension ChatService {
         worldbookAfter: [WorldbookInjection] = [],
         worldbookANTop: [WorldbookInjection] = [],
         worldbookANBottom: [WorldbookInjection] = [],
-        roleplayPrompt: String? = nil
+        roleplayPrompt: String? = nil,
+        includeLocalLinuxInstructions: Bool = false,
+        localAgentPrompt: String? = nil
     ) -> String {
         var parts: [String] = []
+
+        if includeConversationRuntime {
+            let runtimeInstructions = NSLocalizedString(
+                "会话协作运行时协议",
+                comment: "Conversation runtime model instructions"
+            )
+            parts.append("""
+            <conversation_runtime>
+            \(runtimeInstructions)
+            </conversation_runtime>
+            """)
+        }
 
         if !worldbookBefore.isEmpty {
             parts.append(makeWorldbookPromptBlock(tag: "worldbook_before", entries: worldbookBefore))
@@ -40,13 +57,28 @@ extension ChatService {
             parts.append("<system_prompt>\n\(global)\n</system_prompt>")
         }
 
+        if let conversationSystem,
+           !conversationSystem.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append("<conversation_system_prompt>\n\(conversationSystem)\n</conversation_system_prompt>")
+        }
+
         if let roleplayPrompt,
            !roleplayPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             parts.append(roleplayPrompt)
         }
 
+        if includeLocalLinuxInstructions,
+           let localAgentPrompt,
+           !localAgentPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append("<local_linux_runtime_instructions>\n\(localAgentPrompt)\n</local_linux_runtime_instructions>")
+        }
+
         if let topic, !topic.isEmpty {
             parts.append("<topic_prompt>\n\(topic)\n</topic_prompt>")
+        }
+
+        if includeConversationRuntime, !linkedConversations.isEmpty {
+            parts.append(makeLinkedConversationsPromptBlock(linkedConversations))
         }
 
         if includeSystemTime {
@@ -105,6 +137,24 @@ extension ChatService {
         }
 
         return parts.joined(separator: "\n\n")
+    }
+
+    func makeLinkedConversationsPromptBlock(_ contacts: [LinkedConversationContact]) -> String {
+        let rows = contacts.map { contact in
+            var permissions: [String] = []
+            if contact.canRead { permissions.append("read") }
+            if contact.canSend { permissions.append("send") }
+            if contact.canTriggerReply { permissions.append("trigger_reply") }
+            if contact.canInterrupt { permissions.append("interrupt") }
+            let status = contact.runStatus?.rawValue ?? "idle"
+            let visibility = contact.isEmbeddedSubagent ? "hidden" : "visible"
+            return "  <conversation id=\"\(xmlEscapedAttribute(contact.sessionID.uuidString))\" title=\"\(xmlEscapedAttribute(contact.title))\" visibility=\"\(visibility)\" relation=\"\(contact.relation.rawValue)\" status=\"\(status)\" unread=\"\(contact.unreadEventCount)\" permissions=\"\(permissions.joined(separator: ","))\" />"
+        }
+        return """
+        <linked_conversations>
+        \(rows.joined(separator: "\n"))
+        </linked_conversations>
+        """
     }
 
     func makeEnhancedPromptMessage(

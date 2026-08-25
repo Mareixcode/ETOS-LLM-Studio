@@ -66,6 +66,19 @@ public enum Persistence {
     static var hasCreatedLaunchBackupPoint = false
     static var hasScheduledLaunchBackupPoint = false
 
+    /// 数据写入允许在后台完成，但驱动 SwiftUI 刷新的通知必须始终从主线程发出。
+    static func postCloudSyncLocalDataDidChange(
+        notificationCenter: NotificationCenter = .default
+    ) {
+        guard !Thread.isMainThread else {
+            notificationCenter.post(name: .cloudSyncLocalDataDidChange, object: nil)
+            return
+        }
+        DispatchQueue.main.async {
+            notificationCenter.post(name: .cloudSyncLocalDataDidChange, object: nil)
+        }
+    }
+
     static var deferredLaunchBackupDelay: TimeInterval {
         #if os(watchOS)
         120
@@ -236,6 +249,7 @@ public enum Persistence {
     static let dailyPulsePendingCurationFileName = "pending-curation.json"
     static let dailyPulseExternalSignalsFileName = "external-signals.json"
     static let dailyPulseTasksFileName = "tasks.json"
+    static let dailyPulseGenerationRuntimeFileName = "generation-runtime.json"
     static let legacySessionDirectoryName = "v3"
     static let legacyArchiveDirectoryName = "legacy"
 

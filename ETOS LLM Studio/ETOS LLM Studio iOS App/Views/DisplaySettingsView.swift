@@ -52,6 +52,19 @@ struct DisplaySettingsView: View {
                     }
                 }
 
+                if enableBackground && selectedBackgroundIsVideo {
+                    Section {
+                        Toggle(
+                            NSLocalizedString("离开聊天时继续播放", comment: "Video background continuous playback toggle"),
+                            isOn: $appConfig.continueVideoBackgroundPlaybackWhenChatHidden
+                        )
+                    } footer: {
+                        Text(NSLocalizedString("开启后，进入设置等页面时视频会继续播放，返回聊天时保持原有进度；App 进入后台后仍会暂停。", comment: "Video background continuous playback description"))
+                            .etFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if enableBackground {
                     Section(NSLocalizedString("质感与特效", comment: "")) {
                         VStack(alignment: .leading, spacing: 8) {
@@ -114,6 +127,36 @@ struct DisplaySettingsView: View {
                     }
                     Toggle(NSLocalizedString("关闭助手气泡", comment: ""), isOn: $enableNoBubbleUI)
                     Toggle(NSLocalizedString("顶部毛玻璃渐隐", comment: ""), isOn: $enableChatTopBlurFade)
+                }
+
+                Section {
+                    Toggle(
+                        NSLocalizedString("四键消息导航", comment: "Chat timeline navigation toggle"),
+                        isOn: $appConfig.chatTimelineNavigationEnabled
+                    )
+                } header: {
+                    Text(NSLocalizedString("聊天导航", comment: "Chat navigation settings section"))
+                } footer: {
+                    Text(NSLocalizedString("开启后，从聊天区右侧向左轻扫可展开四个导航按钮，停止操作后会自动收起；关闭后仍保留原有的回到底部按钮。", comment: "Chat timeline navigation description"))
+                        .etFont(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Picker(
+                        NSLocalizedString("流式显示", comment: "Streaming response display mode"),
+                        selection: $appConfig.chatStreamingDisplayMode
+                    ) {
+                        ForEach(ChatStreamingDisplayMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode.rawValue)
+                        }
+                    }
+                } header: {
+                    Text(NSLocalizedString("流式显示", comment: "Streaming response display section"))
+                } footer: {
+                    Text(NSLocalizedString("即时模式优先响应速度，并让新增文字快速淡入；柔和模式会合并更多流式分片，以更舒缓的节奏显示新增文字。", comment: "Streaming response display mode description"))
+                        .etFont(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -218,12 +261,25 @@ struct DisplaySettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section(NSLocalizedString("聊天界面", comment: "设置聊天界面分组")) {
+                Section {
+                    Picker(NSLocalizedString("输入栏样式", comment: "聊天输入栏样式选择器"), selection: chatComposerStyleBinding) {
+                        ForEach(ChatComposerStyle.allCases) { style in
+                            Text(chatComposerStyleTitle(style))
+                                .tag(style)
+                        }
+                    }
+
                     NavigationLink {
                         ChatQuickActionSettingsView()
                     } label: {
                         SettingsListIconLabel("聊天快捷功能", icon: .chatQuickAction)
                     }
+                } header: {
+                    Text(NSLocalizedString("聊天界面", comment: "设置聊天界面分组"))
+                } footer: {
+                    Text(NSLocalizedString("胶囊样式保持紧凑；卡片样式会将附件、请求控制、语音和发送操作收进同一输入区域，并随文本自然增高。", comment: "聊天输入栏样式说明"))
+                        .etFont(.footnote)
+                        .foregroundStyle(.secondary)
                 }
             }
             .tabItem {
@@ -250,8 +306,28 @@ struct DisplaySettingsView: View {
         )
     }
 
+    private var chatComposerStyleBinding: Binding<ChatComposerStyle> {
+        Binding(
+            get: { ChatComposerStyle.normalized(appConfig.chatComposerStyle) },
+            set: { appConfig.chatComposerStyle = $0.rawValue }
+        )
+    }
+
+    private func chatComposerStyleTitle(_ style: ChatComposerStyle) -> String {
+        switch style {
+        case .capsule:
+            return NSLocalizedString("胶囊", comment: "胶囊聊天输入栏样式")
+        case .card:
+            return NSLocalizedString("卡片", comment: "卡片聊天输入栏样式")
+        }
+    }
+
     private var isAnyChatAnimationEnabled: Bool {
         appConfig.chatScrollAnimationEnabled || appConfig.chatSendAnimationEnabled
+    }
+
+    private var selectedBackgroundIsVideo: Bool {
+        ConfigLoader.isVideoBackgroundFile(currentBackgroundImage)
     }
 
     @ViewBuilder

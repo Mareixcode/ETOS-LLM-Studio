@@ -88,6 +88,119 @@ public enum VideoFrameExtractionMode: String, CaseIterable, Identifiable, Sendab
     }
 }
 
+public enum ChatStreamingDisplayMode: String, CaseIterable, Identifiable, Sendable {
+    case immediate
+    case gentle
+
+    public static let defaultMode: ChatStreamingDisplayMode = .immediate
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .immediate:
+            return NSLocalizedString("即时", comment: "Immediate streaming display mode")
+        case .gentle:
+            return NSLocalizedString("柔和", comment: "Gentle streaming display mode")
+        }
+    }
+
+    public var uiPublishInterval: TimeInterval {
+        #if os(watchOS)
+        switch self {
+        case .immediate: return 0.080
+        case .gentle: return 0.160
+        }
+        #else
+        switch self {
+        case .immediate: return 0.060
+        case .gentle: return 0.120
+        }
+        #endif
+    }
+
+    /// 淡入只改变新增字形的透明度，不参与文字测量或气泡布局。
+    public var textRevealDuration: TimeInterval {
+        switch self {
+        case .immediate: return 0.28
+        case .gentle: return 0.45
+        }
+    }
+
+    /// 同一批内容内的错峰窗口；批次之间允许重叠，避免高速输出累积成长队列。
+    public var textRevealStaggerWindow: TimeInterval {
+        switch self {
+        case .immediate: return 0.04
+        case .gentle: return 0.10
+        }
+    }
+
+    /// 视口只追随新的底部位置，不动画消息气泡自身的布局。
+    public var viewportFollowDuration: TimeInterval {
+        switch self {
+        case .immediate: return 0.12
+        case .gentle: return 0.20
+        }
+    }
+
+    public static func normalized(_ rawValue: String) -> ChatStreamingDisplayMode {
+        ChatStreamingDisplayMode(rawValue: rawValue) ?? defaultMode
+    }
+}
+
+public enum LocalLinuxChatPreviewMode: String, CaseIterable, Identifiable, Sendable {
+    case off
+    case agentTools = "agent_tools"
+    case userTerminal = "user_terminal"
+
+    public static let defaultMode: LocalLinuxChatPreviewMode = .agentTools
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .off:
+            return NSLocalizedString("关闭", comment: "Local Linux chat preview disabled")
+        case .agentTools:
+            return NSLocalizedString("Agent 工具预览", comment: "Agent tool execution chat preview")
+        case .userTerminal:
+            return NSLocalizedString("用户终端预览", comment: "User terminal chat preview")
+        }
+    }
+
+    public static func normalized(_ rawValue: String) -> LocalLinuxChatPreviewMode {
+        LocalLinuxChatPreviewMode(rawValue: rawValue) ?? defaultMode
+    }
+
+    /// Agent 工具缩略图只属于 Agent 会话；用户终端是独立能力，不受会话模式限制。
+    public func resolved(for sessionMode: LocalAgentMode) -> LocalLinuxChatPreviewMode {
+        guard self == .agentTools, sessionMode == .chat else { return self }
+        return .off
+    }
+}
+
+public enum LocalLinuxChatPreviewPlacement: String, CaseIterable, Identifiable, Sendable {
+    case floating
+    case aboveInput = "above_input"
+
+    public static let defaultPlacement: LocalLinuxChatPreviewPlacement = .floating
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .floating:
+            return NSLocalizedString("悬浮窗", comment: "Floating Local Linux chat preview placement")
+        case .aboveInput:
+            return NSLocalizedString("输入栏上方", comment: "Local Linux chat preview above the composer")
+        }
+    }
+
+    public static func normalized(_ rawValue: String) -> LocalLinuxChatPreviewPlacement {
+        LocalLinuxChatPreviewPlacement(rawValue: rawValue) ?? defaultPlacement
+    }
+}
+
 public enum LiquidGlassTintSetting {
     public static let minimumOpacity = 0.0
     public static let maximumOpacity = 0.6
@@ -149,11 +262,26 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case localModelPerformanceMonitorEnabled = "localModels.performanceMonitor.enabled"
     case localModelCacheEnabled = "localModels.cache.enabled"
     case localModelKVCacheEnabled = "localModels.kvCache.enabled"
+    case localLinuxEnabled = "localLinux.enabled"
+    case localLinuxEnvironmentPrivacyEnabled = "localLinux.environmentPrivacy.enabled"
+    case localLinuxCommandSafetyEnabled = "localLinux.commandSafety.enabled"
+    case localLinuxDefaultShellPath = "localLinux.terminal.defaultShellPath"
+    case localLinuxDefaultSessionMode = "localLinux.defaultSessionMode"
+    case localLinuxDefaultTimeoutSeconds = "localLinux.defaultTimeoutSeconds"
+    case localLinuxOutputPreviewBytes = "localLinux.outputPreviewBytes"
+    case localLinuxLocalMCPOnDemand = "localLinux.localMCP.onDemand"
+    case localLinuxActivePromptProfileID = "localLinux.activePromptProfileID"
+    case localLinuxWorkspaceCleanupPolicy = "localLinux.workspace.cleanupPolicy"
+    case localLinuxTerminalShortcutIDs = "localLinux.terminal.shortcutIDs"
+    case localLinuxChatPreviewMode = "localLinux.chat.previewMode"
+    case localLinuxChatPreviewPlacement = "localLinux.chat.previewPlacement"
+    case browserAgentDelegateToIPhone = "browserAgent.delegateToIPhone"
     case appToolsChatToolsEnabled = "appTools.chatToolsEnabled"
     case appToolsEnabledToolIDs = "appTools.enabledToolIDs"
     case appToolsKnownDefaultToolIDs = "appTools.knownDefaultToolIDs"
     case appToolsToolApprovalPolicies = "appTools.toolApprovalPolicies"
     case mcpChatToolsEnabled = "mcp.chatToolsEnabled"
+    case mcpToolCallTitleEnabled = "mcp.toolCallTitle.enabled"
     case mcpDeletedBuiltInServerIDs = "mcp.deletedBuiltInServerIDs"
     case skillsChatToolsEnabled = "skills.chatToolsEnabled"
     case skillsEnabledNames = "skills.enabledNames"
@@ -183,9 +311,11 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case modelConnectivityTestConcurrencyLimit = "modelConnectivityTest.concurrencyLimit"
     case enableOpenAIStreamIncludeUsage = "enableOpenAIStreamIncludeUsage"
     case reasoningContentEchoMode = "chat.reasoningContentEchoMode"
+    case automaticHistoryLoadingEnabled = "chat.historyWindow.automaticLoadingEnabled"
     case lazyLoadMessageCount = "lazyLoadMessageCount"
     case enableAutoSessionNaming = "enableAutoSessionNaming"
     case chatSendDelaySeconds = "chat.sendDelaySeconds"
+    case conversationRuntimeExecutionBudget = "chat.conversationRuntime.executionBudget"
     case messageRegexRules = "chat.messageRegexRules"
     case videoFrameExtractionMode = "video.frameExtraction.mode"
     case videoFrameExtractionFPS = "video.frameExtraction.fps"
@@ -230,10 +360,12 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case backgroundContentMode = "backgroundContentMode"
     case currentBackgroundImage = "currentBackgroundImage"
     case enableAutoRotateBackground = "enableAutoRotateBackground"
+    case continueVideoBackgroundPlaybackWhenChatHidden = "background.video.continuePlaybackWhenChatHidden"
     case enableReasoningSummary = "enableReasoningSummary"
     case enableLiquidGlass = "enableLiquidGlass"
     case liquidGlassTintOpacity = "liquidGlass.tintOpacity"
     case enableChatTopBlurFade = "enableChatTopBlurFade"
+    case chatTimelineNavigationEnabled = "chat.timelineNavigation.enabled"
     case enableNoBubbleUI = "enableNoBubbleUI"
     case chatScrollAnimationEnabled = "chat.scrollAnimation.enabled"
     case chatScrollAnimationSpringResponse = "chat.scrollAnimation.springResponse"
@@ -242,6 +374,7 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case chatSendAnimationEnabled = "chat.sendAnimation.enabled"
     case chatSendAnimationSpringResponse = "chat.sendAnimation.springResponse"
     case chatSendAnimationSpringDamping = "chat.sendAnimation.springDamping"
+    case chatStreamingDisplayMode = "chat.streamingDisplay.mode"
     case messageActionBarConfiguration = "chat.messageActionBar.configuration"
 
     case fontUseCustomFonts = "font.useCustomFonts"
@@ -268,6 +401,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
     case chatQuickActionIDs = "ui.chatQuickActionIDs"
     case temporaryChatMemoryEnabled = "chat.temporary.memoryEnabled"
     case enableSlashCommands = "chat.slashCommands.enabled"
+    case customChatSlashCommands = "chat.slashCommands.custom"
+    case chatComposerStyle = "chat.composer.style"
     case chatComposerDraft = "chat.composer.draft"
     case restoreLastSessionOnLaunch = "launch.restoreLastSessionOnLaunchEnabled"
     case restoreLastSessionOnlyIfRecent = "launch.restoreLastSessionOnlyIfRecent"
@@ -348,8 +483,35 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .bool(false)
         case .localModelCacheEnabled:
             return .bool(true)
+        case .localLinuxEnabled:
+            return .bool(false)
+        case .localLinuxEnvironmentPrivacyEnabled,
+             .localLinuxCommandSafetyEnabled,
+             .localLinuxLocalMCPOnDemand:
+            return .bool(true)
+        case .localLinuxDefaultShellPath:
+            return .text(LocalLinuxTerminalShellConfiguration.defaultPath)
+        case .localLinuxDefaultSessionMode:
+            return .text("chat")
+        case .localLinuxDefaultTimeoutSeconds:
+            return .integer(300)
+        case .localLinuxOutputPreviewBytes:
+            return .integer(65_536)
+        case .localLinuxActivePromptProfileID:
+            return .text("")
+        case .localLinuxWorkspaceCleanupPolicy:
+            return .text("manual")
+        case .localLinuxTerminalShortcutIDs:
+            return .text(LocalLinuxTerminalShortcutConfiguration.defaultEncodedValue)
+        case .localLinuxChatPreviewMode:
+            return .text(LocalLinuxChatPreviewMode.defaultMode.rawValue)
+        case .localLinuxChatPreviewPlacement:
+            return .text(LocalLinuxChatPreviewPlacement.defaultPlacement.rawValue)
+        case .browserAgentDelegateToIPhone:
+            return .bool(false)
         case .appToolsChatToolsEnabled,
              .mcpChatToolsEnabled,
+             .mcpToolCallTitleEnabled,
              .skillsChatToolsEnabled,
              .shortcutChatToolsEnabled:
             return .bool(true)
@@ -386,11 +548,13 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .aiTopPEnabled:
             return .bool(false)
         case .enableOpenAIStreamIncludeUsage,
+             .automaticHistoryLoadingEnabled,
              .enableAutoSessionNaming:
             return .bool(true)
         case .systemPrompt:
             return .text("")
-        case .messageRegexRules:
+        case .messageRegexRules,
+             .customChatSlashCommands:
             return .text("[]")
         case .maxChatHistory:
             return .integer(0)
@@ -422,6 +586,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .integer(1)
         case .chatSendDelaySeconds:
             return .real(0.0)
+        case .conversationRuntimeExecutionBudget:
+            return .integer(32)
         case .videoFrameExtractionMode:
             return .text(VideoFrameExtractionMode.defaultMode.rawValue)
         case .videoFrameExtractionFPS:
@@ -485,9 +651,11 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .enableAutoReasoningPreview,
              .enableResponsiveReasoningPreviewHeight,
              .enableBackground,
-             .enableChatTopBlurFade:
+             .enableChatTopBlurFade,
+             .chatTimelineNavigationEnabled:
             return .bool(true)
         case .enableAutoRotateBackground,
+             .continueVideoBackgroundPlaybackWhenChatHidden,
              .enableReasoningSummary,
              .enableLiquidGlass,
              .enableNoBubbleUI,
@@ -506,6 +674,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
             return .real(0.45)
         case .chatSendAnimationSpringDamping:
             return .real(0.6)
+        case .chatStreamingDisplayMode:
+            return .text(ChatStreamingDisplayMode.defaultMode.rawValue)
         case .backgroundBlur:
             return .real(10.0)
         case .backgroundOpacity:
@@ -543,6 +713,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
              .watchBackgroundLastSource,
              .chatComposerDraft:
             return .text("")
+        case .chatComposerStyle:
+            return .text(ChatComposerStyle.capsule.rawValue)
         case .watchAttachmentSourceHistory,
              .watchBackgroundSourceHistory:
             return .text("[]")
@@ -568,7 +740,23 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
         case .modelPickerFolderPathsByProvider:
             return .text("{}")
         case .chatQuickActionIDs:
-            return .text("temporaryChat")
+            return .text([
+                "temporaryChat",
+                "contextCompression",
+                "settings",
+                "toolCenter",
+                "dailyPulse",
+                "usageAnalytics",
+                "memory",
+                "mcp",
+                "agentSkills",
+                "shortcuts",
+                "roleplay",
+                "worldbook",
+                "extendedFeatures",
+                "browser",
+                "localTerminal"
+            ].joined(separator: ","))
         case .restoreLastSessionOnLaunch,
              .restoreLastSessionOnlyIfRecent:
             return .bool(false)
@@ -659,7 +847,8 @@ public enum AppConfigKey: String, CaseIterable, Sendable {
         case .localModelsEnabled,
              .localModelPerformanceMonitorEnabled,
              .localModelCacheEnabled,
-             .localModelKVCacheEnabled:
+             .localModelKVCacheEnabled,
+             .localLinuxDefaultShellPath:
             return false
         default:
             return true

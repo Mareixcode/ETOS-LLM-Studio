@@ -55,7 +55,7 @@ struct ModelSettingsView: View {
                 )
             }
 
-            if model.isChatModel && !LocalModelProviderBridge.isLocalProvider(provider) {
+            if ModelKind.allCases.contains(model.kind) && !LocalModelProviderBridge.isLocalProvider(provider) {
                 Section {
                     NavigationLink {
                         SingleModelConnectivityTestView(provider: provider, model: model)
@@ -63,7 +63,7 @@ struct ModelSettingsView: View {
                         Label(NSLocalizedString("模型测试", comment: "Model connectivity test title"), systemImage: "checkmark.seal")
                     }
                 } footer: {
-                    Text(NSLocalizedString("测试该模型的非流式、流式和工具调用能力。", comment: "Single model connectivity test entry footer"))
+                    Text(modelConnectivityTestFooter)
                 }
             }
 
@@ -189,6 +189,10 @@ struct ModelSettingsView: View {
             Section(header: Text(NSLocalizedString("请求体预览", comment: ""))) {
                 RequestBodyPreviewInlineView(preview: preview)
             }
+
+            if !LocalModelProviderBridge.isLocalProvider(provider) {
+                modelAdapterSection
+            }
         }
         .navigationDestination(isPresented: $isRequestBodyControlImportPresented) {
             RequestBodyControlImportView(sources: requestBodyControlImportSources) { source in
@@ -200,11 +204,60 @@ struct ModelSettingsView: View {
         .onDisappear(perform: saveEditorState)
     }
 
+    private var modelConnectivityTestFooter: String {
+        switch model.kind {
+        case .chat:
+            return NSLocalizedString("测试该模型的非流式、流式和工具调用能力。", comment: "Single model connectivity test entry footer")
+        case .embedding:
+            return NSLocalizedString("测试该模型能否返回有效的嵌入向量。", comment: "Embedding model connectivity test entry footer")
+        case .image:
+            return NSLocalizedString("测试该模型能否返回有效图片，可能产生费用。", comment: "Image model connectivity test entry footer")
+        case .rerank, .textToSpeech:
+            return ""
+        }
+    }
+
     private var pickerGroupNameBinding: Binding<String> {
         Binding(
             get: { model.pickerGroupName ?? "" },
             set: { model.pickerGroupName = $0 }
         )
+    }
+
+    private var effectiveAPIFormat: String {
+        model.effectiveAPIFormat(providerAPIFormat: provider.apiFormat)
+    }
+
+    private var apiFormatOverrideBinding: Binding<String> {
+        Binding(
+            get: { Model.normalizedAPIFormatOverride(model.apiFormatOverride) ?? "" },
+            set: { model.apiFormatOverride = Model.normalizedAPIFormatOverride($0) }
+        )
+    }
+
+    private var providerAPIFormatName: String {
+        ProviderAPIFormatOption(rawValue: provider.apiFormat.lowercased())?.localizedName
+            ?? provider.apiFormat
+    }
+
+    private var modelAdapterSection: some View {
+        Section {
+            Picker(NSLocalizedString("API 格式", comment: "Model adapter API format picker"), selection: apiFormatOverrideBinding) {
+                Text(String(
+                    format: NSLocalizedString("跟随提供商（%@）", comment: "Use provider API format option"),
+                    providerAPIFormatName
+                ))
+                .tag("")
+
+                ForEach(ProviderAPIFormatOption.allCases) { option in
+                    Text(option.localizedName).tag(option.rawValue)
+                }
+            }
+        } header: {
+            Text(NSLocalizedString("模型适配器", comment: "Per-model adapter section title"))
+        } footer: {
+            Text(NSLocalizedString("默认跟随提供商。覆盖后，此模型会使用所选 API 格式构建请求端点，基础 URL、API Key 和请求头保持不变。", comment: "Per-model adapter override explanation"))
+        }
     }
 }
 
@@ -332,18 +385,34 @@ extension ModelSettingsView {
         Section {
             Toggle(ModelCapability.toolCalling.localizedName, isOn: capabilityBinding(.toolCalling))
             Toggle(ModelCapability.reasoning.localizedName, isOn: capabilityBinding(.reasoning))
+            switch ProviderAPIFormatFamily(apiFormat: effectiveAPIFormat) {
+            case .anthropic, .gemini:
+                Toggle(ModelCapability.promptCaching.localizedName, isOn: capabilityBinding(.promptCaching))
+            case .openAICompatible, .openAIResponses:
+                EmptyView()
+            }
         } header: {
             Text(NSLocalizedString("能力", comment: "聊天模型能力区块标题"))
         } footer: {
-            Text(NSLocalizedString("推理能力开启后会自动添加思考预算控制；关闭能力不会删除已经配置的控制。", comment: "推理能力与结构化控制联动说明"))
+            Text(chatCapabilityFooterText)
+        }
+    }
+
+    private var chatCapabilityFooterText: String {
+        switch ProviderAPIFormatFamily(apiFormat: effectiveAPIFormat) {
+        case .anthropic:
+            return NSLocalizedString("开启推理或提示缓存能力后会自动添加对应的结构化控制；关闭能力不会删除已经配置的控制。", comment: "模型能力与结构化控制联动说明")
+        case .gemini:
+            return NSLocalizedString("Gemini 的提示缓存由服务端自动管理；此选项只记录模型能力，不会添加请求参数或结构化控制。", comment: "Gemini 隐式提示缓存说明")
+        case .openAICompatible, .openAIResponses:
+            return NSLocalizedString("推理能力开启后会自动添加思考预算控制；关闭能力不会删除已经配置的控制。", comment: "推理能力与结构化控制联动说明")
         }
     }
 
     private var availableInputModalities: [ModelModality] {
         ModelModality.allCases.filter { modality in
             modality != .video
-                || provider.apiFormat.trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased() == "gemini"
+                || effectiveAPIFormat == ProviderAPIFormatOption.gemini.rawValue
         }
     }
 
@@ -400,7 +469,9 @@ extension ModelSettingsView {
                 if isEnabled {
                     capabilitySet.insert(capability)
                     if capability == .reasoning {
-                        model.ensureThinkingRequestBodyControl(apiFormat: provider.apiFormat)
+                        model.ensureThinkingRequestBodyControl(apiFormat: effectiveAPIFormat)
+                    } else if capability == .promptCaching {
+                        model.ensureAutomaticPromptCachingRequestBodyControl(apiFormat: effectiveAPIFormat)
                     }
                 } else {
                     capabilitySet.remove(capability)

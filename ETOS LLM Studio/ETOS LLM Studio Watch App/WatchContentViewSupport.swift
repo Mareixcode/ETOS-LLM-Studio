@@ -11,31 +11,39 @@ import Foundation
 import ETOSCore
 import AVKit
 import AVFoundation
+import WatchKit
 
 struct WatchChatTransientNotice {
     let message: String
     let systemImage: String
     let tint: Color
+
+    static var copyCompleted: WatchChatTransientNotice {
+        WatchChatTransientNotice(
+            message: NSLocalizedString("已复制", comment: "Copy completion notice"),
+            systemImage: "checkmark.circle.fill",
+            tint: .green
+        )
+    }
 }
 
 extension ContentView {
     var legacyChatRootView: some View {
-        ScrollViewReader { proxy in
-            ZStack(alignment: .bottom) {
-                chatList(proxy: proxy)
-
-                WatchRoleplaySessionScriptHost(
-                    sessionID: viewModel.currentSession?.id,
-                    messageID: viewModel.displayMessages.last?.message.id,
-                    versionIndex: viewModel.displayMessages.last?.message.getCurrentVersionIndex() ?? 0
-                )
-
-                if showScrollToBottomButton {
-                    scrollToBottomButton(proxy: proxy)
-                }
+        watchChatPageContainer
+        .navigationTitle(watchChatNavigationTitle)
+        .onChange(of: watchChatPage) { oldPage, newPage in
+            guard oldPage != newPage else { return }
+            WKInterfaceDevice.current().play(newPage.terminalID == nil ? .directionUp : .directionDown)
+        }
+        .task(id: appConfig.localLinuxEnabled) {
+            await observeActiveUserTerminalForWatchChat()
+        }
+        .onChange(of: activeUserTerminalJobIDs) { _, terminalIDs in
+            if let selectedID = watchChatPage.terminalID,
+               !terminalIDs.contains(selectedID) {
+                watchChatPage = .chat
             }
         }
-        .navigationTitle(viewModel.currentSession?.name ?? NSLocalizedString("新对话", comment: ""))
         .sheet(isPresented: $isSettingsPresented) {
             SettingsView(viewModel: viewModel, requestedDestination: $settingsDestination)
                 .appLockOverlayLayer()
@@ -116,7 +124,7 @@ extension ContentView {
         }
         .sheet(item: watchGlobalToolPermissionRequestBinding) { request in
             WatchGlobalToolPermissionView(request: request) { decision in
-                toolPermissionCenter.resolveActiveRequest(with: decision)
+                toolPermissionCenter.resolveRequest(withID: request.id, decision: decision)
             }
             .interactiveDismissDisabled(true)
             .appLockOverlayLayer()
@@ -274,6 +282,80 @@ extension ContentView {
                 cancelDailyPulsePreparation()
             }
         }
+    }
+
+    @ViewBuilder
+    private var watchChatPageContainer: some View {
+        if appConfig.localLinuxEnabled, !activeUserTerminalJobIDs.isEmpty {
+            TabView(selection: $watchChatPage) {
+                watchChatConversationPage
+                    .tag(WatchChatPage.chat)
+
+                ForEach(activeUserTerminalJobIDs, id: \.self) { terminalID in
+                    LocalLinuxWatchTerminalView(
+                        initialJobID: terminalID,
+                        isPresentationActive: watchChatPage == .terminal(terminalID),
+                        showsTerminalManagement: false
+                    )
+                    .tag(WatchChatPage.terminal(terminalID))
+                }
+            }
+            .tabViewStyle(.verticalPage(transitionStyle: .blur))
+        } else {
+            watchChatConversationPage
+        }
+    }
+
+    private var watchChatConversationPage: some View {
+        ScrollViewReader { proxy in
+            ZStack(alignment: .bottom) {
+                chatList(proxy: proxy)
+
+                WatchRoleplaySessionScriptHost(
+                    sessionID: viewModel.currentSession?.id,
+                    messageID: viewModel.displayMessages.last?.message.id,
+                    versionIndex: viewModel.displayMessages.last?.message.getCurrentVersionIndex() ?? 0,
+                    chatMessages: viewModel.allMessagesForSession
+                )
+
+                if showScrollToBottomButton {
+                    scrollToBottomButton(proxy: proxy)
+                }
+            }
+        }
+    }
+
+    private func observeActiveUserTerminalForWatchChat() async {
+        guard appConfig.localLinuxEnabled else {
+            activeUserTerminalJobIDs = []
+            watchChatPage = .chat
+            return
+        }
+
+        let updates = await LocalLinuxRuntimeController.shared.updates()
+        for await snapshot in updates {
+            guard !Task.isCancelled else { return }
+            if snapshot.activeTerminalCount == 0 {
+                activeUserTerminalJobIDs = []
+                watchChatPage = .chat
+                continue
+            }
+            let terminals = await LocalLinuxJobScheduler.shared.activeStandaloneUserTerminals()
+            activeUserTerminalJobIDs = terminals.map(\.id)
+            if activeUserTerminalJobIDs.isEmpty {
+                watchChatPage = .chat
+            }
+        }
+    }
+
+    private var watchChatNavigationTitle: String {
+        guard let terminalID = watchChatPage.terminalID else {
+            return viewModel.currentSession?.name ?? NSLocalizedString("新对话", comment: "")
+        }
+        return String(
+            format: NSLocalizedString("终端 %@", comment: "Watch Linux terminal page title"),
+            String(terminalID.uuidString.prefix(4))
+        )
     }
 
     var watchModalBlocksAskUserInputPresentation: Bool {
@@ -531,6 +613,7 @@ extension ContentView {
             tags: viewModel.sessionTags,
             currentSession: $viewModel.currentSession,
             runningSessionIDs: viewModel.runningSessionIDs,
+            conversationRuntimeStates: viewModel.conversationRuntimeStates,
             deleteSessionAction: { session in
                 viewModel.deleteSessions([session])
             },
@@ -766,23 +849,34 @@ extension ContentView {
 private struct WatchLoopingBackgroundVideoView: View {
     let url: URL
 
+    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject private var appConfig = AppConfigStore.shared
     @State private var player = AVPlayer()
     @State private var endObserver: NSObjectProtocol?
     @State private var currentURL: URL?
+    @State private var isVisible = false
 
     var body: some View {
         VideoPlayer(player: player)
             .disabled(true)
             .onAppear {
+                isVisible = true
                 configurePlayerIfNeeded()
-                player.play()
+                updatePlayback()
             }
             .onDisappear {
-                player.pause()
+                isVisible = false
+                updatePlayback()
             }
             .onChange(of: url) { _, _ in
                 configurePlayerIfNeeded()
-                player.play()
+                updatePlayback()
+            }
+            .onChange(of: scenePhase) { _, _ in
+                updatePlayback()
+            }
+            .onChange(of: appConfig.continueVideoBackgroundPlaybackWhenChatHidden) { _, _ in
+                updatePlayback()
             }
     }
 
@@ -805,5 +899,15 @@ private struct WatchLoopingBackgroundVideoView: View {
         player.isMuted = true
         player.actionAtItemEnd = .none
         currentURL = url
+    }
+
+    private func updatePlayback() {
+        let shouldPlay = scenePhase == .active
+            && (isVisible || appConfig.continueVideoBackgroundPlaybackWhenChatHidden)
+        if shouldPlay {
+            player.play()
+        } else {
+            player.pause()
+        }
     }
 }

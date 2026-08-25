@@ -16,6 +16,34 @@ extension ChatViewModel {
         chatService.deleteMessage(message)
     }
 
+    /// 正文与图片附件是同一条记录中的独立展示部分；有图片时只清正文气泡。
+    func deleteTextBubbleOrMessage(_ message: ChatMessage) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let sessionID = currentSession?.id {
+                await chatService.cancelRequestIfGenerating(
+                    messageID: message.id,
+                    in: sessionID
+                )
+            }
+            guard let currentMessage = findMessage(by: message.id) else { return }
+            guard !(currentMessage.imageFileNames ?? []).isEmpty else {
+                deleteAllVersions(of: currentMessage)
+                return
+            }
+
+            var updatedMessage = currentMessage
+            updatedMessage.clearContentVersions()
+            updatedMessage.reasoningContent = nil
+            updatedMessage.reasoningProviderSpecificFields = nil
+            updatedMessage.providerResponseMetadata = nil
+            updatedMessage.toolCalls = nil
+            updatedMessage.toolCallsPlacement = nil
+            updatedMessage.fullErrorContent = nil
+            updateMessage(updatedMessage)
+        }
+    }
+
     func deleteMessages(withIDs messageIDs: Set<UUID>) {
         chatService.deleteMessages(withIDs: messageIDs)
     }
@@ -29,14 +57,14 @@ extension ChatViewModel {
         chatService.deleteSessions(sessions)
     }
 
-    func messageCount(for session: ChatSession) -> Int {
+    func messageCount(for session: ChatSession) async -> Int {
         if session.id == currentSession?.id {
             return allMessagesForSession.count
         }
         if let temporaryCount = chatService.temporaryChatMessageCount(for: session.id) {
             return temporaryCount
         }
-        return Persistence.loadMessageCount(for: session.id)
+        return await Persistence.loadMessageCountAsync(for: session.id)
     }
 
     @discardableResult
@@ -394,8 +422,7 @@ extension ChatViewModel {
     }
 
     func deleteResponseAttemptVersion(at index: Int, of message: ChatMessage) -> Bool {
-        guard let groupID = message.responseGroupID,
-              message.responseAttemptID != nil else {
+        guard let groupID = responseAttemptVersionInfo(for: message)?.responseGroupID else {
             return false
         }
 

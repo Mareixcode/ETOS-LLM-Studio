@@ -10,6 +10,29 @@ import SwiftUI
 import ETOSCore
 
 extension ChatView {
+    @MainActor
+    func reloadCurrentLocalAgentMode() async {
+        guard let sessionID = viewModel.currentSession?.id else {
+            currentLocalAgentMode = .chat
+            return
+        }
+
+        let selectionRevision = localAgentModeSelectionRevision
+        await viewModel.chatService.waitForInitialPersistenceStateIfNeeded()
+        guard !Task.isCancelled,
+              viewModel.currentSession?.id == sessionID,
+              localAgentModeSelectionRevision == selectionRevision else { return }
+
+        let storedMode = await Task.detached(priority: .userInitiated) {
+            Persistence.localAgentMode(sessionID: sessionID)
+        }.value
+        // 用户在异步读取期间做出的选择优先，旧快照不能把 Agent 悄悄改回 Chat。
+        guard !Task.isCancelled,
+              viewModel.currentSession?.id == sessionID,
+              localAgentModeSelectionRevision == selectionRevision else { return }
+        currentLocalAgentMode = storedMode
+    }
+
     /// Telegram 风格输入栏
     @ViewBuilder
     var telegramInputBar: some View {
@@ -39,7 +62,18 @@ extension ChatView {
                     }
                 ),
                 isRequestControlsExpanded: $isComposerRequestControlsExpanded,
-                isSending: viewModel.isSendingMessage || viewModel.isSendDelayPending,
+                localAgentMode: Binding(
+                    get: { currentLocalAgentMode },
+                    set: { mode in
+                        guard currentLocalAgentMode != mode else { return }
+                        localAgentModeSelectionRevision &+= 1
+                        currentLocalAgentMode = mode
+                    }
+                ),
+                isSending: viewModel.isSendingMessage
+                    || viewModel.isSendDelayPending
+                    || viewModel.isSendSubmissionPending,
+                isSendActionPending: viewModel.isSendSubmissionPending,
                 sendAction: {
                     guard viewModel.canSendMessage else { return }
                     shouldKeepBottomPinned = true
@@ -48,9 +82,12 @@ extension ChatView {
                     if AppConfigStore.shared.chatSendAnimationEnabled,
                        AppConfigStore.shared.chatSendDelaySeconds <= 0 {
                         // 启动「输入框 → 气泡」Overlay 飞行（内部已调用 viewModel.sendMessage()）
-                        beginSendFlight(text: outgoingText)
+                        beginSendFlight(
+                            text: outgoingText,
+                            localAgentMode: currentLocalAgentMode
+                        )
                     } else {
-                        viewModel.sendMessage()
+                        viewModel.sendMessage(localAgentMode: currentLocalAgentMode)
                     }
                     draftText = ""
                 },

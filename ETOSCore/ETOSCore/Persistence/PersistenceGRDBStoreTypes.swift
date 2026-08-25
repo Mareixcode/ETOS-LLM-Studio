@@ -77,6 +77,7 @@ struct PersistedMessageRecord: Equatable {
     let costEstimateJSON: Data?
     let audioFileName: String?
     let imageFileNamesJSON: Data?
+    let modelExcludedImageFileNamesJSON: Data?
     let fileFileNamesJSON: Data?
     let videoAnalysisResultsJSON: Data?
     let fullErrorContent: String?
@@ -86,6 +87,10 @@ struct PersistedMessageRecord: Equatable {
     let responseAttemptID: String?
     let responseAttemptIndex: Int?
     let selectedResponseAttemptID: String?
+    let authorKind: String
+    let sourceSessionID: String?
+    let sourceMessageID: String?
+    let conversationEventID: String?
     let position: Int
     let createdAt: Double
 }

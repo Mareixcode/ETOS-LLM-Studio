@@ -13,6 +13,10 @@ import Dispatch
 
 public enum LocalGGUFMetadata {
     public static func architecture(at modelURL: URL) -> String? {
+        try? validatedArchitecture(at: modelURL)
+    }
+
+    public static func validatedArchitecture(at modelURL: URL) throws -> String {
         var architecturePointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = modelURL.path.withCString {
@@ -26,10 +30,68 @@ public enum LocalGGUFMetadata {
             architecturePointer.map(etos_local_llm_free)
             errorPointer.map(etos_local_llm_free)
         }
-        guard status == 0, let architecturePointer else { return nil }
+        guard status == 0, let architecturePointer else {
+            let message = errorPointer.map { String(cString: $0) }
+                ?? LocalLLMEngineError.backendUnavailable.localizedDescription
+            let missingFilePrefix = "etos.local_model_file_missing|"
+            if message.hasPrefix(missingFilePrefix) {
+                let fileName = message
+                    .dropFirst(missingFilePrefix.count)
+                    .split(whereSeparator: \.isNewline)
+                    .first
+                    .map(String.init) ?? ""
+                throw LocalLLMEngineError.modelFileMissing(fileName)
+            }
+            let incompleteFilePrefix = "etos.local_model_file_incomplete|"
+            if message.hasPrefix(incompleteFilePrefix) {
+                let fields = message.split(
+                    separator: "|",
+                    maxSplits: 3,
+                    omittingEmptySubsequences: false
+                )
+                if fields.count == 4,
+                   let actualBytes = UInt64(fields[1]),
+                   let requiredBytes = UInt64(fields[2]) {
+                    let fileName = fields[3]
+                        .split(whereSeparator: \.isNewline)
+                        .first
+                        .map(String.init) ?? modelURL.lastPathComponent
+                    throw LocalLLMEngineError.modelFileIncomplete(
+                        fileName: fileName,
+                        actualBytes: actualBytes,
+                        requiredBytes: requiredBytes
+                    )
+                }
+            }
+            throw LocalLLMEngineError.generationFailed(String(
+                format: NSLocalizedString("无法加载文件: %@", comment: "Unable to load imported GGUF file"),
+                message
+            ))
+        }
         return String(cString: architecturePointer)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
+    }
+
+    public static func validateLoRAAdapter(at adapterURL: URL, compatibleWith architecture: String?) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = adapterURL.path.withCString { adapterPath in
+            (architecture ?? "").withCString { expectedArchitecture in
+                etos_local_gguf_validate_lora_adapter(
+                    adapterPath,
+                    expectedArchitecture,
+                    &errorPointer
+                )
+            }
+        }
+        defer { errorPointer.map(etos_local_llm_free) }
+        guard status == 0 else {
+            let message = errorPointer.map { String(cString: $0) }
+                ?? LocalLLMEngineError.backendUnavailable.localizedDescription
+            throw LocalLLMEngineError.generationFailed(String(
+                format: NSLocalizedString("无法加载文件: %@", comment: "Unable to load imported GGUF file"),
+                message
+            ))
+        }
     }
 }
 
@@ -328,6 +390,13 @@ private let localSpeechShouldCancel: @convention(c) (UnsafeMutableRawPointer?) -
 private func etos_local_gguf_architecture(
     _ modelPath: UnsafePointer<CChar>,
     _ architecture: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+    _ error: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("etos_local_gguf_validate_lora_adapter")
+private func etos_local_gguf_validate_lora_adapter(
+    _ adapterPath: UnsafePointer<CChar>,
+    _ expectedArchitecture: UnsafePointer<CChar>,
     _ error: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
 ) -> Int32
 

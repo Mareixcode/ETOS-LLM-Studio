@@ -45,7 +45,35 @@ private enum CoreSettingsNavigationDestination: Hashable {
     case sync
 }
 
+struct SettingsCoreGridLayout: Equatable {
+    private static let compactCardHeight: CGFloat = 100
+    private static let wideCardHeight: CGFloat = 140
+
+    let columnCount: Int
+    let preferredCardHeight: CGFloat
+
+    static func resolved(
+        horizontalSizeClass: UserInterfaceSizeClass?,
+        verticalSizeClass: UserInterfaceSizeClass?
+    ) -> SettingsCoreGridLayout {
+        let usesWideLayout = horizontalSizeClass == .regular || verticalSizeClass == .compact
+        return usesWideLayout
+            ? SettingsCoreGridLayout(columnCount: 3, preferredCardHeight: wideCardHeight)
+            : SettingsCoreGridLayout(columnCount: 2, preferredCardHeight: compactCardHeight)
+    }
+}
+
 struct SettingsView: View {
+    private static let portraitCoreSettingsColumns = Array(
+        repeating: GridItem(.flexible()),
+        count: 2
+    )
+    private static let landscapeCoreSettingsColumns = Array(
+        repeating: GridItem(.flexible()),
+        count: 3
+    )
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @EnvironmentObject private var viewModel: ChatViewModel
     @ObservedObject private var announcementManager = AnnouncementManager.shared
     @ObservedObject private var pulseManager = DailyPulseManager.shared
@@ -62,55 +90,7 @@ struct SettingsView: View {
     var body: some View {
         List {
             Section {
-                Grid {
-                    GridRow {
-                        Button {
-                            coreSettingsDestination = .modelManagement
-                        } label: {
-                            SettingsCategoryCard("模型管理", icon: .providerManagement)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            coreSettingsDestination = .conversation
-                        } label: {
-                            SettingsCategoryCard("会话", icon: .conversationSettings)
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    GridRow {
-                        Button {
-                            coreSettingsDestination = .prompts
-                        } label: {
-                            SettingsCategoryCard("提示词", icon: .promptSettings)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            coreSettingsDestination = .output
-                        } label: {
-                            SettingsCategoryCard("输出", icon: .outputSettings)
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    GridRow {
-                        Button {
-                            coreSettingsDestination = .display
-                        } label: {
-                            SettingsCategoryCard("背景与视觉", icon: .display)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            coreSettingsDestination = .sync
-                        } label: {
-                            SettingsCategoryCard("同步与备份", icon: .sync)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
+                coreSettingsGrid
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
@@ -200,6 +180,18 @@ struct SettingsView: View {
                     )
                 } label: {
                     SettingsListIconLabel("语音输入", icon: .speechInput)
+                }
+
+                NavigationLink {
+                    LocalLinuxFeatureView(sessionID: viewModel.currentSession?.id)
+                } label: {
+                    SettingsListIconLabel("本地 Linux", icon: .localLinux)
+                }
+
+                NavigationLink {
+                    BrowserAgentFeatureView(sessionID: viewModel.currentSession?.id)
+                } label: {
+                    SettingsListIconLabel("Browser Agent", icon: .browserAgent)
                 }
 
                 NavigationLink {
@@ -300,6 +292,74 @@ struct SettingsView: View {
         }
     }
 
+    /// 使用导航开始前已经确定的尺寸等级，避免在 List 布局过程中切换网格结构。
+    private var coreSettingsGrid: some View {
+        let layout = SettingsCoreGridLayout.resolved(
+            horizontalSizeClass: horizontalSizeClass,
+            verticalSizeClass: verticalSizeClass
+        )
+        let columns = layout.columnCount == 3
+            ? Self.landscapeCoreSettingsColumns
+            : Self.portraitCoreSettingsColumns
+
+        return LazyVGrid(columns: columns) {
+            coreSettingsButton(
+                titleKey: "模型管理",
+                icon: .providerManagement,
+                destination: .modelManagement,
+                preferredHeight: layout.preferredCardHeight
+            )
+            coreSettingsButton(
+                titleKey: "会话",
+                icon: .conversationSettings,
+                destination: .conversation,
+                preferredHeight: layout.preferredCardHeight
+            )
+            coreSettingsButton(
+                titleKey: "提示词",
+                icon: .promptSettings,
+                destination: .prompts,
+                preferredHeight: layout.preferredCardHeight
+            )
+            coreSettingsButton(
+                titleKey: "输出",
+                icon: .outputSettings,
+                destination: .output,
+                preferredHeight: layout.preferredCardHeight
+            )
+            coreSettingsButton(
+                titleKey: "背景与视觉",
+                icon: .display,
+                destination: .display,
+                preferredHeight: layout.preferredCardHeight
+            )
+            coreSettingsButton(
+                titleKey: "同步与备份",
+                icon: .sync,
+                destination: .sync,
+                preferredHeight: layout.preferredCardHeight
+            )
+        }
+    }
+
+    private func coreSettingsButton(
+        titleKey: String,
+        icon: SettingsListIcon,
+        destination: CoreSettingsNavigationDestination,
+        preferredHeight: CGFloat
+    ) -> some View {
+        Button {
+            coreSettingsDestination = destination
+        } label: {
+            SettingsCategoryCard(
+                titleKey,
+                icon: icon,
+                preferredHeight: preferredHeight
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - 辅助方法
 
     @ViewBuilder
@@ -366,12 +426,10 @@ struct SettingsView: View {
             return NSLocalizedString("明日已准备", comment: "每日脉冲明日已准备状态")
         }
         if deliveryCoordinator.reminderEnabled {
-            return deliveryCoordinator.deliveryTimes.count == 1
-                ? deliveryCoordinator.reminderTimeText
-                : String(
-                    format: NSLocalizedString("%d 个时间点", comment: "Daily Pulse delivery time count"),
-                    deliveryCoordinator.deliveryTimes.count
-                )
+            return String(
+                format: NSLocalizedString("%d 张卡片", comment: "Daily Pulse configured card count"),
+                deliveryCoordinator.deliveryTimes.count
+            )
         }
         return nil
     }
@@ -434,6 +492,8 @@ extension SettingsListIcon {
     static let extendedFeatures = SettingsListIcon(systemName: "ellipsis", backgroundColor: .indigo)
     static let backgroundGeneration = SettingsListIcon(systemName: "location", backgroundColor: .green)
     static let localModels = SettingsListIcon(systemName: "cpu", backgroundColor: .blue)
+    static let localLinux = SettingsListIcon(systemName: "terminal", backgroundColor: .green)
+    static let browserAgent = SettingsListIcon(systemName: "safari", backgroundColor: .blue)
     static let display = SettingsListIcon(systemName: "sun.max", backgroundColor: .purple)
     static let sync = SettingsListIcon(systemName: "arrow.clockwise", backgroundColor: .green)
     static let security = SettingsListIcon(systemName: "lock", backgroundColor: .red)
@@ -472,11 +532,13 @@ struct SettingsListIconLabel: View {
 private struct SettingsCategoryCard: View {
     let title: String
     let icon: SettingsListIcon
+    let preferredHeight: CGFloat
     @ObservedObject private var appConfig = AppConfigStore.shared
 
-    init(_ titleKey: String, icon: SettingsListIcon) {
+    init(_ titleKey: String, icon: SettingsListIcon, preferredHeight: CGFloat) {
         self.title = NSLocalizedString(titleKey, comment: "核心设置分类入口标题")
         self.icon = icon
+        self.preferredHeight = preferredHeight
     }
 
     var body: some View {
@@ -496,8 +558,8 @@ private struct SettingsCategoryCard: View {
             }
         }
         .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .aspectRatio(2, contentMode: .fit)
+        // 只限制卡片随宽度增长的目标高度，动态字体仍可按内容继续撑开。
+        .frame(maxWidth: .infinity, minHeight: preferredHeight, alignment: .leading)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground),
             in: RoundedRectangle(cornerRadius: 20, style: .continuous)

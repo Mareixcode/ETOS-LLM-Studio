@@ -21,12 +21,15 @@ struct ETAdvancedMarkdownRenderer: View {
     let customTextColor: Color?
     let customTextStyleColors: ChatAppearanceTextStyleColors?
     let isStreaming: Bool
+    let streamingState: ETStreamingMarkdownRenderState?
+    let streamingChannel: ETStreamingMarkdownChannel
     let onCodeBlockHeaderTap: ((String) -> Void)?
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var appConfig = AppConfigStore.shared
     @State private var imagePreviewItem: ETWatchMarkdownImagePreviewItem?
     @State private var preparedRuleRequest: ChatAppearanceTextRuleRenderRequest?
     @State private var ruleAttributedText: AttributedString?
+    @State private var asynchronouslyPreparedContent: ETPreparedMarkdownRenderPayload?
 
     init(
         content: String,
@@ -38,6 +41,8 @@ struct ETAdvancedMarkdownRenderer: View {
         customTextColor: Color? = nil,
         customTextStyleColors: ChatAppearanceTextStyleColors? = nil,
         isStreaming: Bool = false,
+        streamingState: ETStreamingMarkdownRenderState? = nil,
+        streamingChannel: ETStreamingMarkdownChannel = .content,
         onCodeBlockHeaderTap: ((String) -> Void)? = nil
     ) {
         self.content = content
@@ -49,14 +54,28 @@ struct ETAdvancedMarkdownRenderer: View {
         self.customTextColor = customTextColor
         self.customTextStyleColors = customTextStyleColors
         self.isStreaming = isStreaming
+        self.streamingState = streamingState
+        self.streamingChannel = streamingChannel
         self.onCodeBlockHeaderTap = onCodeBlockHeaderTap
     }
 
     private var effectivePreparedContent: ETPreparedMarkdownRenderPayload? {
-        guard let preparedContent, preparedContent.sourceText == content else {
-            return nil
+        if let preparedContent, preparedContent.sourceText == content {
+            return preparedContent
         }
-        return preparedContent
+        guard asynchronouslyPreparedContent?.sourceText == content else { return nil }
+        return asynchronouslyPreparedContent
+    }
+
+    private var shouldUseStreamingRenderer: Bool {
+        if isStreaming { return true }
+        guard enableMarkdown,
+              effectivePreparedContent == nil,
+              let streamingState,
+              streamingState.snapshot(for: streamingChannel) != nil else {
+            return false
+        }
+        return streamingState.isAwaitingStaticHandoff(channel: streamingChannel)
     }
 
     var body: some View {
@@ -75,6 +94,9 @@ struct ETAdvancedMarkdownRenderer: View {
                 fallbackLineSpacingEm: FontLibrary.defaultWatchLineSpacingEm
             )
         )
+        let streamingDisplayMode = ChatStreamingDisplayMode.normalized(
+            appConfig.chatStreamingDisplayMode
+        )
         Group {
             if preparedRuleRequest == ruleRenderRequest,
                let ruleAttributedText {
@@ -82,16 +104,22 @@ struct ETAdvancedMarkdownRenderer: View {
                     .etFont(.body, sampleText: content)
                     .lineSpacing(lineSpacing)
                     .foregroundStyle(textColor)
+            } else if shouldUseStreamingRenderer, let streamingState {
+                ETWatchStreamingMarkdownLiveView(
+                    state: streamingState,
+                    channel: streamingChannel,
+                    fallbackText: content,
+                    enableMarkdown: enableMarkdown,
+                    isOutgoing: isOutgoing,
+                    textColor: textColor,
+                    customTextStyleColors: customTextStyleColors,
+                    fontScale: fontScale,
+                    lineSpacing: lineSpacing,
+                    streamingDisplayMode: streamingDisplayMode,
+                    onCodeBlockHeaderTap: onCodeBlockHeaderTap
+                )
             } else if enableMarkdown {
-                if let streamingLineParts {
-                    streamingLineMarkdownView(
-                        prefix: streamingLineParts.prefix,
-                        activeLine: streamingLineParts.activeLine,
-                        textColor: textColor,
-                        fontScale: fontScale,
-                        lineSpacing: lineSpacing
-                    )
-                } else if let prepared = effectivePreparedContent {
+                if let prepared = effectivePreparedContent {
                     markdownTextView(
                         markdownContent: prepared.markdownContent,
                         sampleText: prepared.sourceText,
@@ -100,13 +128,7 @@ struct ETAdvancedMarkdownRenderer: View {
                         lineSpacing: lineSpacing
                     )
                 } else {
-                    markdownTextView(
-                        markdownContent: MarkdownContent(content),
-                        sampleText: content,
-                        textColor: textColor,
-                        fontScale: fontScale,
-                        lineSpacing: lineSpacing
-                    )
+                    plainTextView(content, textColor: textColor, lineSpacing: lineSpacing)
                 }
             } else {
                 plainTextView(content, textColor: textColor, lineSpacing: lineSpacing)
@@ -123,6 +145,22 @@ struct ETAdvancedMarkdownRenderer: View {
             preparedRuleRequest = request
             ruleAttributedText = prepared
         }
+        .task(id: fallbackMarkdownRequest) {
+            guard fallbackMarkdownRequest != nil else {
+                asynchronouslyPreparedContent = nil
+                return
+            }
+            let prepared = await ETMarkdownPrecomputeWorker.shared.prepare(source: content)
+            guard !Task.isCancelled else { return }
+            asynchronouslyPreparedContent = prepared
+        }
+    }
+
+    private var fallbackMarkdownRequest: String? {
+        guard enableMarkdown,
+              !isStreaming,
+              preparedContent?.sourceText != content else { return nil }
+        return content
     }
 
     private var ruleRenderRequest: ChatAppearanceTextRuleRenderRequest? {
@@ -140,29 +178,6 @@ struct ETAdvancedMarkdownRenderer: View {
             fontScale: FontLibrary.customFontScale,
             fontFallbackScope: FontLibrary.fallbackScope
         )
-    }
-
-    // 流式期间只把短的最后一行作为活动文本，避免整泡切纯文本或扫过气泡背景。
-    private var streamingLineParts: (prefix: String, activeLine: String)? {
-        guard isStreaming, !content.isEmpty else {
-            return nil
-        }
-        let prefix: String
-        let activeLine: String
-        if let lineBreak = content.lastIndex(of: "\n") {
-            let activeLineStart = content.index(after: lineBreak)
-            prefix = String(content[..<activeLineStart])
-            activeLine = String(content[activeLineStart...])
-        } else {
-            prefix = ""
-            activeLine = content
-        }
-        guard !activeLine.isEmpty,
-              activeLine.utf16.count <= 48,
-              (prefix.isEmpty || !containsUnclosedFence(in: prefix)) else {
-            return nil
-        }
-        return (prefix, activeLine)
     }
 
     @ViewBuilder
@@ -202,33 +217,6 @@ struct ETAdvancedMarkdownRenderer: View {
     }
 
     @ViewBuilder
-    private func streamingLineMarkdownView(
-        prefix: String,
-        activeLine: String,
-        textColor: Color,
-        fontScale: Double,
-        lineSpacing: CGFloat
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if !prefix.isEmpty {
-                markdownTextView(
-                    markdownContent: MarkdownContent(prefix),
-                    sampleText: prefix,
-                    textColor: textColor,
-                    fontScale: fontScale,
-                    lineSpacing: lineSpacing
-                )
-            }
-            ETStreamingActiveLineText(
-                text: activeLine,
-                textColor: textColor,
-                lineSpacing: lineSpacing
-            )
-            .padding(.top, prefix.isEmpty ? 0 : lineSpacing)
-        }
-    }
-
-    @ViewBuilder
     private func plainTextView(_ text: String, textColor: Color, lineSpacing: CGFloat) -> some View {
         Text(text)
             .etFont(.body, sampleText: text)
@@ -241,106 +229,9 @@ struct ETAdvancedMarkdownRenderer: View {
         return ChatAppearanceColorCodec.color(from: slot.hex, fallback: fallback)
     }
 
-    private func containsUnclosedFence(in text: String) -> Bool {
-        var openedFence: (marker: Character, count: Int)?
-        for line in text.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard let marker = trimmed.first, marker == "`" || marker == "~" else {
-                continue
-            }
-            let count = trimmed.prefix { $0 == marker }.count
-            guard count >= 3 else { continue }
-            if let current = openedFence {
-                if current.marker == marker && count >= current.count {
-                    openedFence = nil
-                }
-            } else {
-                openedFence = (marker, count)
-            }
-        }
-        return openedFence != nil
-    }
 }
 
-private struct ETStreamingActiveLineText: View {
-    let text: String
-    let textColor: Color
-    let lineSpacing: CGFloat
-    var fadeDuration: TimeInterval = 0.18
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var settledText = ""
-    @State private var fadingTail = ""
-    @State private var tailOpacity = 1.0
-    @State private var targetText = ""
-    @State private var settleTask: Task<Void, Never>?
-
-    var body: some View {
-        displayText
-            .etFont(.body, sampleText: text)
-            .lineSpacing(lineSpacing)
-            .onAppear {
-                reset(to: text)
-            }
-            .onChange(of: text) { _, newText in
-                update(to: newText)
-            }
-            .onDisappear {
-                settleTask?.cancel()
-            }
-    }
-
-    private var displayText: Text {
-        let base = Text(verbatim: settledText).foregroundColor(textColor)
-        guard !fadingTail.isEmpty else { return base }
-        return base + Text(verbatim: fadingTail).foregroundColor(textColor.opacity(tailOpacity))
-    }
-
-    private func update(to newText: String) {
-        let displayedText = settledText + fadingTail
-        settleTask?.cancel()
-
-        guard !reduceMotion,
-              newText.hasPrefix(displayedText),
-              newText.count > displayedText.count else {
-            reset(to: newText)
-            return
-        }
-
-        let tail = String(newText.dropFirst(displayedText.count))
-        guard !tail.isEmpty else {
-            reset(to: newText)
-            return
-        }
-
-        targetText = newText
-        settledText = displayedText
-        fadingTail = tail
-        tailOpacity = 0
-        withAnimation(.easeOut(duration: fadeDuration)) {
-            tailOpacity = 1
-        }
-
-        settleTask = Task { @MainActor in
-            let delay = UInt64((fadeDuration + 0.04) * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled, targetText == newText else { return }
-            settledText = newText
-            fadingTail = ""
-            tailOpacity = 1
-        }
-    }
-
-    private func reset(to newText: String) {
-        settleTask?.cancel()
-        targetText = newText
-        settledText = newText
-        fadingTail = ""
-        tailOpacity = 1
-    }
-}
-
-private extension View {
+extension View {
     @ViewBuilder
     func etChatMarkdownBaseStyle(
         textColor: Color,
@@ -365,9 +256,8 @@ private extension View {
         let codeBorderColor = isOutgoing
             ? Color.white.opacity(0.24)
             : Color.primary.opacity(0.16)
-        let codeHeaderTextColor = isOutgoing
-            ? Color.white.opacity(0.9)
-            : Color.secondary
+        // 标题与操作按钮沿用正文色，避免自定义气泡颜色下固定白色失去对比度。
+        let codeHeaderTextColor = textColor
         let bodyFontName = FontLibrary.resolvePostScriptName(for: .body, sampleText: sampleText)
         let emphasisFontName = FontLibrary.resolvePostScriptName(for: .emphasis, sampleText: sampleText)
         let strongFontName = FontLibrary.resolvePostScriptName(for: .strong, sampleText: sampleText)

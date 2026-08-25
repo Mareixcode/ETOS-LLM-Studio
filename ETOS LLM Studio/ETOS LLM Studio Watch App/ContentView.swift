@@ -48,6 +48,12 @@ struct ContentView: View {
     @State var bottomAnchorVisibilityWorkItem: DispatchWorkItem?
     @State var shouldRestorePendingJumpOnAppear = false
     @State var pendingJumpRequest: MessageJumpRequest?
+    @State var pendingAutomaticHistoryLoadRequest: WatchAutomaticHistoryLoadRequest?
+    @State var automaticHistoryAnchorTask: Task<Void, Never>?
+    @State var isAutomaticHistoryLoadInFlight = false
+    @State var lastAutomaticHistoryLoadAnchorID: UUID?
+    @State var automaticHistoryBoundaryBlockedAnchorID: UUID?
+    @State var deferredAutomaticHistoryBoundaryRequest: WatchAutomaticHistoryLoadRequest?
     @State var launchRecoveryNoticeMessage: String?
     @State var launchRecoveryRequest: Persistence.LaunchRecoveryRequest?
     @State var launchRecoveryErrorMessage: String?
@@ -69,6 +75,8 @@ struct ContentView: View {
     @State var contextCompressionReminderNotificationKeys: Set<WatchContextCompressionReminderNotificationKey> = []
     @State var chatTransientNotice: WatchChatTransientNotice?
     @State var chatTransientNoticeDismissTask: Task<Void, Never>?
+    @State var watchChatPage: WatchChatPage = .chat
+    @State var activeUserTerminalJobIDs: [UUID] = []
 
     var effectiveFontScale: CGFloat {
         CGFloat(FontLibrary.effectiveFontScale(appConfig.fontCustomScale, isCustomFontEnabled: appConfig.fontUseCustomFonts))
@@ -83,6 +91,7 @@ struct ContentView: View {
     let bottomAnchorID = "inputBubble"
     let watchBottomPinnedDistanceThreshold: CGFloat = 24
     let watchScrollToBottomButtonRevealDistance: CGFloat = 48
+    let watchAutomaticHistoryLoadTriggerDistance: CGFloat = 32
 
     var isLiquidGlassEnabled: Bool {
         if #available(watchOS 26.0, *) {
@@ -169,6 +178,9 @@ struct ContentView: View {
                 .zIndex(2_000)
             }
         }
+        .copyCompletionNoticeAction {
+            showChatTransientNotice(.copyCompleted, duration: .seconds(1.4))
+        }
         .environment(\.font, rootBodyFont)
         .environment(\.locale, AppLanguagePreference.preferredLocale(rawValue: appConfig.appLanguage))
         .onAppear {
@@ -229,6 +241,7 @@ struct ContentView: View {
             pendingBottomSnapTask = nil
             watchInputLayoutSettleTask?.cancel()
             watchInputLayoutSettleTask = nil
+            cancelAutomaticHistoryNavigation()
             bottomAnchorVisibilityWorkItem?.cancel()
             bottomAnchorVisibilityWorkItem = nil
             chatTransientNoticeDismissTask?.cancel()
@@ -296,6 +309,9 @@ struct ContentView: View {
                 ChatService.recordAppDidEnterBackground()
                 didEnterBackgroundSinceLastActivation = true
                 Task {
+                    // watchOS 不提供 iOS 的通用后台收尾窗口；进入后台后立即把
+                    // 活跃 guest 任务标记为系统挂起，避免下次启动误认为仍在运行。
+                    await LocalLinuxJobScheduler.shared.interruptForSystemSuspension()
                     await AppConfigStore.shared.flushPendingWrites()
                 }
             default:
@@ -316,4 +332,14 @@ struct ContentView: View {
         viewModel.reloadPersistedDataAfterLegacyJSONMigration()
         launchStateMachine.continueAfterDatabaseUnlock()
     }
+}
+
+enum WatchAutomaticHistoryDirection: Equatable {
+    case earlier
+    case later
+}
+
+struct WatchAutomaticHistoryLoadRequest: Equatable {
+    let direction: WatchAutomaticHistoryDirection
+    let anchorMessageID: UUID
 }

@@ -35,6 +35,7 @@ extension ChatViewModel {
         enableStreaming = appConfig.enableStreaming
         enableResponseSpeedMetrics = appConfig.enableResponseSpeedMetrics
         enableOpenAIStreamIncludeUsage = appConfig.enableOpenAIStreamIncludeUsage
+        automaticHistoryLoadingEnabled = appConfig.automaticHistoryLoadingEnabled
         lazyLoadMessageCount = appConfig.lazyLoadMessageCount
         currentBackgroundImage = appConfig.currentBackgroundImage
         enableAutoRotateBackground = appConfig.enableAutoRotateBackground
@@ -183,6 +184,14 @@ extension ChatViewModel {
         isApplicationActive = true
         BackgroundGenerationKeepAliveManager.shared.refreshStatus()
         chatService.reloadLocalModelsAndProvidersIfNeeded()
+        clearCurrentSessionReplyNotifications()
+    }
+
+    private func clearCurrentSessionReplyNotifications() {
+        guard let sessionID = currentSession?.id else { return }
+        Task {
+            await AppLocalNotificationCenter.shared.removeChatReplyNotifications(sessionID: sessionID)
+        }
     }
 
     func shouldPresentMemoryEmbeddingErrorAlert(message: String) -> Bool {
@@ -247,6 +256,15 @@ extension ChatViewModel {
             }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(for: RoleplayStore.didChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard notification.userInfo?[RoleplayStore.changeKindUserInfoKey] as? String
+                        == RoleplayStore.libraryChangeKind else { return }
+                self?.refreshVisualMessagesAfterRegexRulesChange()
+            }
+            .store(in: &cancellables)
+
         NotificationCenter.default.publisher(for: RoleplayDisplayedMessageBridge.didChangeNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
@@ -288,16 +306,31 @@ extension ChatViewModel {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] session in
                 guard let self else { return }
+                beginHistorySession(session?.id)
                 currentSession = session
+                refreshSessionScopedAppToolRequests()
                 imageGenerationFeedback = .idle
                 refreshCurrentSessionSendingState()
+#if canImport(UIKit)
+                if UIApplication.shared.applicationState == .active {
+                    clearCurrentSessionReplyNotifications()
+                }
+#endif
             }
             .store(in: &cancellables)
 
         chatService.messagesForSessionSubject
+            .map { [chatService] messages in
+                (
+                    sessionID: chatService.currentSessionSubject.value?.id,
+                    messages: messages
+                )
+            }
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] messages in
-                self?.applyMessagesUpdate(messages)
+            .sink { [weak self] update in
+                guard let self else { return }
+                guard update.sessionID == chatService.currentSessionSubject.value?.id else { return }
+                applyMessagesUpdate(update.messages, for: update.sessionID)
             }
             .store(in: &cancellables)
 
@@ -346,6 +379,7 @@ extension ChatViewModel {
                 guard let self else { return }
                 self.runningSessionIDs = runningSessionIDs
                 refreshCurrentSessionSendingState()
+                flushPendingToolSupplementMessagesIfPossible()
                 if runningSessionIDs.isEmpty {
                     endBackgroundTaskIfNeeded()
                 } else {
@@ -354,6 +388,13 @@ extension ChatViewModel {
                 BackgroundGenerationKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
                 BackgroundGenerationAudioKeepAliveManager.shared.setGenerationActive(!runningSessionIDs.isEmpty)
                 updateAutoReasoningPreviewState(with: allMessagesForSession)
+            }
+            .store(in: &cancellables)
+
+        chatService.conversationRuntimeStatesSubject
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] states in
+                self?.conversationRuntimeStates = states
             }
             .store(in: &cancellables)
 
@@ -453,18 +494,20 @@ extension ChatViewModel {
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: .appToolFillUserInputRequested)
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
-                guard let request = AppToolInputDraftRequest.decode(from: notification.userInfo) else { return }
-                self?.applyToolInputDraftRequest(request)
+                guard let self,
+                      let request = AppToolInputDraftRequest.decode(from: notification.userInfo),
+                      let receipt = AppToolUIRequestDeliveryReceipt.decode(from: notification.userInfo) else { return }
+                receiveToolInputDraftRequest(request, receipt: receipt)
             }
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: .appToolAskUserInputRequested)
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
-                guard let request = AppToolAskUserInputRequest.decode(from: notification.userInfo) else { return }
-                self?.activeAskUserInputRequest = request
+                guard let self,
+                      let request = AppToolAskUserInputRequest.decode(from: notification.userInfo),
+                      let receipt = AppToolUIRequestDeliveryReceipt.decode(from: notification.userInfo) else { return }
+                receiveAskUserInputRequest(request, receipt: receipt)
             }
             .store(in: &cancellables)
 

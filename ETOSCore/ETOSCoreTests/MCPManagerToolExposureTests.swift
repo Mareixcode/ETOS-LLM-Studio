@@ -170,6 +170,7 @@ struct MCPManagerToolExposureTests {
             (server.id, MCPServerStore.loadMetadata(for: server.id))
         })
         let originalGlobalSwitch = manager.chatToolsEnabled
+        let originalTitleSwitch = manager.toolCallTitleEnabled
 
         defer {
             for server in MCPServerStore.loadServers() {
@@ -182,7 +183,9 @@ struct MCPManagerToolExposureTests {
                 }
             }
             manager.chatToolsEnabled = originalGlobalSwitch
+            manager.toolCallTitleEnabled = originalTitleSwitch
             AppConfigStore.persistSynchronously(.bool(originalGlobalSwitch), for: .mcpChatToolsEnabled)
+            AppConfigStore.persistSynchronously(.bool(originalTitleSwitch), for: .mcpToolCallTitleEnabled)
             manager.reloadServers()
         }
 
@@ -191,6 +194,7 @@ struct MCPManagerToolExposureTests {
         }
         manager.reloadServers()
         manager.setChatToolsEnabled(true)
+        manager.setToolCallTitleEnabled(true)
 
         let server = MCPServerConfiguration(
             displayName: "Test MCP Server",
@@ -225,10 +229,216 @@ struct MCPManagerToolExposureTests {
         let exposedTools = manager.chatToolsForLLM()
         let exposedTool = try #require(exposedTools.first(where: { $0.name == "mcp_tool_alpha" }))
         #expect(exposedTool.name == "mcp_tool_alpha")
+        guard case .dictionary(let titledSchema) = exposedTool.parameters,
+              case .dictionary(let titledProperties) = titledSchema["properties"],
+              case .array(let titledRequired) = titledSchema["required"] else {
+            Issue.record("开启标题后应把 ETOS 保留字段加入 MCP Schema")
+            return
+        }
+        #expect(titledProperties[MCPToolCallTitleMetadata.argumentKey] != nil)
+        #expect(titledRequired.contains(.string(MCPToolCallTitleMetadata.argumentKey)))
+
+        manager.setToolCallTitleEnabled(false)
+        let untitledTool = try #require(manager.chatToolsForLLM().first(where: { $0.name == "mcp_tool_alpha" }))
+        if case .dictionary(let untitledSchema) = untitledTool.parameters,
+           case .dictionary(let untitledProperties) = untitledSchema["properties"] {
+            #expect(untitledProperties[MCPToolCallTitleMetadata.argumentKey] == nil)
+        }
 
         manager.setChatToolsEnabled(false)
         #expect(manager.chatToolsForLLM().isEmpty)
         #expect(manager.approvalPolicy(for: exposedTool.name) == .alwaysDeny)
+    }
+
+    @Test("MCP 标题元数据只保留在 ETOS 并从执行参数移除")
+    func testToolCallTitleMetadataIsRemovedFromExecutionArguments() throws {
+        #expect(AppConfigKey.mcpToolCallTitleEnabled.defaultValue == .bool(true))
+
+        let parsed = MCPToolCallTitleMetadata.parse(
+            argumentsJSON: #"{"__etos_tool_title":"  搜索相关问题  ","query":"Linux"}"#
+        )
+        #expect(parsed.title == "搜索相关问题")
+
+        let data = try #require(parsed.argumentsJSON.data(using: .utf8))
+        let dictionary = try #require(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        #expect(dictionary[MCPToolCallTitleMetadata.argumentKey] == nil)
+        #expect(dictionary["query"] as? String == "Linux")
+    }
+
+    @MainActor
+    @Test("本地 stdio MCP 仅在 Agent 启用本地 Linux 时暴露")
+    func testLocalStdioToolsRequireLocalLinuxCapability() async throws {
+        let previousPersistenceOverride = enableRelationalPersistence()
+        defer { restorePersistenceOverride(previousPersistenceOverride) }
+
+        let manager = MCPManager.shared
+        let originalServers = MCPServerStore.loadServers()
+        let originalMetadata = Dictionary(uniqueKeysWithValues: originalServers.map { server in
+            (server.id, MCPServerStore.loadMetadata(for: server.id))
+        })
+        let originalGlobalSwitch = manager.chatToolsEnabled
+
+        defer {
+            for server in MCPServerStore.loadServers() {
+                MCPServerStore.delete(server)
+            }
+            for server in originalServers {
+                MCPServerStore.save(server)
+                if let metadata = originalMetadata[server.id] {
+                    MCPServerStore.saveMetadata(metadata, for: server.id)
+                }
+            }
+            manager.chatToolsEnabled = originalGlobalSwitch
+            AppConfigStore.persistSynchronously(.bool(originalGlobalSwitch), for: .mcpChatToolsEnabled)
+            manager.reloadServers()
+        }
+
+        for server in MCPServerStore.loadServers() {
+            MCPServerStore.delete(server)
+        }
+        manager.reloadServers()
+        manager.setChatToolsEnabled(true)
+
+        let remoteServer = MCPServerConfiguration(
+            displayName: "Remote MCP Server",
+            transport: .http(
+                endpoint: URL(string: "https://example.com/mcp")!,
+                apiKey: nil,
+                additionalHeaders: [:]
+            ),
+            isSelectedForChat: true
+        )
+        let localServer = MCPServerConfiguration(
+            displayName: "Local MCP Server",
+            transport: .localStdio(
+                configuration: MCPLocalStdioConfiguration(
+                    command: "mcp-server-test",
+                    launchPolicy: .manual
+                )
+            ),
+            isSelectedForChat: true
+        )
+        let metadata = MCPServerMetadataCache(
+            info: nil,
+            tools: [
+                MCPToolDescription(
+                    toolId: "tool.alpha",
+                    description: "用于测试模式隔离的 MCP 工具",
+                    inputSchema: .dictionary(["type": .string("object")]),
+                    examples: nil
+                )
+            ],
+            resources: [],
+            resourceTemplates: [],
+            prompts: [],
+            roots: []
+        )
+        for server in [remoteServer, localServer] {
+            MCPServerStore.save(server)
+            MCPServerStore.saveMetadata(metadata, for: server.id)
+        }
+
+        manager.reloadServers()
+        let chatToolDescriptions = manager.chatToolsForLLM().map(\.description)
+        #expect(chatToolDescriptions.contains(where: { $0.contains("Remote MCP Server") }))
+        #expect(!chatToolDescriptions.contains(where: { $0.contains("Local MCP Server") }))
+
+        let agentTools = manager.chatToolsForLLM(includeLocalLinuxTools: true)
+        let agentToolDescriptions = agentTools.map(\.description)
+        #expect(agentToolDescriptions.contains(where: { $0.contains("Remote MCP Server") }))
+        #expect(agentToolDescriptions.contains(where: { $0.contains("Local MCP Server") }))
+
+        let localTool = try #require(
+            agentTools.first(where: { $0.description.contains("Local MCP Server") })
+        )
+        await #expect(throws: LocalLinuxRuntimeError.self) {
+            try await manager.executeToolFromChat(
+                toolName: localTool.name,
+                argumentsJSON: "{}",
+                sourceSessionID: UUID(),
+                sourceToolCallID: "chat-local-mcp",
+                sourceAgentRunID: UUID()
+            )
+        }
+    }
+
+    @MainActor
+    @Test("Chat 保留普通工具但不暴露本地 Linux 工具")
+    func testNonLinuxBuiltInsRemainChatTools() throws {
+        let previousPersistenceOverride = enableRelationalPersistence()
+        defer { restorePersistenceOverride(previousPersistenceOverride) }
+
+        let manager = MCPManager.shared
+        let originalServers = MCPServerStore.loadServers()
+        let originalMetadata = Dictionary(uniqueKeysWithValues: originalServers.map { server in
+            (server.id, MCPServerStore.loadMetadata(for: server.id))
+        })
+        let originalGlobalSwitch = manager.chatToolsEnabled
+
+        defer {
+            for server in MCPServerStore.loadServers() {
+                MCPServerStore.delete(server)
+            }
+            for server in originalServers {
+                MCPServerStore.save(server)
+                if let metadata = originalMetadata[server.id] {
+                    MCPServerStore.saveMetadata(metadata, for: server.id)
+                }
+            }
+            manager.chatToolsEnabled = originalGlobalSwitch
+            AppConfigStore.persistSynchronously(.bool(originalGlobalSwitch), for: .mcpChatToolsEnabled)
+            manager.reloadServers()
+        }
+
+        for server in MCPServerStore.loadServers() {
+            MCPServerStore.delete(server)
+        }
+        manager.reloadServers()
+        manager.setChatToolsEnabled(true)
+
+        let browserServer = MCPBuiltInAppToolServer.defaultConfiguration(for: .browser)
+        let conversationServer = MCPBuiltInAppToolServer.defaultConfiguration(for: .conversation)
+        let linuxServer = MCPBuiltInAppToolServer.defaultConfiguration(for: .linux)
+        for server in [browserServer, conversationServer, linuxServer] {
+            let category = try #require(MCPBuiltInAppToolServer.category(for: server.id))
+            MCPServerStore.save(server)
+            MCPServerStore.saveMetadata(
+                MCPServerMetadataCache(
+                    info: nil,
+                    tools: MCPBuiltInAppToolServer.appToolDescriptions(for: category),
+                    resources: [],
+                    resourceTemplates: [],
+                    prompts: [],
+                    roots: []
+                ),
+                for: server.id
+            )
+        }
+
+        manager.reloadServers()
+        let chatTools = manager.chatToolsForLLM(
+            includeConversationAgentTools: true,
+            includeBrowserAgentTools: true
+        )
+        #expect(chatTools.contains(where: { $0.description.contains(browserServer.displayName) }))
+        #expect(chatTools.contains(where: { $0.description.contains(conversationServer.displayName) }))
+        #expect(!chatTools.contains(where: { $0.description.contains(linuxServer.displayName) }))
+
+        let agentTools = manager.chatToolsForLLM(
+            includeConversationAgentTools: true,
+            includeLocalLinuxTools: true,
+            includeBrowserAgentTools: true
+        )
+        #expect(agentTools.contains(where: { $0.description.contains(linuxServer.displayName) }))
+
+        manager.setChatToolsEnabled(false)
+        let disabledTools = manager.chatToolsForLLM(
+            includeConversationAgentTools: true,
+            includeBrowserAgentTools: true
+        )
+        #expect(disabledTools.isEmpty)
     }
 
     @MainActor

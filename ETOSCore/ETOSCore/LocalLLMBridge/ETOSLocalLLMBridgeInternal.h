@@ -36,6 +36,26 @@ namespace etos_local_llm_bridge {
 extern std::once_flag backend_init_once;
 constexpr int32_t local_llm_cancelled_status = -2;
 
+class native_log_capture {
+public:
+    native_log_capture();
+    ~native_log_capture();
+
+    native_log_capture(const native_log_capture &) = delete;
+    native_log_capture & operator=(const native_log_capture &) = delete;
+
+    void append(ggml_log_level level, const char * text);
+    std::string text() const;
+
+private:
+    native_log_capture * previous_ = nullptr;
+    std::string buffer_;
+    bool captures_continuation_ = false;
+};
+
+void initialize_backend();
+std::string diagnostic_message(std::string summary, const std::string & native_log);
+
 struct llama_model_deleter {
     void operator()(llama_model * model) const {
         if (model) {
@@ -56,6 +76,14 @@ struct llama_sampler_deleter {
     void operator()(llama_sampler * sampler) const {
         if (sampler) {
             llama_sampler_free(sampler);
+        }
+    }
+};
+
+struct llama_adapter_lora_deleter {
+    void operator()(llama_adapter_lora * adapter) const {
+        if (adapter) {
+            llama_adapter_lora_free(adapter);
         }
     }
 };
@@ -88,6 +116,7 @@ using llama_model_handle = std::unique_ptr<llama_model, llama_model_deleter>;
 using llama_model_shared_handle = std::shared_ptr<llama_model>;
 using llama_context_handle = std::unique_ptr<llama_context, llama_context_deleter>;
 using llama_sampler_handle = std::unique_ptr<llama_sampler, llama_sampler_deleter>;
+using llama_adapter_lora_handle = std::unique_ptr<llama_adapter_lora, llama_adapter_lora_deleter>;
 using mtmd_context_handle = std::unique_ptr<mtmd_context, mtmd_context_deleter>;
 using mtmd_bitmap_handle = std::unique_ptr<mtmd_bitmap, mtmd_bitmap_deleter>;
 using mtmd_input_chunks_handle = std::unique_ptr<mtmd_input_chunks, mtmd_input_chunks_deleter>;
@@ -100,7 +129,8 @@ int32_t thread_count();
 llama_model_shared_handle load_model(
     const char * model_path,
     const llama_model_params & model_params,
-    bool use_model_cache
+    bool use_model_cache,
+    std::string * diagnostic_log = nullptr
 );
 
 struct local_generation_params {
@@ -111,6 +141,8 @@ struct local_generation_params {
     };
 
     std::string mmproj_path;
+    std::string lora_path;
+    float lora_scale = 1.0f;
     std::string kv_cache_key;
     int32_t context_size = 2048;
     int32_t max_output_tokens = 512;

@@ -19,18 +19,21 @@ extension ChatService {
         from messagesToSend: [ChatMessage],
         loadingMessageID: UUID,
         sessionID: UUID
-    ) {
+    ) async {
         let snapshot = messagesToSend
             .filter { $0.role == .system }
             .map(\.content)
             .joined(separator: "\n\n")
-        var persistedMessages = messagesSnapshot(for: sessionID)
-        guard let index = persistedMessages.firstIndex(where: { $0.id == loadingMessageID }) else {
+        guard var loadingMessage = messagesSnapshot(for: sessionID).first(where: { $0.id == loadingMessageID }) else {
             logger.warning("无法记录系统提示词快照：未找到回复占位消息 \(loadingMessageID)。")
             return
         }
-        persistedMessages[index].sentSystemPromptSnapshot = snapshot
-        persistAndPublishMessages(persistedMessages, for: sessionID)
+        loadingMessage.sentSystemPromptSnapshot = snapshot
+        do {
+            _ = try await upsertConversationMessage(loadingMessage, to: sessionID)
+        } catch {
+            logger.error("原子保存系统提示词快照失败：\(error.localizedDescription)")
+        }
     }
 
     func openAIReasoningContentEchoModeControlValue() async -> String {
@@ -52,6 +55,7 @@ extension ChatService {
         enableStreaming: Bool,
         enhancedPrompt: String?,
         tools: [InternalToolDefinition]?,
+        localAgentPrompt: String?,
         enableMemory: Bool,
         enableMemoryWrite: Bool,
         enableMemoryActiveRetrieval: Bool,
@@ -67,7 +71,11 @@ extension ChatService {
         let currentSessionSnapshot = currentSessionSubject.value
         let sessionForRequest = currentSessionSnapshot?.id == currentSessionID
             ? currentSessionSnapshot
-            : chatSessionsSubject.value.first(where: { $0.id == currentSessionID })
+            : conversationSession(withID: currentSessionID)
+        let resolvedEnhancedPrompt = sessionForRequest?.enhancedPrompt ?? enhancedPrompt
+        let linkedConversations = await Task.detached(priority: .utility) {
+            Persistence.loadLinkedConversationContacts(sourceSessionID: currentSessionID)
+        }.value
         let continuationMessages: [ChatMessage]
         do {
             continuationMessages = try await Task.detached(priority: .userInitiated) {
@@ -161,7 +169,25 @@ extension ChatService {
             conversationUserProfile = nil
         }
 
-        guard let runnableModel = selectedModelSubject.value else {
+        let sessionPreferredModel = sessionForRequest?.preferredModelIdentifier.flatMap { identifier in
+            activatedConversationModels.first(where: { $0.id == identifier })
+        }
+        let runConfiguredModelIdentifier = conversationRunIDs(for: currentSessionID).flatMap { runIDs in
+            Persistence.loadConversationRun(id: runIDs.runID)?.requestConfiguration.modelIdentifier
+        }
+        let runConfiguredModel = runConfiguredModelIdentifier.flatMap { identifier in
+            activatedConversationModels.first(where: { $0.id == identifier })
+                ?? selectedModelSubject.value.flatMap { $0.id == identifier ? $0 : nil }
+        }
+        if runConfiguredModelIdentifier != nil, runConfiguredModel == nil {
+            addErrorMessage(
+                NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
+                sessionID: currentSessionID
+            )
+            emitSessionRequestStatus(.error, sessionID: currentSessionID)
+            return
+        }
+        guard let runnableModel = runConfiguredModel ?? sessionPreferredModel ?? selectedModelSubject.value else {
             addErrorMessage(
                 NSLocalizedString("错误: 没有选中的可用模型。请在设置中激活一个模型。", comment: "No active model error"),
                 sessionID: currentSessionID
@@ -229,7 +255,7 @@ extension ChatService {
                 worldbooks: boundWorldbooks,
                 messages: requestMessages,
                 topicPrompt: sessionForRequest?.topicPrompt,
-                enhancedPrompt: enhancedPrompt,
+                enhancedPrompt: resolvedEnhancedPrompt,
                 personaDescription: resolvedRoleplay?.persona?.description,
                 characterDescription: resolvedRoleplay?.characters.first?.description,
                 characterPersonality: resolvedRoleplay?.characters.first?.personality,
@@ -247,9 +273,19 @@ extension ChatService {
         )
 
         var messagesToSend: [ChatMessage] = []
+        let includesConversationTools = runnableModel.model.supportsToolCalling
+            && (tools?.contains { ConversationToolDefinitions.containsExposedName($0.name) } == true)
+        let includesLocalLinuxInstructions = shouldIncludeLocalLinuxInstructions(
+            tools: tools,
+            modelSupportsToolCalling: runnableModel.model.supportsToolCalling,
+            localLinuxToolsEnabled: activeRequestIncludesLocalLinuxTools(sessionID: currentSessionID)
+        )
         var finalSystemPrompt = buildFinalSystemPrompt(
             global: systemPrompt,
+            conversationSystem: sessionForRequest?.systemPrompt,
             topic: sessionForRequest?.topicPrompt,
+            includeConversationRuntime: includesConversationTools,
+            linkedConversations: linkedConversations,
             memories: memories,
             recentConversationSummaries: recentConversationSummaries,
             conversationProfile: conversationUserProfile,
@@ -258,7 +294,9 @@ extension ChatService {
             worldbookAfter: worldbookResult.after,
             worldbookANTop: worldbookResult.anTop,
             worldbookANBottom: worldbookResult.anBottom,
-            roleplayPrompt: resolvedRoleplay.map(RoleplayRuntime.roleplaySystemPrompt)
+            roleplayPrompt: resolvedRoleplay.map(RoleplayRuntime.roleplaySystemPrompt),
+            includeLocalLinuxInstructions: includesLocalLinuxInstructions,
+            localAgentPrompt: localAgentPrompt
         )
         if !helperScriptIDs.isEmpty, finalSystemPrompt.contains("{{") {
             finalSystemPrompt = await RoleplayMacroExpansionBridge.shared.expand(
@@ -307,10 +345,10 @@ extension ChatService {
         let openAIUsesSystemRole = await MainActor.run {
             AppConfigStore.shared.openAITailContextUsesSystemRole
         }
-        let apiFormat = runnableModel.provider.apiFormat
+        let apiFormat = runnableModel.effectiveAPIFormat
 
         if let enhancedPromptMessage = makeEnhancedPromptMessage(
-            enhancedPrompt,
+            resolvedEnhancedPrompt,
             apiFormat: apiFormat,
             openAIUsesSystemRole: openAIUsesSystemRole
         ) {
@@ -369,7 +407,8 @@ extension ChatService {
 
         var imageAttachments: [UUID: [ImageAttachment]] = [:]
         for msg in messagesToSend {
-            guard let imageFileNames = msg.imageFileNames, !imageFileNames.isEmpty else { continue }
+            let imageFileNames = msg.modelVisibleImageFileNames
+            guard !imageFileNames.isEmpty else { continue }
             var attachments: [ImageAttachment] = []
             for fileName in imageFileNames {
                 if let attachment = loadImageAttachmentFromStorage(fileName: fileName) {
@@ -505,7 +544,11 @@ extension ChatService {
         }
 
         if LocalModelProviderBridge.isLocalRunnableModel(runnableModel) {
-            persistSentSystemPromptSnapshot(
+            let localTools = runnableModel.model.supportsToolCalling ? tools : nil
+            if tools != nil, localTools == nil {
+                logger.info("当前本地模型未启用工具能力，本次请求不会附带工具定义。")
+            }
+            await persistSentSystemPromptSnapshot(
                 from: messagesToSend,
                 loadingMessageID: loadingMessageID,
                 sessionID: currentSessionID
@@ -531,16 +574,16 @@ extension ChatService {
                 enableResponseSpeedMetrics: enableResponseSpeedMetrics,
                 requestStartedAt: requestStartedAt,
                 requestLogContext: requestLogContext,
-                availableTools: nil,
+                availableTools: localTools,
                 imageAttachments: imageAttachments
             )
             return
         }
 
-        guard let adapter = adapters[runnableModel.provider.apiFormat] else {
+        guard let adapter = adapters[runnableModel.effectiveAPIFormat] else {
             addErrorMessage(String(
                 format: NSLocalizedString("错误: 找不到适用于 '%@' 格式的 API 适配器。", comment: "Missing API adapter error"),
-                runnableModel.provider.apiFormat
+                runnableModel.effectiveAPIFormat
             ), sessionID: currentSessionID)
             emitSessionRequestStatus(.error, sessionID: currentSessionID)
             persistRequestLog(
@@ -612,7 +655,31 @@ extension ChatService {
             let includeUsageInStream = await MainActor.run { AppConfigStore.shared.enableOpenAIStreamIncludeUsage }
             commonPayload[OpenAIAdapter.streamIncludeUsageControlKey] = includeUsageInStream
         }
-        let effectiveTools = runnableModel.model.supportsToolCalling ? tools : nil
+        let providerResolvedTools: [InternalToolDefinition]?
+        do {
+            providerResolvedTools = try await toolsUsingNativeResponsesShellIfNeeded(
+                tools,
+                runnableModel: runnableModel,
+                sessionID: currentSessionID
+            )
+        } catch {
+            let reason = String(
+                format: NSLocalizedString("错误: 无法准备 Responses 本地 Shell：%@", comment: "Prepare Responses local shell failure"),
+                error.localizedDescription
+            )
+            addErrorMessage(reason, sessionID: currentSessionID)
+            emitSessionRequestStatus(.error, sessionID: currentSessionID)
+            persistRequestLog(
+                context: requestLogContext,
+                status: .failed,
+                tokenUsage: nil,
+                finishedAt: Date(),
+                recordUsageEvent: false,
+                errorKind: "responses_local_shell_preparation_failed"
+            )
+            return
+        }
+        let effectiveTools = runnableModel.model.supportsToolCalling ? providerResolvedTools : nil
         if tools != nil, effectiveTools == nil {
             logger.info("当前模型未启用工具能力，本次请求不会附带工具定义。")
         }
@@ -656,7 +723,7 @@ extension ChatService {
             isStreaming: requestLogContext.isStreaming
         )
 
-        persistSentSystemPromptSnapshot(
+        await persistSentSystemPromptSnapshot(
             from: messagesToSend,
             loadingMessageID: loadingMessageID,
             sessionID: currentSessionID
@@ -870,7 +937,7 @@ extension ChatService {
                                 sessionID: sessionID
                             )
                             updatedMessages[messageIndex].replaceVideoAnalysisResult(result)
-                            persistVideoAnalysisResult(
+                            await persistVideoAnalysisResult(
                                 result,
                                 messageID: messageID,
                                 sessionID: sessionID
@@ -1194,7 +1261,7 @@ extension ChatService {
         using ocrModel: RunnableModel,
         sessionID: UUID
     ) async throws -> String {
-        guard let adapter = adapters[ocrModel.provider.apiFormat] else {
+        guard let adapter = adapters[ocrModel.effectiveAPIFormat] else {
             throw DetachedCompletionError.unsupportedAdapter
         }
         if let configurationError = providerConfigurationValidationErrorMessage(

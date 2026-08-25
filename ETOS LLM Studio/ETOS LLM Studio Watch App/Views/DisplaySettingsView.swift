@@ -67,6 +67,17 @@ struct DisplaySettingsView: View {
                 }
             }
 
+            if enableBackground && selectedBackgroundIsVideo {
+                Section(
+                    footer: Text(NSLocalizedString("开启后，进入设置等页面时视频会继续播放，返回聊天时保持原有进度；App 进入后台后仍会暂停。", comment: "Video background continuous playback description"))
+                ) {
+                    Toggle(
+                        NSLocalizedString("离开聊天时继续播放", comment: "Video background continuous playback toggle"),
+                        isOn: $appConfig.continueVideoBackgroundPlaybackWhenChatHidden
+                    )
+                }
+            }
+
             // MARK: Section 2：对话框与内容
             Section(
                 header: Text(NSLocalizedString("对话框与内容", comment: "")),
@@ -101,6 +112,20 @@ struct DisplaySettingsView: View {
                     WatchFontSettingsView()
                 } label: {
                     Text(NSLocalizedString("字体设置", comment: ""))
+                }
+            }
+
+            Section(
+                header: Text(NSLocalizedString("流式显示", comment: "Streaming response display section")),
+                footer: Text(NSLocalizedString("即时模式优先响应速度，并让新增文字快速淡入；柔和模式会合并更多流式分片，以更舒缓的节奏显示新增文字。", comment: "Streaming response display mode description"))
+            ) {
+                Picker(
+                    NSLocalizedString("流式显示", comment: "Streaming response display mode"),
+                    selection: $appConfig.chatStreamingDisplayMode
+                ) {
+                    ForEach(ChatStreamingDisplayMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode.rawValue)
+                    }
                 }
             }
 
@@ -187,6 +212,10 @@ struct DisplaySettingsView: View {
                 AppLanguageRuntime.apply(rawValue: newValue)
             }
         )
+    }
+
+    private var selectedBackgroundIsVideo: Bool {
+        ConfigLoader.isVideoBackgroundFile(currentBackgroundImage)
     }
 
     @ViewBuilder

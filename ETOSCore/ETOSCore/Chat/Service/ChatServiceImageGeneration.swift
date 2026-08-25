@@ -66,10 +66,10 @@ extension ChatService {
             return
         }
 
-        guard let adapter = adapters[runnableModel.provider.apiFormat] else {
+        guard let adapter = adapters[runnableModel.effectiveAPIFormat] else {
             let reason = String(
                 format: NSLocalizedString("错误: 找不到适用于 '%@' 格式的 API 适配器。", comment: "Missing API adapter error"),
-                runnableModel.provider.apiFormat
+                runnableModel.effectiveAPIFormat
             )
             addErrorMessage(reason, sessionID: currentSession.id)
             requestStatusSubject.send(.error)
@@ -134,22 +134,51 @@ extension ChatService {
             }
         }
 
-        let userMessage = ChatMessage(
+        let requestedAt = Date()
+        var userMessages = savedImageFileNames.map { fileName in
+            ChatMessage(
+                role: .user,
+                content: NSLocalizedString("[图片]", comment: "Image message placeholder"),
+                requestedAt: requestedAt,
+                imageFileNames: [fileName]
+            )
+        }
+        var userMessage = ChatMessage(
             role: .user,
             content: trimmedPrompt,
-            requestedAt: Date(),
-            imageFileNames: savedImageFileNames.isEmpty ? nil : savedImageFileNames
+            requestedAt: requestedAt
         )
+        let responseAttempt = ResponseAttemptMetadata(
+            groupID: userMessage.id,
+            attemptID: UUID(),
+            attemptIndex: 0
+        )
+        userMessage.selectedResponseAttemptID = responseAttempt.attemptID
+        userMessages.append(userMessage)
         let loadingMessage = ChatMessage(
             role: .assistant,
             content: "",
-            requestedAt: Date()
+            requestedAt: requestedAt,
+            responseGroupID: responseAttempt.groupID,
+            responseAttemptID: responseAttempt.attemptID,
+            responseAttemptIndex: responseAttempt.attemptIndex,
+            selectedResponseAttemptID: responseAttempt.attemptID
         )
 
-        var messages = existingMessages
-        messages.append(userMessage)
-        messages.append(loadingMessage)
-        persistAndPublishMessages(messages, for: currentSession.id)
+        do {
+            for message in userMessages {
+                _ = try await appendConversationMessage(message, to: currentSession.id)
+            }
+            _ = try await appendConversationMessage(loadingMessage, to: currentSession.id)
+        } catch {
+            addErrorMessage(
+                NSLocalizedString("错误: 无法保存会话消息。", comment: "Unable to persist conversation messages"),
+                sessionID: currentSession.id
+            )
+            requestStatusSubject.send(.error)
+            return
+        }
+        let messages = messagesSnapshot(for: currentSession.id)
         scheduleUserMessageAchievementDetectionIfNeeded(
             content: trimmedPrompt,
             userMessageCount: messages.filter { $0.role == .user }.count,
@@ -274,7 +303,7 @@ extension ChatService {
     func latestAssistantImageReference(in messages: [ChatMessage]) -> ImageAttachment? {
         let visibleMessages = ChatResponseAttemptSupport.visibleMessages(from: messages)
         for message in visibleMessages.reversed() where message.role == .assistant {
-            for fileName in (message.imageFileNames ?? []).reversed() {
+            for fileName in message.modelVisibleImageFileNames.reversed() {
                 if let attachment = loadImageAttachmentFromStorage(fileName: fileName) {
                     logger.info("连续改图复用最近助手图片: \(fileName)")
                     return attachment
@@ -425,18 +454,28 @@ extension ChatService {
             let revisedPrompt = revisedPrompts.first(where: { !$0.isEmpty })
             let content = revisedPrompt ?? NSLocalizedString("[图片]", comment: "Image message placeholder")
 
-            var messages = messagesSnapshot(for: currentSessionID)
-            if let loadingIndex = messages.firstIndex(where: { $0.id == loadingMessageID }) {
-                messages[loadingIndex] = ChatMessage(
-                    id: messages[loadingIndex].id,
+            if let loadingMessage = messagesSnapshot(for: currentSessionID).first(where: { $0.id == loadingMessageID }) {
+                let completedMessage = ChatMessage(
+                    id: loadingMessage.id,
                     role: .assistant,
                     content: content,
-                    imageFileNames: generatedImageFileNames
+                    requestedAt: loadingMessage.requestedAt,
+                    providerResponseMetadata: loadingMessage.providerResponseMetadata,
+                    imageFileNames: generatedImageFileNames,
+                    responseGroupID: loadingMessage.responseGroupID,
+                    responseAttemptID: loadingMessage.responseAttemptID,
+                    responseAttemptIndex: loadingMessage.responseAttemptIndex,
+                    selectedResponseAttemptID: loadingMessage.selectedResponseAttemptID
                 )
-                persistAndPublishMessages(messages, for: currentSessionID)
-                logger.info(
-                    "生图消息已落盘: session=\(currentSessionID.uuidString), loadingMessageID=\(loadingMessageID.uuidString), imageCount=\(generatedImageFileNames.count)"
-                )
+                let atomizedMessages = ChatMessageAtomicContentSupport.atomized(completedMessage)
+                var updatedMessages = messagesSnapshot(for: currentSessionID)
+                if let loadingIndex = updatedMessages.firstIndex(where: { $0.id == loadingMessageID }) {
+                    updatedMessages.replaceSubrange(loadingIndex...loadingIndex, with: atomizedMessages)
+                    persistAndPublishMessages(updatedMessages, for: currentSessionID)
+                    logger.info(
+                        "生图消息已落盘: session=\(currentSessionID.uuidString), loadingMessageID=\(loadingMessageID.uuidString), imageCount=\(generatedImageFileNames.count)"
+                    )
+                }
             } else {
                 logger.warning("未找到生图占位消息，无法替换: loadingMessageID=\(loadingMessageID.uuidString)")
             }

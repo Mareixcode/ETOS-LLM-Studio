@@ -38,6 +38,7 @@ final class PersistenceGRDBStore {
         static let dailyPulsePendingCuration = "daily_pulse_pending_curation"
         static let dailyPulseExternalSignals = "daily_pulse_external_signals"
         static let dailyPulseTasks = "daily_pulse_tasks"
+        static let dailyPulseGenerationRuntime = "daily_pulse_generation_runtime"
     }
 
     let logger = Logger(subsystem: "com.ETOS.LLM.Studio", category: "PersistenceGRDB")
@@ -108,6 +109,7 @@ final class PersistenceGRDBStore {
                     topic_prompt TEXT,
                     enhanced_prompt TEXT,
                     folder_id TEXT,
+                    container_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
                     lorebook_ids_json BLOB NOT NULL,
                     worldbook_context_isolation_enabled INTEGER NOT NULL DEFAULT 0,
                     is_temporary INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +137,7 @@ final class PersistenceGRDBStore {
                     cost_estimate_json BLOB,
                     audio_file_name TEXT,
                     image_file_names_json BLOB,
+                    model_excluded_image_file_names_json BLOB,
                     file_file_names_json BLOB,
                     video_analysis_results_json BLOB,
                     full_error_content TEXT,
@@ -488,6 +491,91 @@ final class PersistenceGRDBStore {
             }
         }
 
+        migrator.registerMigration("v10_conversation_runtime") { db in
+            let sessionColumns = try Row.fetchAll(db, sql: "PRAGMA table_info(sessions)")
+            let sessionColumnNames = Set(sessionColumns.compactMap { row -> String? in row["name"] })
+            if !sessionColumnNames.contains("system_prompt") {
+                try db.execute(sql: "ALTER TABLE sessions ADD COLUMN system_prompt TEXT")
+            }
+            if !sessionColumnNames.contains("preferred_model_identifier") {
+                try db.execute(sql: "ALTER TABLE sessions ADD COLUMN preferred_model_identifier TEXT")
+            }
+
+            let messageColumns = try Row.fetchAll(db, sql: "PRAGMA table_info(messages)")
+            let messageColumnNames = Set(messageColumns.compactMap { row -> String? in row["name"] })
+            let addedAuthorKind = !messageColumnNames.contains("author_kind")
+            if addedAuthorKind {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN author_kind TEXT NOT NULL DEFAULT 'user'")
+            }
+            if !messageColumnNames.contains("source_session_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN source_session_id TEXT")
+            }
+            if !messageColumnNames.contains("source_message_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN source_message_id TEXT")
+            }
+            if !messageColumnNames.contains("conversation_event_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN conversation_event_id TEXT")
+            }
+            if addedAuthorKind {
+                // 旧触发器监听任意字段更新，批量回填会为每条历史消息重建一次 FTS。
+                try db.execute(sql: "DROP TRIGGER IF EXISTS messages_au")
+                try db.execute(sql: """
+                    UPDATE messages
+                    SET author_kind = CASE role
+                        WHEN 'assistant' THEN 'assistant'
+                        WHEN 'error' THEN 'assistant'
+                        WHEN 'tool' THEN 'tool'
+                        WHEN 'system' THEN 'system'
+                        ELSE 'user'
+                    END
+                """)
+                try Self.createMessagesFTSUpdateTrigger(db)
+            }
+
+            try Self.createConversationRuntimeTables(db)
+        }
+
+        migrator.registerMigration("v11_model_excluded_image_attachments") { db in
+            let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(messages)")
+            let columnNames = Set(columns.compactMap { row -> String? in row["name"] })
+            if !columnNames.contains("model_excluded_image_file_names_json") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN model_excluded_image_file_names_json BLOB")
+            }
+        }
+
+        migrator.registerMigration("v12_embedded_subagent_sessions") { db in
+            let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(sessions)")
+            let columnNames = Set(columns.compactMap { row -> String? in row["name"] })
+            if !columnNames.contains("container_session_id") {
+                try db.execute(
+                    sql: "ALTER TABLE sessions ADD COLUMN container_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE"
+                )
+            }
+            try db.execute(
+                sql: "CREATE INDEX IF NOT EXISTS idx_sessions_container ON sessions(container_session_id, updated_at DESC)"
+            )
+        }
+
+        migrator.registerMigration("v13_limit_messages_fts_update_trigger") { db in
+            try Self.replaceMessagesFTSUpdateTrigger(db)
+        }
+
+        migrator.registerMigration("v13_local_agent_runtime") { db in
+            try Self.createLocalAgentRuntimeTables(db)
+        }
+
+        migrator.registerMigration("v14_browser_agent_governance") { db in
+            try Self.migrateLocalAgentBrowserSchema(db)
+        }
+
+        migrator.registerMigration("v15_skill_execution_governance") { db in
+            try Self.createSkillExecutionGovernanceTables(db)
+        }
+
+        migrator.registerMigration("v16_system_entry_receipts") { db in
+            try Self.createSystemEntryReceiptTable(db)
+        }
+
         try migrator.migrate(dbPool)
         try repairCoreSchemaIfNeeded()
     }
@@ -496,6 +584,16 @@ final class PersistenceGRDBStore {
         try dbPool.write { db in
             try createCoreTablesIfMissing(db)
             try Self.createConversationContinuationContextTable(db)
+            try Self.createConversationRuntimeTables(db)
+            try Self.migrateLocalAgentBrowserSchema(db)
+            try Self.createSkillExecutionGovernanceTables(db)
+            try Self.createSystemEntryReceiptTable(db)
+            try ensureColumn(
+                db,
+                table: "conversation_waits",
+                column: "tool_call_id",
+                definition: "tool_call_id TEXT NOT NULL DEFAULT ''"
+            )
             try requireColumns(db, table: "sessions", columns: ["id", "name"])
             try requireColumns(db, table: "messages", columns: ["id", "session_id", "role", "content"])
             try requireColumns(db, table: "request_logs", columns: ["id", "request_id", "provider_name", "model_id"])
@@ -515,7 +613,15 @@ final class PersistenceGRDBStore {
 
             try ensureColumn(db, table: "sessions", column: "topic_prompt", definition: "topic_prompt TEXT")
             try ensureColumn(db, table: "sessions", column: "enhanced_prompt", definition: "enhanced_prompt TEXT")
+            try ensureColumn(db, table: "sessions", column: "system_prompt", definition: "system_prompt TEXT")
+            try ensureColumn(db, table: "sessions", column: "preferred_model_identifier", definition: "preferred_model_identifier TEXT")
             try ensureColumn(db, table: "sessions", column: "folder_id", definition: "folder_id TEXT")
+            try ensureColumn(
+                db,
+                table: "sessions",
+                column: "container_session_id",
+                definition: "container_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE"
+            )
             try ensureColumn(db, table: "sessions", column: "lorebook_ids_json", definition: "lorebook_ids_json BLOB NOT NULL DEFAULT X'5B5D'")
             try ensureColumn(db, table: "sessions", column: "worldbook_context_isolation_enabled", definition: "worldbook_context_isolation_enabled INTEGER NOT NULL DEFAULT 0")
             try ensureColumn(db, table: "sessions", column: "is_temporary", definition: "is_temporary INTEGER NOT NULL DEFAULT 0")
@@ -537,6 +643,12 @@ final class PersistenceGRDBStore {
                 definition: "continuation_session_link_hidden INTEGER NOT NULL DEFAULT 0"
             )
 
+            let messageColumnsBeforeRepair = try columnNames(db, table: "messages")
+            let shouldBackfillAuthorKind = !messageColumnsBeforeRepair.contains("author_kind")
+            if shouldBackfillAuthorKind {
+                // 修复异常旧库时同样不能让元数据回填触发全文索引重建。
+                try db.execute(sql: "DROP TRIGGER IF EXISTS messages_au")
+            }
             try ensureColumn(db, table: "messages", column: "requested_at", definition: "requested_at REAL")
             try ensureColumn(db, table: "messages", column: "content_versions_json", definition: "content_versions_json BLOB NOT NULL DEFAULT X'5B5D'")
             try ensureColumn(db, table: "messages", column: "current_version_index", definition: "current_version_index INTEGER NOT NULL DEFAULT 0")
@@ -548,6 +660,7 @@ final class PersistenceGRDBStore {
             try ensureColumn(db, table: "messages", column: "cost_estimate_json", definition: "cost_estimate_json BLOB")
             try ensureColumn(db, table: "messages", column: "audio_file_name", definition: "audio_file_name TEXT")
             try ensureColumn(db, table: "messages", column: "image_file_names_json", definition: "image_file_names_json BLOB")
+            try ensureColumn(db, table: "messages", column: "model_excluded_image_file_names_json", definition: "model_excluded_image_file_names_json BLOB")
             try ensureColumn(db, table: "messages", column: "file_file_names_json", definition: "file_file_names_json BLOB")
             try ensureColumn(db, table: "messages", column: "full_error_content", definition: "full_error_content TEXT")
             try ensureColumn(db, table: "messages", column: "sent_system_prompt_snapshot", definition: "sent_system_prompt_snapshot TEXT")
@@ -556,6 +669,23 @@ final class PersistenceGRDBStore {
             try ensureColumn(db, table: "messages", column: "response_attempt_id", definition: "response_attempt_id TEXT")
             try ensureColumn(db, table: "messages", column: "response_attempt_index", definition: "response_attempt_index INTEGER")
             try ensureColumn(db, table: "messages", column: "selected_response_attempt_id", definition: "selected_response_attempt_id TEXT")
+            try ensureColumn(db, table: "messages", column: "author_kind", definition: "author_kind TEXT NOT NULL DEFAULT 'user'")
+            try ensureColumn(db, table: "messages", column: "source_session_id", definition: "source_session_id TEXT")
+            try ensureColumn(db, table: "messages", column: "source_message_id", definition: "source_message_id TEXT")
+            try ensureColumn(db, table: "messages", column: "conversation_event_id", definition: "conversation_event_id TEXT")
+            if shouldBackfillAuthorKind {
+                try db.execute(sql: """
+                    UPDATE messages
+                    SET author_kind = CASE role
+                        WHEN 'assistant' THEN 'assistant'
+                        WHEN 'error' THEN 'assistant'
+                        WHEN 'tool' THEN 'tool'
+                        WHEN 'system' THEN 'system'
+                        ELSE 'user'
+                    END
+                """)
+                try Self.createMessagesFTSUpdateTrigger(db)
+            }
             try ensureColumn(db, table: "messages", column: "position", definition: "position INTEGER NOT NULL DEFAULT 0")
             try ensureColumn(db, table: "messages", column: "created_at", definition: "created_at REAL NOT NULL DEFAULT 0")
 
@@ -572,6 +702,7 @@ final class PersistenceGRDBStore {
 
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_sessions_sort ON sessions(sort_index ASC)")
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_sessions_container ON sessions(container_session_id, updated_at DESC)")
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_messages_session_position ON messages(session_id, position ASC)")
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_messages_session_requested ON messages(session_id, requested_at DESC)")
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_request_logs_requested_at ON request_logs(requested_at DESC)")
@@ -580,6 +711,21 @@ final class PersistenceGRDBStore {
             try Self.createSessionTagTables(db)
             try ensureMessagesFTSObjects(db)
         }
+    }
+
+    static func createSystemEntryReceiptTable(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS system_entry_receipts (
+                id TEXT PRIMARY KEY NOT NULL,
+                kind TEXT NOT NULL,
+                session_id TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_system_entry_receipts_created_at
+            ON system_entry_receipts(created_at DESC)
+        """)
     }
 
     private func createCoreTablesIfMissing(_ db: Database) throws {
@@ -594,9 +740,12 @@ final class PersistenceGRDBStore {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
+                system_prompt TEXT,
                 topic_prompt TEXT,
                 enhanced_prompt TEXT,
+                preferred_model_identifier TEXT,
                 folder_id TEXT,
+                container_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
                 lorebook_ids_json BLOB NOT NULL DEFAULT X'5B5D',
                 worldbook_context_isolation_enabled INTEGER NOT NULL DEFAULT 0,
                 is_temporary INTEGER NOT NULL DEFAULT 0,
@@ -623,6 +772,7 @@ final class PersistenceGRDBStore {
                 cost_estimate_json BLOB,
                 audio_file_name TEXT,
                 image_file_names_json BLOB,
+                model_excluded_image_file_names_json BLOB,
                 file_file_names_json BLOB,
                 video_analysis_results_json BLOB,
                 full_error_content TEXT,
@@ -632,6 +782,10 @@ final class PersistenceGRDBStore {
                 response_attempt_id TEXT,
                 response_attempt_index INTEGER,
                 selected_response_attempt_id TEXT,
+                author_kind TEXT NOT NULL DEFAULT 'user',
+                source_session_id TEXT,
+                source_message_id TEXT,
+                conversation_event_id TEXT,
                 position INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL DEFAULT 0
             )
@@ -713,8 +867,21 @@ final class PersistenceGRDBStore {
                 DELETE FROM messages_fts WHERE message_id = old.id;
             END
         """)
+        try Self.createMessagesFTSUpdateTrigger(db)
+    }
+
+    private static func replaceMessagesFTSUpdateTrigger(_ db: Database) throws {
+        try db.execute(sql: "DROP TRIGGER IF EXISTS messages_au")
+        try createMessagesFTSUpdateTrigger(db)
+    }
+
+    private static func createMessagesFTSUpdateTrigger(_ db: Database) throws {
         try db.execute(sql: """
-            CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+            CREATE TRIGGER IF NOT EXISTS messages_au
+            AFTER UPDATE OF id, session_id, content ON messages
+            WHEN old.id IS NOT new.id
+                OR old.session_id IS NOT new.session_id
+                OR old.content IS NOT new.content
             BEGIN
                 DELETE FROM messages_fts WHERE message_id = old.id;
                 INSERT INTO messages_fts(message_id, session_id, content)
@@ -748,12 +915,13 @@ final class PersistenceGRDBStore {
 
     private func scheduleDatabaseMaintenanceIfNeeded() {
         Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
             let delay = DatabaseMaintenanceLaunchDeferral.delayNanoseconds
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled else { return }
             }
+            // 延迟期间不持有 Store，避免已被释放的测试数据库稍后仍触发维护。
+            guard let self else { return }
             self.runDatabaseMaintenanceIfNeeded()
         }
     }

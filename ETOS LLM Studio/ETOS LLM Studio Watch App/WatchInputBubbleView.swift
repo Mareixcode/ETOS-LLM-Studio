@@ -35,6 +35,7 @@ struct WatchInputBubbleView: View {
     @Binding var isAttachmentImportPresented: Bool
     @Binding var attachmentSourceText: String
     @ObservedObject private var appConfig = AppConfigStore.shared
+    @ObservedObject private var customSlashCommandStore = CustomChatSlashCommandStore.shared
     @State private var resourceUsageTask: Task<Void, Never>?
     @State private var speechPreviewFinalizeTask: Task<Void, Never>?
     @State private var isDraftEditorPresented = false
@@ -47,7 +48,8 @@ struct WatchInputBubbleView: View {
     @State private var temporaryChatMemoryMode: TemporaryChatMemoryMode = .enabled
     @State private var visibleLeadingQuickActions: [WatchInputQuickAction] = []
     @State private var visibleTrailingQuickActions: [WatchInputQuickAction] = []
-    @State private var slashCommandSuggestions: [ChatSlashCommand] = []
+    @State private var slashCommandSuggestions: [ChatSlashCommandSuggestion] = []
+    @State private var customSlashCommandPrefilledPrompt: String?
 
     private var hasPendingAttachments: Bool {
         viewModel.pendingAudioAttachment != nil
@@ -150,7 +152,9 @@ struct WatchInputBubbleView: View {
         let hasTrimmedText = !viewModel.userInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let canSend = hasTrimmedText || hasPendingAttachments
         let inputActionState = WatchChatInputActionState.resolve(
-            isSending: viewModel.isSendingMessage || viewModel.isSendDelayPending,
+            isSending: viewModel.isSendingMessage
+                || viewModel.isSendDelayPending
+                || viewModel.isSendSubmissionPending,
             hasSendableContent: canSend,
             canQuickRetry: viewModel.canQuickRetryLatestMessage,
             isSpeechInputEnabled: viewModel.enableSpeechInput
@@ -183,7 +187,11 @@ struct WatchInputBubbleView: View {
                             }
                             .buttonStyle(.plain)
                             .glassEffect(.clear, in: Circle())
-                            .disabled(inputActionState.isDisabled || viewModel.attachmentImportInProgress)
+                            .disabled(
+                                inputActionState.isDisabled
+                                    || viewModel.attachmentImportInProgress
+                                    || viewModel.isSendSubmissionPending
+                            )
                         } else {
                             ZStack {
                                 Capsule()
@@ -207,7 +215,11 @@ struct WatchInputBubbleView: View {
                                 Circle()
                                     .stroke(inputStrokeColor, lineWidth: 0.8)
                             )
-                            .disabled(inputActionState.isDisabled || viewModel.attachmentImportInProgress)
+                            .disabled(
+                                inputActionState.isDisabled
+                                    || viewModel.attachmentImportInProgress
+                                    || viewModel.isSendSubmissionPending
+                            )
                         }
                     }
                     .frame(height: inputControlHeight)
@@ -238,7 +250,11 @@ struct WatchInputBubbleView: View {
                             Circle()
                                 .stroke(inputStrokeColor, lineWidth: 0.8)
                         )
-                        .disabled(inputActionState.isDisabled || viewModel.attachmentImportInProgress)
+                        .disabled(
+                            inputActionState.isDisabled
+                                || viewModel.attachmentImportInProgress
+                                || viewModel.isSendSubmissionPending
+                        )
                     }
                     .frame(height: inputControlHeight)
                     .padding(.horizontal, 10)
@@ -275,6 +291,8 @@ struct WatchInputBubbleView: View {
                     NavigationStack {
                         WatchQuickRequestControlsView(
                             runnableModel: selectedModel,
+                            sessionID: viewModel.currentSession?.id,
+                            isLocked: viewModel.isSendingMessage || viewModel.isSendDelayPending,
                             onDone: { isRequestControlsPresented = false }
                         )
                     }
@@ -314,6 +332,9 @@ struct WatchInputBubbleView: View {
                 } else {
                     slashCommandSuggestions = []
                 }
+            }
+            .onChange(of: customSlashCommandStore.commands) { _, _ in
+                refreshSlashCommandSuggestions()
             }
             .confirmationDialog(
                 NSLocalizedString("助手脚本", comment: "Watch roleplay script action menu"),
@@ -503,6 +524,17 @@ struct WatchInputBubbleView: View {
         switch action {
         case .requestControls:
             return viewModel.selectedModel?.model.requestBodyControls.contains(where: \.isEnabled) == true
+                || (appConfig.localLinuxEnabled
+                    && viewModel.currentSession != nil
+                    && viewModel.selectedModel != nil)
+        case .agentMode:
+            return appConfig.localLinuxEnabled
+                && viewModel.currentSession != nil
+                && viewModel.selectedModel != nil
+        case .browser:
+            return viewModel.currentSession != nil
+        case .localTerminal:
+            return appConfig.localLinuxEnabled && viewModel.currentSession != nil
         case .roleplayScripts:
             return !roleplayScriptActions.isEmpty
         case .clearInput:
@@ -523,6 +555,12 @@ struct WatchInputBubbleView: View {
                 isTemporaryChatEnabled: isTemporaryChatEnabled,
                 hasConversationStarted: !isTemporaryChatActivationAvailable
             )
+        case .agentMode:
+            return viewModel.currentSession == nil || !appConfig.localLinuxEnabled
+        case .browser:
+            return viewModel.currentSession == nil
+        case .localTerminal:
+            return viewModel.currentSession == nil || !appConfig.localLinuxEnabled
         default:
             return false
         }
@@ -542,7 +580,10 @@ struct WatchInputBubbleView: View {
         case .clearInput:
             viewModel.clearUserInput()
             viewModel.clearAllAttachments()
+            customSlashCommandPrefilledPrompt = nil
             slashCommandSuggestions = []
+        case .agentMode:
+            onPerformQuickAction(action)
         case .sessionHistory,
              .contextCompression,
              .settings,
@@ -556,7 +597,9 @@ struct WatchInputBubbleView: View {
              .shortcuts,
              .roleplay,
              .worldbook,
-             .extendedFeatures:
+             .extendedFeatures,
+             .browser,
+             .localTerminal:
             onPerformQuickAction(action)
         }
     }
@@ -564,14 +607,17 @@ struct WatchInputBubbleView: View {
     private func handleInputAction(_ state: WatchChatInputActionState) {
         if case .send = state,
            appConfig.enableSlashCommands,
-           let command = ChatSlashCommandParser.recognizedCommand(in: viewModel.userInput) {
-            viewModel.userInput = ""
-            slashCommandSuggestions = []
-            onPerformSlashCommand(command)
+           customSlashCommandPrefilledPrompt != viewModel.userInput,
+           let command = ChatSlashCommandParser.recognizedSuggestion(
+               in: viewModel.userInput,
+               customCommands: customSlashCommandStore.commands
+           ) {
+            performSelectedSlashCommand(command)
             return
         }
 
         if case .send = state {
+            customSlashCommandPrefilledPrompt = nil
             slashCommandSuggestions = []
         }
         onHandleInputAction(state)
@@ -582,13 +628,34 @@ struct WatchInputBubbleView: View {
             slashCommandSuggestions = []
             return
         }
-        slashCommandSuggestions = ChatSlashCommandParser.suggestions(for: viewModel.userInput)
+
+        if customSlashCommandPrefilledPrompt == viewModel.userInput {
+            slashCommandSuggestions = []
+            return
+        }
+        customSlashCommandPrefilledPrompt = nil
+        slashCommandSuggestions = ChatSlashCommandParser.suggestions(
+            for: viewModel.userInput,
+            customCommands: customSlashCommandStore.commands
+        )
     }
 
-    private func performSuggestedSlashCommand(_ command: ChatSlashCommand) {
-        viewModel.userInput = ""
+    private func performSuggestedSlashCommand(_ command: ChatSlashCommandSuggestion) {
+        performSelectedSlashCommand(command)
+    }
+
+    private func performSelectedSlashCommand(_ command: ChatSlashCommandSuggestion) {
         slashCommandSuggestions = []
-        onPerformSlashCommand(command)
+
+        switch command {
+        case .builtIn(let builtInCommand):
+            customSlashCommandPrefilledPrompt = nil
+            viewModel.userInput = ""
+            onPerformSlashCommand(builtInCommand)
+        case .custom(let customCommand):
+            customSlashCommandPrefilledPrompt = customCommand.prompt
+            viewModel.userInput = customCommand.prompt
+        }
     }
 
     private func performPendingQuickAction() {
@@ -780,7 +847,7 @@ struct WatchInputBubbleView: View {
         guard resourceUsageTask == nil else { return }
         resourceUsageTask = Task { @MainActor in
             while !Task.isCancelled {
-                resourceUsageMonitor.refresh()
+                await resourceUsageMonitor.refresh()
                 do {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {

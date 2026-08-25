@@ -306,7 +306,23 @@ extension OpenAIAdapter {
         }
 
         if let tools, !tools.isEmpty {
-            let functionTools = stableToolDefinitions(tools) { self.sanitizedToolName($0) }.map { tool -> [String: Any] in
+            if let localShell = tools.first(where: { $0.kind == .openAIResponsesLocalShell }) {
+                var environment: [String: Any] = ["type": "local"]
+                if let rawSkills = localShell.providerSpecificFields?[OpenAIResponsesLocalShellProtocol.skillsField],
+                   case let .array(skills) = rawSkills,
+                   !skills.isEmpty {
+                    environment["skills"] = skills.map { $0.toAny() }
+                }
+                responsesTools.removeAll { ($0["type"] as? String) == "shell" }
+                responsesTools.append([
+                    "type": "shell",
+                    "environment": environment
+                ])
+            }
+
+            let functionTools = stableToolDefinitions(tools.filter { $0.kind == nil }) {
+                self.sanitizedToolName($0)
+            }.map { tool -> [String: Any] in
                 let rawParams = tool.parameters.toAny() as? [String: Any] ?? [:]
                 let functionParams = normalizedOpenAIToolParameters(rawParams)
                 return [
@@ -447,7 +463,7 @@ extension OpenAIAdapter {
         
         if dataString == "[DONE]" {
             logger.info("流式传输结束信号 [DONE] 已收到。")
-            return nil
+            return ChatMessagePart(streamTermination: .completed)
         }
         
         guard !dataString.isEmpty, let data = dataString.data(using: .utf8) else {
@@ -455,19 +471,33 @@ extension OpenAIAdapter {
         }
 
         if let object = try? JSONSerialization.jsonObject(with: data, options: []),
-           let payload = object as? [String: Any],
-           let eventType = payload["type"] as? String,
-           eventType.hasPrefix("response.") {
-            return parseResponsesStreamingEvent(payload)
+           let payload = object as? [String: Any] {
+            if let eventType = payload["type"] as? String,
+               eventType.hasPrefix("response.") || eventType == "error" {
+                return parseResponsesStreamingEvent(payload)
+            }
+            if let error = payload["error"] as? [String: Any] {
+                return ChatMessagePart(
+                    streamTermination: .failed(reason: error["message"] as? String)
+                )
+            }
         }
         
         do {
             let chunk = try JSONDecoder().decode(OpenAIResponse.self, from: data)
             let tokenUsage = makeTokenUsage(from: chunk.usage)
+            let streamTermination: ChatMessagePart.StreamTermination? = {
+                guard let finishReason = chunk.choices.first?.finish_reason,
+                      !finishReason.isEmpty else { return nil }
+                return .completed
+            }()
 
             guard let delta = chunk.choices.first?.delta else {
-                if tokenUsage != nil {
-                    return ChatMessagePart(tokenUsage: tokenUsage)
+                if tokenUsage != nil || streamTermination != nil {
+                    return ChatMessagePart(
+                        tokenUsage: tokenUsage,
+                        streamTermination: streamTermination
+                    )
                 }
                 return nil
             }
@@ -491,7 +521,8 @@ extension OpenAIAdapter {
                 content: delta.content,
                 reasoningContent: delta.reasoning_content,
                 toolCallDeltas: toolCallDeltas,
-                tokenUsage: tokenUsage
+                tokenUsage: tokenUsage,
+                streamTermination: streamTermination
             )
         } catch {
             logger.warning("流式 JSON 解析失败: \(error.localizedDescription) - 原始数据: '\(dataString)'")

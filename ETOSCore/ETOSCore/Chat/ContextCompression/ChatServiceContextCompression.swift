@@ -93,6 +93,10 @@ extension ChatService {
                 session: childSession,
                 context: context
             )
+            _ = Persistence.saveLocalAgentMode(
+                Persistence.localAgentMode(sessionID: sourceSession.id),
+                sessionID: childSession.id
+            )
         }.value
 
         storeRuntimeMessagesSnapshot([], for: childSession.id)
@@ -173,7 +177,7 @@ extension ChatService {
             contents.append(content)
         }
 
-        for imageFileName in message.imageFileNames ?? [] {
+        for imageFileName in message.modelVisibleImageFileNames {
             let content = try await cachedContextCompressionAttachment(
                 identifier: imageFileName,
                 kind: .image,
